@@ -2229,9 +2229,10 @@ impl App {
 
         // ── δεξιά στήλη: ημερολόγιο, κανάλια, έλεγχοι ──
         let mut seek_to: Option<chrono::NaiveDateTime> = None;
-        egui::SidePanel::right("pbside").exact_width(280.0).resizable(false)
+        egui::SidePanel::right("pbside").exact_width(300.0).resizable(false)
             .frame(egui::Frame::none().fill(if pal().dark { Color32::from_rgba_unmultiplied(14, 14, 16, 200) } else { PANEL() }).inner_margin(egui::Margin::same(16.0)).stroke(Stroke::new(1.0, BORDER())))
-            .show(ctx, |ui| {
+            .show(ctx, |ui| { egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_max_width(268.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Playback").font(semibold(20.0)).extra_letter_spacing(-0.5));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2248,35 +2249,39 @@ impl App {
             use chrono::Datelike;
             let month = self.pb.month.unwrap_or(date.with_day(1).unwrap());
             ui.horizontal(|ui| {
-                if ui.small_button("◀").clicked() { self.pb.month = Some((month - chrono::Duration::days(1)).with_day(1).unwrap()); }
-                ui.with_layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight).with_main_justify(false), |ui| {
-                    ui.label(RichText::new(month.format("%B %Y").to_string()).strong());
+                ui.label(RichText::new(month.format("%B %Y").to_string()).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let nm = (month + chrono::Duration::days(32)).with_day(1).unwrap();
+                    if ui.add_enabled(nm <= today, egui::Button::new("▶").small()).clicked() { self.pb.month = Some(nm); }
+                    if ui.small_button("◀").clicked() { self.pb.month = Some((month - chrono::Duration::days(1)).with_day(1).unwrap()); }
                 });
             });
-            ui.horizontal(|ui| {
-                ui.add_space(ui.available_width() - 30.0);
-                let nm = (month + chrono::Duration::days(32)).with_day(1).unwrap();
-                if ui.add_enabled(nm <= today, egui::Button::new("▶").small()).clicked() { self.pb.month = Some(nm); }
-            });
-            let cw = (ui.available_width() / 7.0).floor();
-            egui::Grid::new("cal").spacing([0.0, 2.0]).min_col_width(cw).max_col_width(cw).show(ui, |ui| {
-                for d in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"] { ui.vertical_centered(|ui| ui.label(RichText::new(d).small().color(MUTED()))); }
-                ui.end_row();
-                let lead = month.weekday().num_days_from_monday();
-                for _ in 0..lead { ui.label(""); }
-                let mut d = month;
-                let mut col = lead;
-                while d.month() == month.month() {
-                    let sel = d == date;
-                    let fut = d > today;
-                    let txt = RichText::new(d.day().to_string()).color(if sel { Color32::WHITE } else if fut { MUTED().gamma_multiply(0.5) } else { TEXT() });
-                    let b = egui::Button::new(txt).fill(if sel { ACCENT() } else { Color32::TRANSPARENT }).stroke(if d == today && !sel { Stroke::new(1.0, ACCENT()) } else { Stroke::NONE }).rounding(8.0).min_size(egui::vec2(cw - 4.0, 26.0));
-                    if ui.add_enabled(!fut, b).clicked() { self.pb.day = (d - today).num_days(); self.pb.month = Some(month); }
-                    col += 1;
-                    if col == 7 { ui.end_row(); col = 0; }
-                    d += chrono::Duration::days(1);
-                }
-            });
+            // ημερολόγιο ζωγραφισμένο σε σταθερό πλέγμα 7 στηλών, ώστε να χωρά πάντα στη στήλη
+            let w = ui.available_width();
+            let cw = w / 7.0;
+            let ch_h = 28.0;
+            let lead = month.weekday().num_days_from_monday() as usize;
+            let days = { let nm = (month + chrono::Duration::days(32)).with_day(1).unwrap(); (nm - month).num_days() as usize };
+            let rows = (lead + days + 6) / 7;
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 18.0 + rows as f32 * ch_h), egui::Sense::hover());
+            let p = ui.painter();
+            for (k, d) in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].iter().enumerate() {
+                p.text(egui::pos2(rect.left() + cw * (k as f32 + 0.5), rect.top() + 8.0), egui::Align2::CENTER_CENTER, *d, egui::FontId::proportional(11.0), MUTED());
+            }
+            for i in 0..days {
+                let d = month + chrono::Duration::days(i as i64);
+                let k = lead + i;
+                let cell = egui::Rect::from_min_size(egui::pos2(rect.left() + cw * (k % 7) as f32, rect.top() + 18.0 + ch_h * (k / 7) as f32), egui::vec2(cw, ch_h)).shrink(2.0);
+                let resp = ui.interact(cell, ui.id().with(("cal", i)), egui::Sense::click());
+                let (sel, fut) = (d == date, d > today);
+                let p = ui.painter();
+                if sel { p.rect_filled(cell, 8.0, ACCENT()); }
+                else if resp.hovered() && !fut { p.rect_filled(cell, 8.0, BORDER()); }
+                if d == today && !sel { p.rect_stroke(cell, 8.0, Stroke::new(1.0, ACCENT())); }
+                p.text(cell.center(), egui::Align2::CENTER_CENTER, d.day().to_string(), egui::FontId::proportional(13.0),
+                       if sel { Color32::WHITE } else if fut { MUTED().gamma_multiply(0.5) } else { TEXT() });
+                if resp.clicked() && !fut { self.pb.day = (d - today).num_days(); self.pb.month = Some(month); }
+            }
             ui.add_space(14.0);
             ui.separator();
             ui.add_space(8.0);
@@ -2297,7 +2302,7 @@ impl App {
             ui.separator();
             ui.add_space(8.0);
             ui.label(RichText::new("PLAYBACK").small().color(MUTED()).extra_letter_spacing(1.2));
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 let label = if self.pb.paused { "▶  Play" } else { "⏸  Pause" };
                 if ui.add_enabled(!self.pb.players.is_empty(), egui::Button::new(label).rounding(999.0)).clicked() {
                     self.pb.paused ^= true;
@@ -2310,14 +2315,14 @@ impl App {
                     }
                 }
             });
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui.add_enabled(self.pb.cursor.is_some(), egui::Button::new("−30 s")).clicked() { seek_to = self.pb.cursor.map(|c| c - chrono::Duration::seconds(30)); }
                 if ui.add_enabled(self.pb.cursor.is_some(), egui::Button::new("+30 s")).clicked() { seek_to = self.pb.cursor.map(|c| c + chrono::Duration::seconds(30)); }
                 if ui.add_enabled(!self.pb.players.is_empty(), egui::Button::new("■ Stop")).clicked() { self.pb.players.clear(); }
             });
             ui.add_space(6.0);
             ui.label(RichText::new("Click or drag on the timeline to jump. Scroll on it to zoom. Space pause · ←/→ 30 s · double-click a channel to enlarge.").small().color(MUTED()));
-        });
+        }); });
 
         // ── κέντρο: κανάλια + χρονολόγιο ──
         egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::same(10.0))).show(ctx, |ui| {

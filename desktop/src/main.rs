@@ -783,6 +783,17 @@ struct NvrPb {
     files: Arc<Mutex<Option<Result<Vec<dvrip::RecFile>, String>>>>,
     dl: Arc<Mutex<DlJob>>,
     player: Option<NvrPlayer>,
+    /// κανάλι → (όλες οι εγγραφές, εγγραφές με κίνηση)
+    day_files: Arc<Mutex<Option<Result<std::collections::BTreeMap<u32, (Vec<dvrip::RecFile>, Vec<dvrip::RecFile>)>, String>>>>,
+    players: Vec<(u32, NvrPlayer)>,
+    hidden: std::collections::HashSet<u32>,
+    cursor: Option<chrono::NaiveDateTime>,
+    paused: bool,
+    speed: u32,
+    view: (f64, f64),        // ορατό τμήμα χρονολογίου: (αρχή, διάρκεια) σε δευτερόλεπτα της ημέρας
+    drag: Option<f64>,
+    month: Option<chrono::NaiveDate>,
+    big: Option<u32>,
 }
 #[derive(Default)]
 struct DlJob { name: String, bytes: u64, total: u64, busy: bool, done: Option<Result<PathBuf, String>> }
@@ -1839,11 +1850,14 @@ fn nvr_test() -> anyhow::Result<()> {
                 if std::env::var_os("NVRDECK_SEEK").is_some() && ch > 1 {
                     let t0 = (chrono::Local::now() - chrono::Duration::minutes(47)).format("%Y-%m-%d %H:%M:%S").to_string();
                     let t1 = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-                    for v in 0..2u8 {
+                    let fl = d.files(2, &t0, &t1, "*").unwrap_or_default();
+                    let fname = fl.iter().find(|f| f.begin.as_str() <= t0.as_str()).or(fl.first()).map(|f| f.name.clone()).unwrap_or_default();
+                    println!("  file for seek: {}", if fname.is_empty() { "none" } else { "found" });
+                    for v in 2..4u8 {
                         let mut p = dvrip::FrameParser::default();
                         let mut first = String::new();
                         let t = Instant::now();
-                        let r = d.stream_time(&c.host, dvrip::PORT, 2, &t0, &t1, v, |b| { for (_, k) in p.push(b) { if k && first.is_empty() { first = p.time.clone(); } } first.is_empty() && t.elapsed() < Duration::from_secs(8) });
+                        let r = d.stream_time(&c.host, dvrip::PORT, 2, &t0, &t1, &fname, v, |b| { for (_, k) in p.push(b) { if k && first.is_empty() { first = p.time.clone(); } } first.is_empty() && t.elapsed() < Duration::from_secs(8) });
                         println!("  seek variant {v}: asked {t0} → first I-frame at {first:?} after {:.1}s ({:?})", t.elapsed().as_secs_f32(), r.map_err(|e| e.to_string()));
                     }
                 }
@@ -1875,6 +1889,14 @@ fn nvr_test() -> anyhow::Result<()> {
 fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--nvr-test") { return nvr_test(); }
     let wall = std::env::args().any(|a| a == "--wall");
+    // ένα μόνο παράθυρο: δεύτερο αντίγραφο θα έσβηνε τις αλλαγές του πρώτου στο ίδιο αρχείο ρυθμίσεων
+    let lock_path = store_path().with_extension("lock");
+    if let Some(d) = lock_path.parent() { let _ = std::fs::create_dir_all(d); }
+    let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path)?;
+    if lock.try_lock().is_err() {
+        desktop_notify("NVRDeck is already open", "Switch to the existing window.");
+        return Ok(());
+    }
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_fullscreen(wall).with_inner_size([1280.0, 780.0]).with_min_inner_size([720.0, 480.0]).with_title("NVRDeck").with_icon(std::sync::Arc::new(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap_or_default())),
         ..Default::default()
@@ -2039,21 +2061,23 @@ const PW: usize = 1280;
 const PH: usize = 720;
 
 impl NvrPlayer {
-    fn start(cam: &Camera, f: dvrip::RecFile, skip: f64, ctx: egui::Context) -> NvrPlayer {
-        let shared = Arc::new(Mutex::new(Shared { status: "Connecting to the recorder…".into(), ..Default::default() }));
+    fn start(cam: &Camera, f: dvrip::RecFile, at: chrono::NaiveDateTime, ctx: egui::Context) -> NvrPlayer {
+        let skip = 0.0;
+        let shared = Arc::new(Mutex::new(Shared { status: "Loading…".into(), ..Default::default() }));
         let stop = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(AtomicBool::new(false));
         let speed = Arc::new(AtomicU32::new(1));
         let pos = Arc::new(Mutex::new(skip));
-        let begin = chrono::NaiveDateTime::parse_from_str(&f.begin, "%Y-%m-%d %H:%M:%S").unwrap_or_default();
-        let (sh, st, pa, sp, po, c2, f2) = (shared.clone(), stop.clone(), pause.clone(), speed.clone(), pos.clone(), cam.clone(), f.clone());
+        let begin = at;
+        let at_s = at.format("%Y-%m-%d %H:%M:%S").to_string();
+        let (sh, st, pa, sp, po, c2, f2, at_s) = (shared.clone(), stop.clone(), pause.clone(), speed.clone(), pos.clone(), cam.clone(), f.clone(), at_s);
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<()> {
                 let mut d = dvrip::Dvr::connect(&c2.host, dvrip::PORT, &c2.user, &c2.pass)?;
                 let mut parser = dvrip::FrameParser::default();
                 let mut ff: Option<std::process::Child> = None;
                 let mut stdin: Option<std::process::ChildStdin> = None;
-                d.stream(&c2.host, dvrip::PORT, &f2, |chunk| {
+                d.stream_time(&c2.host, dvrip::PORT, f2.channel, &at_s, &f2.end, &f2.name, 3, |chunk| {
                     if st.load(Ordering::Relaxed) { return false; }
                     for (frame, key) in parser.push(chunk) {
                         if ff.is_none() {
@@ -2106,6 +2130,7 @@ impl NvrPlayer {
         });
         NvrPlayer { shared, stop, pause, speed, pos, begin, tex: None, file: f }
     }
+    fn ended(&self) -> bool { self.shared.lock().unwrap().status == "End of recording" }
     fn now(&self) -> chrono::NaiveDateTime { self.begin + chrono::Duration::milliseconds((*self.pos.lock().unwrap() * 1000.0) as i64) }
 }
 impl Drop for NvrPlayer { fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); } }
@@ -2113,171 +2138,326 @@ impl Drop for NvrPlayer { fn drop(&mut self) { self.stop.store(true, Ordering::R
 fn parse_t(s: &str) -> Option<chrono::NaiveDateTime> { chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok() }
 
 impl App {
+    /// Όλα τα κανάλια στη στιγμή `t` (κάθε κανάλι: το αρχείο που την περιέχει ή το επόμενο).
+    fn pb_seek(&mut self, cam: &Camera, t: chrono::NaiveDateTime, ctx: &egui::Context) {
+        self.pb.cursor = Some(t);
+        self.pb.players.clear();
+        let Some(Ok(map)) = self.pb.day_files.lock().unwrap().clone() else { return };
+        for (ch, (all, _)) in &map {
+            if self.pb.hidden.contains(ch) { continue; }
+            let hit = all.iter().find(|f| matches!((parse_t(&f.begin), parse_t(&f.end)), (Some(a), Some(b)) if a <= t && t < b)).map(|f| (f.clone(), t))
+                .or_else(|| all.iter().filter_map(|f| parse_t(&f.begin).filter(|a| *a > t).map(|a| (f.clone(), a))).min_by_key(|x| x.1));
+            if let Some((f, at)) = hit {
+                let p = NvrPlayer::start(cam, f, at, ctx.clone());
+                p.pause.store(self.pb.paused, Ordering::Relaxed);
+                p.speed.store(self.pb.speed.max(1), Ordering::Relaxed);
+                self.pb.players.push((*ch, p));
+            }
+        }
+    }
+
     fn nvr_playback_ui(&mut self, ctx: &egui::Context, groups: Vec<Vec<(usize, u32, String)>>) {
         let gi = self.pb.nvr.min(groups.len() - 1);
         let g = groups[gi].clone();
-        if !g.iter().any(|x| x.1 == self.pb.ch) { self.pb.ch = g[0].1; }
+        let today = chrono::Local::now().date_naive();
         let date = (chrono::Local::now() + chrono::Duration::days(self.pb.day)).date_naive();
-        let key = format!("{gi}/{}/{date}/{}", self.pb.ch, self.pb.motion);
+        let day0 = date.and_hms_opt(0, 0, 0).unwrap();
+        if self.pb.view.1 <= 0.0 { self.pb.view = (0.0, 86400.0); }
+        if self.pb.speed == 0 { self.pb.speed = 1; }
         let cam = self.store.camera[g[0].0].clone();
+        let key = format!("{gi}/{date}");
         if key != self.pb.key {
             self.pb.key = key;
-            self.pb.player = None;
-            *self.pb.files.lock().unwrap() = None;
-            let (out, ch, motion, c2, ctx2) = (self.pb.files.clone(), self.pb.ch, self.pb.motion, cam.clone(), ctx.clone());
+            self.pb.players.clear();
+            self.pb.cursor = None;
+            *self.pb.day_files.lock().unwrap() = None;
+            let (out, c2, ctx2, chans) = (self.pb.day_files.clone(), cam.clone(), ctx.clone(), g.iter().map(|x| x.1).collect::<Vec<_>>());
             std::thread::spawn(move || {
-                let r = dvrip::Dvr::connect(&c2.host, dvrip::PORT, &c2.user, &c2.pass).and_then(|mut d|
-                    d.files(ch, &format!("{date} 00:00:00"), &format!("{date} 23:59:59"), if motion { "M" } else { "*" }));
+                let r = (|| -> anyhow::Result<_> {
+                    let mut d = dvrip::Dvr::connect(&c2.host, dvrip::PORT, &c2.user, &c2.pass)?;
+                    let (a, b) = (format!("{date} 00:00:00"), format!("{date} 23:59:59"));
+                    let mut m = std::collections::BTreeMap::new();
+                    for ch in chans {
+                        let all = d.files(ch, &a, &b, "*").unwrap_or_default();
+                        let mot = d.files(ch, &a, &b, "M").unwrap_or_default();
+                        m.insert(ch, (all, mot));
+                    }
+                    Ok(m)
+                })();
                 *out.lock().unwrap() = Some(r.map_err(|e| e.to_string()));
                 ctx2.request_repaint();
             });
         }
-        // υφή καρέ
-        if let Some(pl) = &mut self.pb.player {
+        // καρέ → υφές· συνέχεια στο επόμενο αρχείο όταν τελειώσει ένα
+        let mut next: Vec<(u32, chrono::NaiveDateTime)> = vec![];
+        for (ch, pl) in &mut self.pb.players {
             let mut gd = pl.shared.lock().unwrap();
             if gd.fresh {
                 if let Some(f) = &gd.frame {
                     let img = egui::ColorImage::from_rgba_unmultiplied([PW, PH], f);
-                    match &mut pl.tex { Some(t) => t.set(img, egui::TextureOptions::LINEAR), None => pl.tex = Some(ctx.load_texture("nvrpb", img, egui::TextureOptions::LINEAR)) }
+                    match &mut pl.tex { Some(t) => t.set(img, egui::TextureOptions::LINEAR), None => pl.tex = Some(ctx.load_texture(format!("pb{ch}"), img, egui::TextureOptions::LINEAR)) }
                 }
                 gd.fresh = false;
             }
+            drop(gd);
+            if pl.ended() { if let Some(e) = parse_t(&pl.file.end) { next.push((*ch, e)); } }
         }
-        let files: Option<Result<Vec<dvrip::RecFile>, String>> = self.pb.files.lock().unwrap().clone();
-        let mut play_at: Option<(dvrip::RecFile, f64)> = None;
+        if !next.is_empty() {
+            if let Some(Ok(map)) = self.pb.day_files.lock().unwrap().clone() {
+                for (ch, e) in next {
+                    let nf = map.get(&ch).and_then(|(all, _)| all.iter().filter_map(|f| parse_t(&f.begin).filter(|a| *a >= e).map(|a| (f.clone(), a))).min_by_key(|x| x.1));
+                    self.pb.players.retain(|(c, _)| *c != ch);
+                    if let Some((f, a)) = nf {
+                        let p = NvrPlayer::start(&cam, f, a, ctx.clone());
+                        p.speed.store(self.pb.speed, Ordering::Relaxed);
+                        self.pb.players.push((ch, p));
+                    }
+                }
+            }
+        }
+        // τρέχουσα θέση = η πιο πρόσφατη ώρα από τα κανάλια που παίζουν
+        if let Some(t) = self.pb.players.iter().map(|(_, p)| p.now()).max() { self.pb.cursor = Some(t); }
+        if !self.pb.players.is_empty() { ctx.request_repaint_after(Duration::from_millis(150)); }
+        let files = self.pb.day_files.lock().unwrap().clone();
 
-        egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::symmetric(20.0, 14.0))).show(ctx, |ui| {
-            // ── γραμμή επιλογών ──
+        // πλήκτρα: διάστημα παύση, ←/→ ±30s
+        let (sp, left, right) = ctx.input(|i| (i.key_pressed(egui::Key::Space), i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight)));
+        if !ctx.wants_keyboard_input() {
+            if sp { self.pb.paused ^= true; for (_, p) in &self.pb.players { p.pause.store(self.pb.paused, Ordering::Relaxed); } }
+            if let Some(c) = self.pb.cursor { if left || right { let t = c + chrono::Duration::seconds(if left { -30 } else { 30 }); self.pb_seek(&cam, t, ctx); } }
+        }
+
+        // ── δεξιά στήλη: ημερολόγιο, κανάλια, έλεγχοι ──
+        let mut seek_to: Option<chrono::NaiveDateTime> = None;
+        egui::SidePanel::right("pbside").exact_width(280.0).resizable(false)
+            .frame(egui::Frame::none().fill(if pal().dark { Color32::from_rgba_unmultiplied(14, 14, 16, 200) } else { PANEL() }).inner_margin(egui::Margin::same(16.0)).stroke(Stroke::new(1.0, BORDER())))
+            .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Playback").font(semibold(22.0)).extra_letter_spacing(-0.6));
-                ui.add_space(14.0);
-                if groups.len() > 1 {
-                    egui::ComboBox::from_id_salt("nvrsel").selected_text(format!("Recorder {}", gi + 1)).show_ui(ui, |ui| {
-                        for k in 0..groups.len() { ui.selectable_value(&mut self.pb.nvr, k, format!("Recorder {}", k + 1)); }
-                    });
-                }
-                for (_, ch, name) in &g {
-                    let sel = self.pb.ch == *ch;
-                    let b = egui::Button::new(RichText::new(name.as_str()).color(if sel { Color32::WHITE } else { TEXT() })).fill(if sel { ACCENT() } else { SURFACE() }).rounding(999.0);
-                    if ui.add(b).clicked() { self.pb.ch = *ch; }
-                }
+                ui.label(RichText::new("Playback").font(semibold(20.0)).extra_letter_spacing(-0.5));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("This computer").clicked() { self.pb.local = true; self.pb.player = None; }
-                    ui.add_space(8.0);
-                    if ui.selectable_label(self.pb.motion, "Motion only").clicked() { self.pb.motion ^= true; }
-                    ui.add_space(8.0);
-                    if ui.add_enabled(self.pb.day < 0, egui::Button::new("▶")).clicked() { self.pb.day += 1; }
-                    ui.label(RichText::new(match self.pb.day { 0 => "Today".to_string(), -1 => "Yesterday".to_string(), _ => date.format("%a %d %b").to_string() }).strong());
-                    if ui.button("◀").clicked() { self.pb.day -= 1; }
+                    if ui.small_button("This computer").clicked() { self.pb.local = true; self.pb.players.clear(); }
                 });
             });
-            ui.add_space(10.0);
-
-            // ── περιοχή βίντεο ──
-            let tl_h = 86.0;
-            let avail = ui.available_rect_before_wrap();
-            let vid_area = egui::Rect::from_min_max(avail.min, egui::pos2(avail.max.x, avail.max.y - tl_h - 10.0));
-            let mut sz = vid_area.size();
-            let ar = 16.0 / 9.0;
-            if sz.x / sz.y > ar { sz.x = sz.y * ar } else { sz.y = sz.x / ar }
-            let vr = egui::Rect::from_center_size(vid_area.center(), sz);
-            let p = ui.painter();
-            p.rect_filled(vr, 16.0, Color32::from_rgb(5, 6, 10));
-            p.rect_stroke(vr, 16.0, Stroke::new(1.0, BORDER()));
-            match &self.pb.player {
-                Some(pl) => {
-                    if let Some(t) = &pl.tex {
-                        let mut rs = egui::epaint::RectShape::filled(vr, 16.0, Color32::WHITE); rs.fill_texture_id = t.id(); rs.uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)); p.add(rs);
-                    }
-                    let status = pl.shared.lock().unwrap().status.clone();
-                    if !status.is_empty() {
-                        p.text(vr.center(), egui::Align2::CENTER_CENTER, &status, egui::FontId::proportional(15.0), Color32::from_gray(200));
-                    }
-                    // χρόνος πάνω αριστερά
-                    let name = g.iter().find(|x| x.1 == self.pb.ch).map(|x| x.2.clone()).unwrap_or_default();
-                    let gal = p.layout_no_wrap(format!("{name}  ·  {}", pl.now().format("%d/%m/%Y %H:%M:%S")), egui::FontId::monospace(12.0), Color32::WHITE);
-                    let br = egui::Rect::from_min_size(vr.min + egui::vec2(12.0, 12.0), gal.size() + egui::vec2(18.0, 10.0));
-                    p.rect_filled(br, 999.0, Color32::from_black_alpha(150));
-                    p.galley(br.min + egui::vec2(9.0, 5.0), gal, Color32::WHITE);
-                    ctx.request_repaint_after(Duration::from_millis(200));
-                }
-                None => {
-                    let msg = match &files {
-                        None => "Loading recordings…".to_string(),
-                        Some(Err(e)) => format!("Recorder not reachable: {e}"),
-                        Some(Ok(v)) if v.is_empty() => "No recordings for this day.".to_string(),
-                        Some(Ok(_)) => "Click on the timeline to play from that moment".to_string(),
-                    };
-                    p.text(vr.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(15.0), MUTED());
-                }
+            if groups.len() > 1 {
+                egui::ComboBox::from_id_salt("nvrsel").selected_text(format!("Recorder {}", gi + 1)).show_ui(ui, |ui| {
+                    for k in 0..groups.len() { ui.selectable_value(&mut self.pb.nvr, k, format!("Recorder {}", k + 1)); }
+                });
             }
-            // κουμπιά αναπαραγωγής κάτω στο βίντεο
-            if self.pb.player.is_some() {
-                let bar = egui::Rect::from_center_size(egui::pos2(vr.center().x, vr.bottom() - 30.0), egui::vec2(300.0, 40.0));
-                let mut close = false;
-                ui.allocate_ui_at_rect(bar, |ui| {
-                    egui::Frame::none().fill(Color32::from_black_alpha(170)).rounding(999.0).inner_margin(egui::Margin::symmetric(10.0, 5.0)).show(ui, |ui| {
-                        ui.horizontal_centered(|ui| {
-                            let pl = self.pb.player.as_ref().unwrap();
-                            let paused = pl.pause.load(Ordering::Relaxed);
-                            if ui.add(egui::Button::new(if paused { "▶  Play" } else { "⏸  Pause" }).rounding(999.0)).clicked() { pl.pause.store(!paused, Ordering::Relaxed); }
-                            let sp = pl.speed.load(Ordering::Relaxed);
-                            for x in [1u32, 2, 4] {
-                                if ui.selectable_label(sp == x, format!("{x}×")).clicked() { pl.speed.store(x, Ordering::Relaxed); }
-                            }
-                            if ui.add(egui::Button::new("✕").rounding(999.0)).clicked() { close = true; }
-                        });
+            ui.add_space(12.0);
+            // ημερολόγιο μήνα
+            use chrono::Datelike;
+            let month = self.pb.month.unwrap_or(date.with_day(1).unwrap());
+            ui.horizontal(|ui| {
+                if ui.small_button("◀").clicked() { self.pb.month = Some((month - chrono::Duration::days(1)).with_day(1).unwrap()); }
+                ui.with_layout(egui::Layout::centered_and_justified(egui::Direction::LeftToRight).with_main_justify(false), |ui| {
+                    ui.label(RichText::new(month.format("%B %Y").to_string()).strong());
+                });
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(ui.available_width() - 30.0);
+                let nm = (month + chrono::Duration::days(32)).with_day(1).unwrap();
+                if ui.add_enabled(nm <= today, egui::Button::new("▶").small()).clicked() { self.pb.month = Some(nm); }
+            });
+            let cw = (ui.available_width() / 7.0).floor();
+            egui::Grid::new("cal").spacing([0.0, 2.0]).min_col_width(cw).max_col_width(cw).show(ui, |ui| {
+                for d in ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"] { ui.vertical_centered(|ui| ui.label(RichText::new(d).small().color(MUTED()))); }
+                ui.end_row();
+                let lead = month.weekday().num_days_from_monday();
+                for _ in 0..lead { ui.label(""); }
+                let mut d = month;
+                let mut col = lead;
+                while d.month() == month.month() {
+                    let sel = d == date;
+                    let fut = d > today;
+                    let txt = RichText::new(d.day().to_string()).color(if sel { Color32::WHITE } else if fut { MUTED().gamma_multiply(0.5) } else { TEXT() });
+                    let b = egui::Button::new(txt).fill(if sel { ACCENT() } else { Color32::TRANSPARENT }).stroke(if d == today && !sel { Stroke::new(1.0, ACCENT()) } else { Stroke::NONE }).rounding(8.0).min_size(egui::vec2(cw - 4.0, 26.0));
+                    if ui.add_enabled(!fut, b).clicked() { self.pb.day = (d - today).num_days(); self.pb.month = Some(month); }
+                    col += 1;
+                    if col == 7 { ui.end_row(); col = 0; }
+                    d += chrono::Duration::days(1);
+                }
+            });
+            ui.add_space(14.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(RichText::new("CHANNELS").small().color(MUTED()).extra_letter_spacing(1.2));
+            let mut changed = false;
+            for (_, ch, name) in &g {
+                let mut on = !self.pb.hidden.contains(ch);
+                let n = files.as_ref().and_then(|r| r.as_ref().ok()).and_then(|m| m.get(ch)).map(|x| (x.0.len(), x.1.len()));
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut on, name.as_str()).changed() { changed = true; if on { self.pb.hidden.remove(ch); } else { self.pb.hidden.insert(*ch); } }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if let Some((a, m)) = n { ui.label(RichText::new(format!("{a} · {m}M")).small().monospace().color(MUTED())); }
                     });
                 });
-                if close { self.pb.player = None; }
+            }
+            if changed { if let Some(t) = self.pb.cursor { seek_to = Some(t); } }
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+            ui.label(RichText::new("PLAYBACK").small().color(MUTED()).extra_letter_spacing(1.2));
+            ui.horizontal(|ui| {
+                let label = if self.pb.paused { "▶  Play" } else { "⏸  Pause" };
+                if ui.add_enabled(!self.pb.players.is_empty(), egui::Button::new(label).rounding(999.0)).clicked() {
+                    self.pb.paused ^= true;
+                    for (_, p) in &self.pb.players { p.pause.store(self.pb.paused, Ordering::Relaxed); }
+                }
+                for x in [1u32, 2, 4, 8] {
+                    if ui.selectable_label(self.pb.speed == x, format!("{x}×")).clicked() {
+                        self.pb.speed = x;
+                        for (_, p) in &self.pb.players { p.speed.store(x, Ordering::Relaxed); }
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.add_enabled(self.pb.cursor.is_some(), egui::Button::new("−30 s")).clicked() { seek_to = self.pb.cursor.map(|c| c - chrono::Duration::seconds(30)); }
+                if ui.add_enabled(self.pb.cursor.is_some(), egui::Button::new("+30 s")).clicked() { seek_to = self.pb.cursor.map(|c| c + chrono::Duration::seconds(30)); }
+                if ui.add_enabled(!self.pb.players.is_empty(), egui::Button::new("■ Stop")).clicked() { self.pb.players.clear(); }
+            });
+            ui.add_space(6.0);
+            ui.label(RichText::new("Click or drag on the timeline to jump. Scroll on it to zoom. Space pause · ←/→ 30 s · double-click a channel to enlarge.").small().color(MUTED()));
+        });
+
+        // ── κέντρο: κανάλια + χρονολόγιο ──
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::same(10.0))).show(ctx, |ui| {
+            let visible: Vec<(u32, String)> = g.iter().filter(|x| !self.pb.hidden.contains(&x.1)).map(|x| (x.1, x.2.clone())).collect();
+            let rows = visible.len().max(1) as f32;
+            let row_h = 16.0;
+            let tl_h = 34.0 + rows * (row_h + 3.0) + 24.0;
+            let avail = ui.available_rect_before_wrap();
+            let grid = egui::Rect::from_min_max(avail.min, egui::pos2(avail.max.x, avail.max.y - tl_h - 8.0));
+            // πλέγμα καναλιών
+            let shown: Vec<(u32, String)> = match self.pb.big { Some(b) if visible.iter().any(|x| x.0 == b) => visible.iter().filter(|x| x.0 == b).cloned().collect(), _ => visible.clone() };
+            let cells = layout_cells(0, shown.len().max(1));
+            let mut toggle_big: Option<u32> = None;
+            for (k, (ch, name)) in shown.iter().enumerate() {
+                let Some(u) = cells.get(k) else { break };
+                let cell = egui::Rect::from_min_max(grid.min + egui::vec2(u.min.x * grid.width(), u.min.y * grid.height()),
+                                                    grid.min + egui::vec2(u.max.x * grid.width(), u.max.y * grid.height())).shrink(3.0);
+                let resp = ui.interact(cell, ui.id().with(("pbcell", ch)), egui::Sense::click());
+                if resp.double_clicked() { toggle_big = Some(*ch); }
+                let p = ui.painter_at(cell);
+                p.rect_filled(cell, 14.0, Color32::from_rgb(5, 6, 10));
+                let pl = self.pb.players.iter().find(|x| x.0 == *ch).map(|x| &x.1);
+                if let Some(t) = pl.and_then(|p| p.tex.as_ref()) {
+                    // γέμισμα κελιού (crop) όπως στη ζωντανή προβολή
+                    let ar = 16.0 / 9.0; let car = cell.width() / cell.height();
+                    let uv = if car > ar { let h = ar / car; egui::Rect::from_min_max(egui::pos2(0.0, 0.5 - h / 2.0), egui::pos2(1.0, 0.5 + h / 2.0)) }
+                             else { let w = car / ar; egui::Rect::from_min_max(egui::pos2(0.5 - w / 2.0, 0.0), egui::pos2(0.5 + w / 2.0, 1.0)) };
+                    let mut rs = egui::epaint::RectShape::filled(cell, 14.0, Color32::WHITE); rs.fill_texture_id = t.id(); rs.uv = uv; p.add(rs);
+                }
+                let msg = match (pl, &files) {
+                    (Some(p), _) => p.shared.lock().unwrap().status.clone(),
+                    (None, None) => "Loading…".into(),
+                    (None, Some(Err(_))) => "Recorder not reachable".into(),
+                    (None, Some(Ok(_))) if self.pb.cursor.is_some() => "No recording".into(),
+                    _ => String::new(),
+                };
+                if !msg.is_empty() { p.text(cell.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(13.0), MUTED()); }
+                let label = match pl { Some(p) => format!("{name}  ·  {}", p.now().format("%H:%M:%S")), None => name.clone() };
+                let gal = p.layout_no_wrap(label, egui::FontId::proportional(11.5), Color32::WHITE);
+                let br = egui::Rect::from_min_size(cell.min + egui::vec2(8.0, 8.0), gal.size() + egui::vec2(16.0, 8.0));
+                p.rect_filled(br, 999.0, Color32::from_black_alpha(150));
+                p.galley(br.min + egui::vec2(8.0, 4.0), gal, Color32::WHITE);
+                if resp.hovered() { p.rect_stroke(cell, 14.0, Stroke::new(1.0, ACCENT().gamma_multiply(0.6))); }
+            }
+            if let Some(b) = toggle_big { self.pb.big = if self.pb.big == Some(b) { None } else { Some(b) }; }
+            if visible.is_empty() {
+                ui.painter().text(grid.center(), egui::Align2::CENTER_CENTER, "No channels selected", egui::FontId::proportional(15.0), MUTED());
+            } else if self.pb.cursor.is_none() {
+                let hint = match &files { None => "Loading recordings…".to_string(), Some(Err(e)) => format!("Recorder not reachable: {e}"),
+                    Some(Ok(m)) if m.values().all(|x| x.0.is_empty()) => "No recordings on this day".into(), _ => "Click on the timeline to start playback".into() };
+                let r = egui::Rect::from_center_size(grid.center(), egui::vec2(360.0, 44.0));
+                ui.painter().rect_filled(r, 999.0, Color32::from_black_alpha(170));
+                ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, hint, egui::FontId::proportional(14.0), Color32::WHITE);
             }
 
-            // ── χρονολόγιο 24 ωρών ──
+            // ── χρονολόγιο ──
             let tl = egui::Rect::from_min_max(egui::pos2(avail.min.x, avail.max.y - tl_h), avail.max);
-            let bar = egui::Rect::from_min_max(tl.min + egui::vec2(0.0, 18.0), egui::pos2(tl.max.x, tl.min.y + 58.0));
-            let resp = ui.interact(bar, ui.id().with("timeline"), egui::Sense::click());
             let p = ui.painter();
-            p.rect_filled(bar, 10.0, glass());
-            p.rect_stroke(bar, 10.0, Stroke::new(1.0, BORDER()));
-            let day0 = date.and_hms_opt(0, 0, 0).unwrap();
-            let x_of = |t: chrono::NaiveDateTime| bar.left() + bar.width() * ((t - day0).num_seconds() as f32 / 86400.0).clamp(0.0, 1.0);
-            if let Some(Ok(v)) = &files {
-                for f in v {
-                    if let (Some(a), Some(b)) = (parse_t(&f.begin), parse_t(&f.end)) {
-                        let r = egui::Rect::from_min_max(egui::pos2(x_of(a), bar.top() + 6.0), egui::pos2(x_of(b).max(x_of(a) + 1.5), bar.bottom() - 6.0));
-                        p.rect_filled(r, 2.0, if self.pb.motion { Color32::from_rgb(255, 176, 32) } else { ACCENT().gamma_multiply(0.75) });
+            p.rect_filled(tl, 14.0, glass());
+            p.rect_stroke(tl, 14.0, Stroke::new(1.0, BORDER()));
+            let name_w = 110.0;
+            let bar = egui::Rect::from_min_max(egui::pos2(tl.left() + name_w, tl.top() + 30.0), egui::pos2(tl.right() - 14.0, tl.bottom() - 24.0));
+            let (vs, vl) = self.pb.view;
+            let x_of = |sec: f64| bar.left() + bar.width() * ((sec - vs) / vl) as f32;
+            let sec_of = |x: f32| (vs + (x - bar.left()) as f64 / bar.width() as f64 * vl).clamp(0.0, 86399.0);
+            let secs = |t: chrono::NaiveDateTime| (t - day0).num_milliseconds() as f64 / 1000.0;
+            // κεφαλίδα: ημερομηνία και τρέχουσα ώρα
+            let head = match self.pb.cursor { Some(c) => format!("{}   {}", date.format("%a %d %B %Y"), c.format("%H:%M:%S")), None => date.format("%a %d %B %Y").to_string() };
+            p.text(egui::pos2(tl.left() + 14.0, tl.top() + 9.0), egui::Align2::LEFT_TOP, head, egui::FontId::monospace(13.0), TEXT());
+            p.text(egui::pos2(tl.right() - 14.0, tl.top() + 9.0), egui::Align2::RIGHT_TOP, "■ recording   ■ motion", egui::FontId::proportional(11.0), MUTED());
+            p.rect_filled(egui::Rect::from_min_size(egui::pos2(tl.right() - 14.0 - 118.0, tl.top() + 11.0), egui::vec2(9.0, 9.0)), 2.0, ACCENT());
+            p.rect_filled(egui::Rect::from_min_size(egui::pos2(tl.right() - 14.0 - 50.0, tl.top() + 11.0), egui::vec2(9.0, 9.0)), 2.0, Color32::from_rgb(255, 176, 32));
+            let clip = p.with_clip_rect(bar.expand2(egui::vec2(0.0, 30.0)));
+            for (k, (ch, name)) in visible.iter().enumerate() {
+                let y = bar.top() + k as f32 * (row_h + 3.0);
+                let row = egui::Rect::from_min_max(egui::pos2(bar.left(), y), egui::pos2(bar.right(), y + row_h));
+                p.text(egui::pos2(tl.left() + 14.0, row.center().y), egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(11.5), MUTED());
+                clip.rect_filled(row, 4.0, Color32::from_white_alpha(if pal().dark { 8 } else { 0 }).gamma_multiply(1.0));
+                clip.rect_filled(row, 4.0, BORDER().gamma_multiply(0.35));
+                if let Some(Ok(m)) = &files {
+                    if let Some((all, mot)) = m.get(ch) {
+                        for (list, col) in [(all, ACCENT().gamma_multiply(0.8)), (mot, Color32::from_rgb(255, 176, 32))] {
+                            for f in list {
+                                if let (Some(a), Some(b)) = (parse_t(&f.begin), parse_t(&f.end)) {
+                                    let (xa, xb) = (x_of(secs(a)), x_of(secs(b)));
+                                    if xb < bar.left() || xa > bar.right() { continue; }
+                                    clip.rect_filled(egui::Rect::from_min_max(egui::pos2(xa, y + 2.0), egui::pos2(xb.max(xa + 1.5), y + row_h - 2.0)), 2.0, col);
+                                }
+                            }
+                        }
                     }
                 }
             }
-            for h in (0..=24).step_by(2) {
-                let x = bar.left() + bar.width() * h as f32 / 24.0;
-                p.line_segment([egui::pos2(x, bar.bottom()), egui::pos2(x, bar.bottom() + 5.0)], Stroke::new(1.0, BORDER()));
-                p.text(egui::pos2(x, bar.bottom() + 8.0), egui::Align2::CENTER_TOP, format!("{h:02}"), egui::FontId::monospace(10.5), MUTED());
+            // κλίμακα ωρών (προσαρμόζεται στο zoom)
+            let step = [60.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0].into_iter().find(|s| vl / s <= 14.0).unwrap_or(7200.0);
+            let mut t = (vs / step).ceil() * step;
+            while t <= vs + vl {
+                let x = x_of(t);
+                p.line_segment([egui::pos2(x, bar.bottom() + 2.0), egui::pos2(x, bar.bottom() + 6.0)], Stroke::new(1.0, MUTED()));
+                let lbl = format!("{:02}:{:02}", (t / 3600.0) as u32, ((t % 3600.0) / 60.0) as u32);
+                p.text(egui::pos2(x, bar.bottom() + 8.0), egui::Align2::CENTER_TOP, lbl, egui::FontId::monospace(10.5), MUTED());
+                t += step;
             }
-            p.text(tl.min, egui::Align2::LEFT_TOP, "Timeline", egui::FontId::proportional(12.0), MUTED());
-            if let Some(pl) = &self.pb.player {
-                let x = x_of(pl.now());
-                p.line_segment([egui::pos2(x, bar.top() - 4.0), egui::pos2(x, bar.bottom() + 4.0)], Stroke::new(2.0, Color32::WHITE));
-                p.circle_filled(egui::pos2(x, bar.top() - 4.0), 4.0, Color32::WHITE);
-            }
-            if let Some(hp) = resp.hover_pos() {
-                let t = day0 + chrono::Duration::seconds(((hp.x - bar.left()) / bar.width() * 86400.0) as i64);
-                p.line_segment([egui::pos2(hp.x, bar.top()), egui::pos2(hp.x, bar.bottom())], Stroke::new(1.0, TEXT().gamma_multiply(0.5)));
-                p.text(egui::pos2(hp.x, bar.top() - 3.0), egui::Align2::CENTER_BOTTOM, t.format("%H:%M").to_string(), egui::FontId::monospace(11.0), TEXT());
-                if resp.clicked() {
-                    if let Some(Ok(v)) = &files {
-                        // το αρχείο που περιέχει τη στιγμή, αλλιώς το επόμενο
-                        let hit = v.iter().find(|f| matches!((parse_t(&f.begin), parse_t(&f.end)), (Some(a), Some(b)) if a <= t && t <= b))
-                            .map(|f| (f.clone(), (t - parse_t(&f.begin).unwrap()).num_seconds() as f64))
-                            .or_else(|| v.iter().filter(|f| parse_t(&f.begin).map_or(false, |a| a > t)).min_by_key(|f| f.begin.clone()).map(|f| (f.clone(), 0.0)));
-                        match hit { Some(h) => play_at = Some(h), None => self.toast("No recording at that time") }
+            // αλληλεπίδραση: κλικ/σύρσιμο = μετάβαση, ροδέλα = zoom
+            let resp = ui.interact(bar.expand2(egui::vec2(0.0, 6.0)), ui.id().with("pbtl"), egui::Sense::click_and_drag());
+            if resp.hovered() {
+                let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                if scroll != 0.0 {
+                    if let Some(mp) = resp.hover_pos() {
+                        let at = sec_of(mp.x);
+                        let nl = (vl * (1.0 - scroll as f64 * 0.003)).clamp(600.0, 86400.0);
+                        let ns = (at - (mp.x - bar.left()) as f64 / bar.width() as f64 * nl).clamp(0.0, 86400.0 - nl);
+                        self.pb.view = (ns, nl);
                     }
                 }
+            }
+            if let Some(pp) = resp.interact_pointer_pos() { if resp.dragged() || resp.drag_started() { self.pb.drag = Some(sec_of(pp.x)); } }
+            if let Some(cur) = self.pb.cursor {
+                let x = x_of(secs(cur));
+                if x >= bar.left() && x <= bar.right() {
+                    p.line_segment([egui::pos2(x, bar.top() - 6.0), egui::pos2(x, bar.bottom() + 2.0)], Stroke::new(2.0, TEXT()));
+                    p.circle_filled(egui::pos2(x, bar.top() - 6.0), 4.5, TEXT());
+                }
+            }
+            let preview = self.pb.drag.or_else(|| resp.hover_pos().map(|h| sec_of(h.x)));
+            if let Some(sv) = preview {
+                let x = x_of(sv);
+                p.line_segment([egui::pos2(x, bar.top() - 4.0), egui::pos2(x, bar.bottom())], Stroke::new(1.0, ACCENT()));
+                let lbl = format!("{:02}:{:02}:{:02}", (sv / 3600.0) as u32, ((sv % 3600.0) / 60.0) as u32, (sv % 60.0) as u32);
+                let gal = p.layout_no_wrap(lbl, egui::FontId::monospace(11.0), Color32::WHITE);
+                let r = egui::Rect::from_center_size(egui::pos2(x.clamp(bar.left() + 34.0, bar.right() - 34.0), bar.top() - 14.0), gal.size() + egui::vec2(12.0, 6.0));
+                p.rect_filled(r, 6.0, ACCENT());
+                p.galley(r.min + egui::vec2(6.0, 3.0), gal, Color32::WHITE);
+            }
+            if resp.drag_stopped() || (resp.clicked() && self.pb.drag.is_none()) {
+                let sv = self.pb.drag.take().or_else(|| resp.interact_pointer_pos().map(|pp| sec_of(pp.x)));
+                if let Some(sv) = sv { seek_to = Some(day0 + chrono::Duration::milliseconds((sv * 1000.0) as i64)); }
             }
         });
-        if let Some((f, skip)) = play_at {
-            self.pb.player = Some(NvrPlayer::start(&cam, f, skip, ctx.clone()));
-        }
+        if let Some(t) = seek_to { self.pb_seek(&cam, t, ctx); }
     }
 }
 

@@ -188,11 +188,12 @@ impl Dvr {
     }
 
     /// Αναπαραγωγή από συγκεκριμένη ώρα (PlayMode ByTime): το καταγραφικό ξεκινά από το `start`.
-    pub fn stream_time(&mut self, host: &str, port: u16, channel: u32, start: &str, end: &str, variant: u8, mut sink: impl FnMut(&[u8]) -> bool) -> anyhow::Result<u64> {
+    pub fn stream_time(&mut self, host: &str, port: u16, channel: u32, start: &str, end: &str, fname: &str, variant: u8, mut sink: impl FnMut(&[u8]) -> bool) -> anyhow::Result<u64> {
         let sid = self.sid();
         let pb = |action: &str| {
             let mut par = json!({"FileName": "", "PlayMode": "ByTime", "TransMode": "TCP", "Value": channel, "StreamType": 0, "IntelligentPlayBackEvent": "", "IntelligentPlayBackSpeed": 0});
             if variant == 1 { par["Channel"] = json!(channel); par["Value"] = json!(0); }
+            if variant == 3 { par["FileName"] = json!(fname); par["PlayMode"] = json!("ByName"); par["Value"] = json!(0); }
             json!({"Name": "OPPlayBack", "SessionID": sid, "OPPlayBack": { "Action": action, "StartTime": start, "EndTime": end, "Parameter": par }})
         };
         let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| anyhow::anyhow!("bad address"))?;
@@ -200,7 +201,7 @@ impl Dvr {
         data.s.set_read_timeout(Some(Duration::from_secs(10)))?;
         let c = data.call(1424, pb("Claim"))?;
         anyhow::ensure!(c["Ret"].as_i64() == Some(100), "claim refused ({:?})", c["Ret"]);
-        let r = self.call(1420, pb("Start"))?;
+        let r = self.call(1420, pb(if variant >= 2 { "DownloadStart" } else { "Start" }))?;
         anyhow::ensure!(r["Ret"].as_i64() == Some(100), "start refused ({:?})", r["Ret"]);
         let mut total = 0u64;
         loop {

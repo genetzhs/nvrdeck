@@ -574,7 +574,7 @@ fun NvrDialog(free: Int, onDismiss: () -> Unit, onAdd: (List<Camera>) -> Unit) {
     var name by remember { mutableStateOf("NVR") }
     var c by remember { mutableStateOf(Camera(port = 554)) }
     var first by remember { mutableStateOf("1") }
-    var count by remember { mutableStateOf(minOf(4, free).coerceAtLeast(1).toString()) }
+    var count by remember { mutableStateOf(minOf(8, free).coerceAtLeast(1).toString()) }
     var err by remember { mutableStateOf("") }
     var testing by remember { mutableStateOf(false) }
     var result by remember { mutableStateOf<Result<String>?>(null) }
@@ -725,6 +725,11 @@ fun SoloView(cam: Camera, idx: Int, s: Settings, onClose: () -> Unit) {
     var off by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
     var view by remember { mutableStateOf<androidx.media3.ui.PlayerView?>(null) }
     var msg by remember { mutableStateOf("") }
+    var res by remember { mutableStateOf("") }
+    var hdFailed by remember(cam.id) { mutableStateOf(false) }
+    val wantHd = s.autoHd && !cam.mainStream && !hdFailed
+    // αν η HD ροή δεν δώσει εικόνα σε 10s, επιστροφή στην ελαφριά
+    LaunchedEffect(wantHd) { if (wantHd) { kotlinx.coroutines.delay(10_000); if (res.isEmpty()) { hdFailed = true; msg = "HD unavailable – using the light stream" } } }
     LaunchedEffect(msg) { if (msg.isNotEmpty()) { kotlinx.coroutines.delay(2000); msg = "" } }
     BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
         val wPx = constraints.maxWidth.toFloat(); val hPx = constraints.maxHeight.toFloat()
@@ -744,7 +749,7 @@ fun SoloView(cam: Camera, idx: Int, s: Settings, onClose: () -> Unit) {
                     )
                 }
                 .graphicsLayer { scaleX = scale; scaleY = scale; translationX = off.x; translationY = off.y },
-            cornerDp = 0.dp, hd = s.autoHd && !cam.mainStream, onView = { view = it })
+            cornerDp = 0.dp, fill = true, hd = wantHd, onView = { view = it }, onFrame = { w, h -> res = "${w}×${h}" })
         Row(Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 18.dp)
             .clip(RoundedCornerShape(50)).background(Color.Black.copy(alpha = .6f)).padding(horizontal = 6.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically) {
@@ -755,7 +760,7 @@ fun SoloView(cam: Camera, idx: Int, s: Settings, onClose: () -> Unit) {
             if (scale > 1.01f) TextButton(onClick = { scale = 1f; off = androidx.compose.ui.geometry.Offset.Zero }) {
                 Text("${"%.1f".format(scale)}×  reset", color = Color.White, fontSize = 12.sp)
             }
-            Text(if (s.autoHd || cam.mainStream) "HD" else "SD", color = Color.White.copy(alpha = .7f), fontSize = 11.sp, fontFamily = GeistMono, modifier = Modifier.padding(horizontal = 8.dp))
+            Text(res.ifEmpty { "…" }, color = Color.White.copy(alpha = .7f), fontSize = 11.sp, fontFamily = GeistMono, modifier = Modifier.padding(horizontal = 8.dp))
             IconButton(onClick = onClose) { Icon(Icons.Outlined.Close, "Close", tint = Color.White) }
         }
         if (msg.isNotEmpty()) Text(msg, color = Color.White, fontSize = 13.sp,

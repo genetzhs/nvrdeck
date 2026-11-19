@@ -1114,9 +1114,9 @@ impl App {
                             let ar = tw as f32 / th as f32;
                             let car = cell.width() / cell.height();
                             if self.solo.is_some() {
-                                let mut sz = cell.size();
-                                if sz.x / sz.y > ar { sz.x = sz.y * ar } else { sz.y = sz.x / ar }
-                                let img_rect = egui::Rect::from_center_size(cell.center(), sz);
+                                // γεμίζει όλη την περιοχή (cover)· ό,τι περισσεύει κόβεται με το uv
+                                let img_rect = cell;
+                                let (cw, chh) = if car > ar { (1.0, ar / car) } else { (car / ar, 1.0) };
                                 // #5 zoom: ροδέλα γύρω από τον κέρσορα, σύρσιμο για μετακίνηση
                                 let zr = ui.interact(img_rect, ui.id().with("zoom"), egui::Sense::drag());
                                 if zr.hovered() {
@@ -1137,10 +1137,10 @@ impl App {
                                     let d = zr.drag_delta() / img_rect.size() / self.zoom;
                                     self.zoom_c -= d;
                                 }
-                                let half = 0.5 / self.zoom;
-                                self.zoom_c.x = self.zoom_c.x.clamp(half, 1.0 - half);
-                                self.zoom_c.y = self.zoom_c.y.clamp(half, 1.0 - half);
-                                let uv = egui::Rect::from_min_max(egui::pos2(self.zoom_c.x - half, self.zoom_c.y - half), egui::pos2(self.zoom_c.x + half, self.zoom_c.y + half));
+                                let (hx, hy) = (0.5 * cw / self.zoom, 0.5 * chh / self.zoom);
+                                self.zoom_c.x = self.zoom_c.x.clamp(hx, 1.0 - hx);
+                                self.zoom_c.y = self.zoom_c.y.clamp(hy, 1.0 - hy);
+                                let uv = egui::Rect::from_min_max(egui::pos2(self.zoom_c.x - hx, self.zoom_c.y - hy), egui::pos2(self.zoom_c.x + hx, self.zoom_c.y + hy));
                                 p.image(tid, img_rect, uv, Color32::WHITE);
                             } else {
                                 let uv = if car > ar { let v = ar / car; egui::Rect::from_min_max(egui::pos2(0.0, (1.0 - v) / 2.0), egui::pos2(1.0, (1.0 + v) / 2.0)) }

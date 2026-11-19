@@ -1847,6 +1847,19 @@ fn nvr_test() -> anyhow::Result<()> {
                                                Ok(None) => {}, Err(e) => { println!("  alarm error {e}"); break } }
                     }
                 }
+                if std::env::var_os("NVRDECK_SEEK2").is_some() && ch > 1 {
+                    let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+                    let want = format!("{day} 12:00:00");
+                    for k in 1..=5u32 {
+                        let fl = d.files(k, &format!("{day} 00:00:00"), &format!("{day} 23:59:59"), "*").unwrap_or_default();
+                        let Some(f) = fl.iter().find(|f| f.begin <= want && want < f.end) else { println!("  ch{k}: no file at {want}"); continue };
+                        let mut p = dvrip::FrameParser::default();
+                        let mut first = String::new();
+                        let t = Instant::now();
+                        let _ = d.stream_time(&c.host, dvrip::PORT, k, &want, &f.end, &f.name, 3, |b| { for (_, key) in p.push(b) { if key && first.is_empty() { first = p.time.clone(); } } first.is_empty() && t.elapsed() < Duration::from_secs(8) });
+                        println!("  ch{k}: file {}–{} · asked {want} → first frame {first} ({:.1}s)", &f.begin[11..], &f.end[11..], t.elapsed().as_secs_f32());
+                    }
+                }
                 if std::env::var_os("NVRDECK_SEEK").is_some() && ch > 1 {
                     let t0 = (chrono::Local::now() - chrono::Duration::minutes(47)).format("%Y-%m-%d %H:%M:%S").to_string();
                     let t1 = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -2052,7 +2065,8 @@ struct NvrPlayer {
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
     speed: Arc<AtomicU32>,
-    pos: Arc<Mutex<f64>>,       // δευτερόλεπτα από την αρχή του αρχείου
+    pos: Arc<Mutex<f64>>,       // (δεν χρησιμοποιείται για την ώρα)
+    clock: Arc<Mutex<Option<chrono::NaiveDateTime>>>, // πραγματική ώρα του καρέ που φαίνεται
     begin: chrono::NaiveDateTime,
     tex: Option<egui::TextureHandle>,
     file: dvrip::RecFile,
@@ -2068,18 +2082,35 @@ impl NvrPlayer {
         let pause = Arc::new(AtomicBool::new(false));
         let speed = Arc::new(AtomicU32::new(1));
         let pos = Arc::new(Mutex::new(skip));
+        let clock: Arc<Mutex<Option<chrono::NaiveDateTime>>> = Arc::new(Mutex::new(None));
+        let stamps: Arc<Mutex<std::collections::VecDeque<chrono::NaiveDateTime>>> = Default::default();
         let begin = at;
         let at_s = at.format("%Y-%m-%d %H:%M:%S").to_string();
         let (sh, st, pa, sp, po, c2, f2, at_s) = (shared.clone(), stop.clone(), pause.clone(), speed.clone(), pos.clone(), cam.clone(), f.clone(), at_s);
+        let (clk, stq) = (clock.clone(), stamps.clone());
+        let target = at;
         std::thread::spawn(move || {
             let r = (|| -> anyhow::Result<()> {
                 let mut d = dvrip::Dvr::connect(&c2.host, dvrip::PORT, &c2.user, &c2.pass)?;
                 let mut parser = dvrip::FrameParser::default();
                 let mut ff: Option<std::process::Child> = None;
                 let mut stdin: Option<std::process::ChildStdin> = None;
+                let mut cur_t: Option<chrono::NaiveDateTime> = None;
+                let mut n_since: u64 = 0;
                 d.stream_time(&c2.host, dvrip::PORT, f2.channel, &at_s, &f2.end, &f2.name, 3, |chunk| {
                     if st.load(Ordering::Relaxed) { return false; }
                     for (frame, key) in parser.push(chunk) {
+                        // ώρα καρέ από την κεφαλίδα I-frame του καταγραφικού, + n/fps για τα ενδιάμεσα
+                        if key { cur_t = parse_t(&parser.time); n_since = 0; }
+                        let Some(base) = cur_t else { continue };
+                        let t = base + chrono::Duration::milliseconds((n_since * 1000 / parser.fps.max(1) as u64) as i64);
+                        n_since += 1;
+                        // ό,τι είναι πριν από τη ζητούμενη στιγμή (−2 s) πετιέται
+                        if ff.is_none() && (!key || t < target - chrono::Duration::seconds(2)) {
+                            if key { sh.lock().unwrap().status = format!("Seeking… {}", t.format("%H:%M:%S")); ctx.request_repaint(); }
+                            continue;
+                        }
+                        stq.lock().unwrap().push_back(t);
                         if ff.is_none() {
                             if !key { continue; }
                             // ffmpeg ξεκινά με το πρώτο I-frame (τότε ξέρουμε codec και fps)
@@ -2090,7 +2121,7 @@ impl NvrPlayer {
                                 .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() { Ok(c) => c, Err(_) => return false };
                             stdin = child.stdin.take();
                             let mut out = child.stdout.take().unwrap();
-                            let (sh, st, pa, sp, po, fps, ctx) = (sh.clone(), st.clone(), pa.clone(), sp.clone(), po.clone(), parser.fps as f64, ctx.clone());
+                            let (sh, st, pa, sp, po, fps, ctx, clk, stq) = (sh.clone(), st.clone(), pa.clone(), sp.clone(), po.clone(), parser.fps as f64, ctx.clone(), clk.clone(), stq.clone());
                             // αναγνώστης: ρυθμός αναπαραγωγής, παράλειψη μέχρι το σημείο εκκίνησης
                             std::thread::spawn(move || {
                                 let mut buf = vec![0u8; PW * PH * 4];
@@ -2108,6 +2139,7 @@ impl NvrPlayer {
                                     shown += 1;
                                     if sp.load(Ordering::Relaxed) as f64 != spd { clock = Instant::now(); shown = 0; }
                                     *po.lock().unwrap() = k as f64 / fps;
+                                    if let Some(t) = stq.lock().unwrap().pop_front() { *clk.lock().unwrap() = Some(t); }
                                     let mut g = sh.lock().unwrap();
                                     g.frame = Some(buf.clone()); g.fresh = true; g.last = Some(Instant::now()); g.status.clear();
                                     drop(g);
@@ -2128,10 +2160,10 @@ impl NvrPlayer {
             })();
             if let Err(e) = r { if !st.load(Ordering::Relaxed) { sh.lock().unwrap().status = format!("Recorder error: {e}"); } }
         });
-        NvrPlayer { shared, stop, pause, speed, pos, begin, tex: None, file: f }
+        NvrPlayer { shared, stop, pause, speed, pos, clock, begin, tex: None, file: f }
     }
     fn ended(&self) -> bool { self.shared.lock().unwrap().status == "End of recording" }
-    fn now(&self) -> chrono::NaiveDateTime { self.begin + chrono::Duration::milliseconds((*self.pos.lock().unwrap() * 1000.0) as i64) }
+    fn now(&self) -> chrono::NaiveDateTime { self.clock.lock().unwrap().unwrap_or(self.begin) }
 }
 impl Drop for NvrPlayer { fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); } }
 
@@ -2143,10 +2175,17 @@ impl App {
         self.pb.cursor = Some(t);
         self.pb.players.clear();
         let Some(Ok(map)) = self.pb.day_files.lock().unwrap().clone() else { return };
+        let covers = |f: &dvrip::RecFile, t: chrono::NaiveDateTime| matches!((parse_t(&f.begin), parse_t(&f.end)), (Some(a), Some(b)) if a <= t && t < b);
+        // αν κανένα κανάλι δεν έχει εγγραφή τη στιγμή t, πάμε στην πρώτη εγγραφή μετά
+        let mut t = t;
+        let any = map.iter().any(|(ch, (all, _))| !self.pb.hidden.contains(ch) && all.iter().any(|f| covers(f, t)));
+        if !any {
+            if let Some(n) = map.iter().filter(|(ch, _)| !self.pb.hidden.contains(ch)).flat_map(|(_, (all, _))| all.iter().filter_map(|f| parse_t(&f.begin)).filter(|a| *a > t)).min() { t = n; self.pb.cursor = Some(t); }
+        }
         for (ch, (all, _)) in &map {
             if self.pb.hidden.contains(ch) { continue; }
-            let hit = all.iter().find(|f| matches!((parse_t(&f.begin), parse_t(&f.end)), (Some(a), Some(b)) if a <= t && t < b)).map(|f| (f.clone(), t))
-                .or_else(|| all.iter().filter_map(|f| parse_t(&f.begin).filter(|a| *a > t).map(|a| (f.clone(), a))).min_by_key(|x| x.1));
+            // μόνο κανάλια με εγγραφή εκείνη τη στιγμή· τα υπόλοιπα ξεκινούν όταν η ώρα φτάσει στην εγγραφή τους
+            let hit = all.iter().find(|f| covers(f, t)).map(|f| (f.clone(), t));
             if let Some((f, at)) = hit {
                 let p = NvrPlayer::start(cam, f, at, ctx.clone());
                 p.pause.store(self.pb.paused, Ordering::Relaxed);
@@ -2205,7 +2244,7 @@ impl App {
         if !next.is_empty() {
             if let Some(Ok(map)) = self.pb.day_files.lock().unwrap().clone() {
                 for (ch, e) in next {
-                    let nf = map.get(&ch).and_then(|(all, _)| all.iter().filter_map(|f| parse_t(&f.begin).filter(|a| *a >= e).map(|a| (f.clone(), a))).min_by_key(|x| x.1));
+                    let nf = map.get(&ch).and_then(|(all, _)| all.iter().filter_map(|f| parse_t(&f.begin).filter(|a| *a >= e - chrono::Duration::seconds(5) && *a <= e + chrono::Duration::seconds(10)).map(|a| (f.clone(), a))).min_by_key(|x| x.1));
                     self.pb.players.retain(|(c, _)| *c != ch);
                     if let Some((f, a)) = nf {
                         let p = NvrPlayer::start(&cam, f, a, ctx.clone());
@@ -2217,6 +2256,20 @@ impl App {
         }
         // τρέχουσα θέση = η πιο πρόσφατη ώρα από τα κανάλια που παίζουν
         if let Some(t) = self.pb.players.iter().map(|(_, p)| p.now()).max() { self.pb.cursor = Some(t); }
+        // κανάλια χωρίς αναπαραγωγή ξεκινούν μόλις η ώρα μπει σε εγγραφή τους
+        if let (Some(t), false) = (self.pb.cursor, self.pb.players.is_empty()) {
+            if let Some(Ok(map)) = self.pb.day_files.lock().unwrap().clone() {
+                for (ch, (all, _)) in &map {
+                    if self.pb.hidden.contains(ch) || self.pb.players.iter().any(|x| x.0 == *ch) { continue; }
+                    if let Some(f) = all.iter().find(|f| matches!((parse_t(&f.begin), parse_t(&f.end)), (Some(a), Some(b)) if a <= t && t + chrono::Duration::seconds(3) < b)) {
+                        let p = NvrPlayer::start(&cam, f.clone(), t, ctx.clone());
+                        p.pause.store(self.pb.paused, Ordering::Relaxed);
+                        p.speed.store(self.pb.speed, Ordering::Relaxed);
+                        self.pb.players.push((*ch, p));
+                    }
+                }
+            }
+        }
         if !self.pb.players.is_empty() { ctx.request_repaint_after(Duration::from_millis(150)); }
         let files = self.pb.day_files.lock().unwrap().clone();
 
@@ -2356,7 +2409,7 @@ impl App {
                     (Some(p), _) => p.shared.lock().unwrap().status.clone(),
                     (None, None) => "Loading…".into(),
                     (None, Some(Err(_))) => "Recorder not reachable".into(),
-                    (None, Some(Ok(_))) if self.pb.cursor.is_some() => "No recording".into(),
+                    (None, Some(Ok(_))) if self.pb.cursor.is_some() => "No recording at this time".into(),
                     _ => String::new(),
                 };
                 if !msg.is_empty() { p.text(cell.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(13.0), MUTED()); }

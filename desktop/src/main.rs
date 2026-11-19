@@ -3,6 +3,7 @@
 
 mod share;
 mod dvrip;
+mod detect;
 use eframe::egui::{self, Color32, RichText, Rounding, Stroke};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -229,10 +230,10 @@ impl Camera {
 #[derive(Serialize, Deserialize, Clone)]
 struct Settings { width: usize, height: usize, fps: u32, #[serde(default)] theme: u32, #[serde(default = "yes")] show_clock: bool, #[serde(default)] layout: u32, #[serde(default)] main_ch: usize,
     #[serde(default = "yes")] auto_hd: bool, #[serde(default = "yes")] alerts: bool, #[serde(default = "alert_secs")] alert_after: u64,
-    #[serde(default)] group: String, #[serde(default = "sens")] motion_sens: u32, #[serde(default)] wall_autologin: bool }
+    #[serde(default)] group: String, #[serde(default = "sens")] motion_sens: u32, #[serde(default = "yes")] ai_only: bool, #[serde(default)] wall_autologin: bool }
 fn sens() -> u32 { 30 }
 fn alert_secs() -> u64 { 60 }
-impl Default for Settings { fn default() -> Self { Settings { width: 960, height: 540, fps: 12, theme: 0, show_clock: true, layout: 0, main_ch: 0, auto_hd: true, alerts: true, alert_after: 60, group: String::new(), motion_sens: 30, wall_autologin: false } } }
+impl Default for Settings { fn default() -> Self { Settings { width: 960, height: 540, fps: 12, theme: 0, show_clock: true, layout: 0, main_ch: 0, auto_hd: true, alerts: true, alert_after: 60, group: String::new(), motion_sens: 30, ai_only: true, wall_autologin: false } } }
 
 #[derive(Serialize, Deserialize, Default)]
 struct Store {
@@ -770,6 +771,10 @@ struct App {
     qr: Option<QrState>,
     media: Vec<(PathBuf, bool, std::time::SystemTime, u64)>,
     pb: NvrPb,
+    det_tx: Option<std::sync::mpsc::Sender<(usize, Vec<u8>)>>,
+    det_rx: Option<std::sync::mpsc::Receiver<(usize, Vec<detect::Hit>)>>,
+    det_busy: std::collections::HashSet<usize>,
+    det_known: std::collections::HashMap<usize, Vec<detect::Hit>>,
 }
 
 /// Αναπαραγωγή από το καταγραφικό
@@ -813,7 +818,7 @@ impl App {
               scan: Arc::new(Mutex::new(ScanState::default())), scan_open: false, nvr: None,
               hd: None, zoom: 1.0, zoom_c: egui::pos2(0.5, 0.5), recs: Default::default(),
               inbox: Arc::new(Mutex::new(vec![])), health: vec![], last_tick: Instant::now(),
-              wall: false, chrome: true, qr: None, media: vec![], pb: NvrPb::default() }
+              wall: false, chrome: true, qr: None, media: vec![], pb: NvrPb::default(), det_tx: None, det_rx: None, det_busy: Default::default(), det_known: Default::default() }
     }
 
     fn restart_streams(&mut self, ctx: &egui::Context) {
@@ -1057,6 +1062,9 @@ impl App {
         }
         let (w, h) = (self.store.settings.width, self.store.settings.height);
         let mut motion_events: Vec<usize> = vec![];
+        let mut ai_frames: Vec<(usize, Vec<u8>)> = vec![];
+        let ai = self.store.settings.ai_only;
+        let busy = self.det_busy.clone();
         for (i, s) in self.streams.iter_mut().enumerate() {
             let Some(s) = s else { continue };
             let mut g = s.shared.lock().unwrap();
@@ -1077,8 +1085,8 @@ impl App {
                                 if s.motion_run >= 4 {
                                     s.motion_at = Some(Instant::now());
                                     if s.motion_note.map_or(true, |t| t.elapsed() > Duration::from_secs(300)) {
-                                        s.motion_note = Some(Instant::now());
-                                        motion_events.push(i);
+                                        if ai { if !busy.contains(&i) { ai_frames.push((i, f.clone())); } }
+                                        else { s.motion_note = Some(Instant::now()); motion_events.push(i); }
                                     }
                                 }
                             }
@@ -1099,6 +1107,33 @@ impl App {
             let name = self.store.camera[i].name.clone();
             if self.store.settings.alerts { desktop_notify(&format!("Motion: {name}"), "Movement detected on this camera."); }
             self.toast(&format!("Motion on {name}"));
+        }
+        // αναγνώριση ανθρώπων/οχημάτων σε ξεχωριστό νήμα
+        if !ai_frames.is_empty() && self.det_tx.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
+            let (rtx, rrx) = std::sync::mpsc::channel();
+            let (w, h, ctx2) = (self.store.settings.width, self.store.settings.height, ctx.clone());
+            std::thread::spawn(move || {
+                let Ok(d) = detect::Detector::new() else { return };
+                for (i, img) in rx { let hits = d.run(&img, w, h, 0.45).unwrap_or_default(); let _ = rtx.send((i, hits)); ctx2.request_repaint(); }
+            });
+            self.det_tx = Some(tx); self.det_rx = Some(rrx);
+        }
+        for (i, img) in ai_frames { if let Some(tx) = &self.det_tx { if tx.send((i, img)).is_ok() { self.det_busy.insert(i); } } }
+        let results: Vec<(usize, Vec<detect::Hit>)> = self.det_rx.as_ref().map(|r| r.try_iter().collect()).unwrap_or_default();
+        for (i, hits) in results {
+            self.det_busy.remove(&i);
+            // ό,τι βρίσκεται στην ίδια θέση με την προηγούμενη φορά (π.χ. παρκαρισμένο αυτοκίνητο) αγνοείται
+            let known = self.det_known.insert(i, hits.clone());
+            let Some(known) = known else { continue }; // πρώτη φορά: μόνο καταγραφή της σκηνής
+            let new: Vec<&detect::Hit> = hits.iter().filter(|h| !known.iter().any(|k| k.class == h.class && detect::iou(&k.bx, &h.bx) > 0.5)).collect();
+            if let Some(h) = new.first() {
+                let what = detect::label(h.class).unwrap_or("Object");
+                let name = self.store.camera.get(i).map(|c| c.name.clone()).unwrap_or_default();
+                if let Some(Some(s)) = self.streams.get_mut(i) { s.motion_note = Some(Instant::now()); }
+                if self.store.settings.alerts { desktop_notify(&format!("{what} at {name}"), &format!("Detected with {:.0}% confidence.", h.score * 100.0)); }
+                self.toast(&format!("{what} at {name}"));
+            }
         }
         egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::same(3.0))).show(ctx, |ui| {
             if self.store.camera.is_empty() {
@@ -1754,7 +1789,8 @@ impl App {
                 ch |= ui.add(egui::Slider::new(&mut st.motion_sens, 1..=100)).changed();
                 ui.end_row();
             });
-            ui.label(RichText::new("Turn motion on per camera in Cameras → Edit.").color(MUTED()).small());
+            ch |= ui.checkbox(&mut st.ai_only, "Only alert for people and vehicles (on-device recognition)").changed();
+            ui.label(RichText::new("Turn motion on per camera in Cameras → Edit. Parked cars and other things that stay put are ignored.").color(MUTED()).small());
             if ch { let _ = self.store.save(); }
         });
         Self::card(ui, "Monitor wall", "Fullscreen without menus (W toggles them). Start with --wall.", |ui| {
@@ -1905,6 +1941,16 @@ fn nvr_test() -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--nvr-test") { return nvr_test(); }
+    if let Some(i) = std::env::args().position(|a| a == "--detect-test") {
+        // αναγνώριση σε εικόνα (raw RGBA 960x540) — μόνο αποτελέσματα
+        let path = std::env::args().nth(i + 1).unwrap_or_default();
+        let d = detect::Detector::new()?;
+        let img = std::fs::read(path)?;
+        let t = Instant::now();
+        let hits = d.run(&img, 960, 540, 0.4)?;
+        println!("{:.0} ms: {:?}", t.elapsed().as_secs_f32() * 1000.0, hits.iter().map(|h| format!("{} {:.2}", detect::label(h.class).unwrap(), h.score)).collect::<Vec<_>>());
+        return Ok(());
+    }
     let wall = std::env::args().any(|a| a == "--wall");
     // ένα μόνο παράθυρο: δεύτερο αντίγραφο θα έσβηνε τις αλλαγές του πρώτου στο ίδιο αρχείο ρυθμίσεων
     let lock_path = store_path().with_extension("lock");

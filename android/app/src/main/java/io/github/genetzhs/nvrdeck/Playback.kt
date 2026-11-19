@@ -62,7 +62,8 @@ fun PlaybackScreen(data: StoreData) {
         files = null
         val cam = group.firstOrNull() ?: return@LaunchedEffect
         files = withContext(Dispatchers.IO) {
-            runCatching { Dvr.connect(cam.host, cam.user, cam.pass).use { it.files(ch, "$date 00:00:00", "$date 23:59:59", if (motion) "M" else "*") } }
+            // στο DVRIP τα κανάλια μετρούν από 0, στο RTSP από 1
+            runCatching { Dvr.connect(cam.host, cam.user, cam.pass).use { it.files((ch - 1).coerceAtLeast(0), "$date 00:00:00", "$date 23:59:59", if (motion) "M" else "*") } }
         }
     }
 

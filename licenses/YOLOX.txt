@@ -1,0 +1,1 @@
+assets/models/yolox_nano.onnx: YOLOX-nano by Megvii (https://github.com/Megvii-BaseDetection/YOLOX), Apache License 2.0.

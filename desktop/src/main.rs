@@ -196,6 +196,9 @@ struct Camera {
     group: String,
     #[serde(default)]
     motion: bool,
+    /// ζώνη AI: "R x0 y0 x1 y1" περιοχή ή "L x0 y0 x1 y1" γραμμή (0..1)
+    #[serde(default)]
+    ai_zone: String,
 }
 fn yes() -> bool { true }
 fn one() -> u32 { 1 }
@@ -203,7 +206,7 @@ fn one() -> u32 { 1 }
 impl Default for Camera {
     fn default() -> Self {
         Camera { name: String::new(), host: String::new(), port: 554, proto: Proto::XMeye, user: "admin".into(),
-                 pass: String::new(), main_stream: false, path: String::new(), enabled: true, channel: 1, group: String::new(), motion: false }
+                 pass: String::new(), main_stream: false, path: String::new(), enabled: true, channel: 1, group: String::new(), motion: false, ai_zone: String::new() }
     }
 }
 
@@ -242,10 +245,10 @@ impl Camera {
 #[derive(Serialize, Deserialize, Clone)]
 struct Settings { width: usize, height: usize, fps: u32, #[serde(default)] theme: u32, #[serde(default = "yes")] show_clock: bool, #[serde(default)] layout: u32, #[serde(default)] main_ch: usize,
     #[serde(default = "yes")] auto_hd: bool, #[serde(default = "yes")] alerts: bool, #[serde(default = "alert_secs")] alert_after: u64,
-    #[serde(default)] group: String, #[serde(default = "sens")] motion_sens: u32, #[serde(default = "yes")] ai_only: bool, #[serde(default)] wall_autologin: bool }
+    #[serde(default)] group: String, #[serde(default = "sens")] motion_sens: u32, #[serde(default = "yes")] ai_only: bool, #[serde(default)] wall_autologin: bool, #[serde(default = "yes")] armed: bool }
 fn sens() -> u32 { 30 }
 fn alert_secs() -> u64 { 60 }
-impl Default for Settings { fn default() -> Self { Settings { width: 960, height: 540, fps: 12, theme: 0, show_clock: true, layout: 0, main_ch: 0, auto_hd: true, alerts: true, alert_after: 60, group: String::new(), motion_sens: 30, ai_only: true, wall_autologin: false } } }
+impl Default for Settings { fn default() -> Self { Settings { width: 960, height: 540, fps: 12, theme: 0, show_clock: true, layout: 0, main_ch: 0, auto_hd: true, alerts: true, alert_after: 60, group: String::new(), motion_sens: 30, ai_only: true, wall_autologin: false, armed: true } } }
 
 #[derive(Serialize, Deserialize, Default)]
 struct Store {
@@ -510,6 +513,47 @@ fn stop_recording(mut r: Recording) -> PathBuf {
     let _ = r.child.kill();
     let _ = r.child.wait();
     r.path
+}
+
+static CLIP_REQ: Mutex<Option<(usize, chrono::NaiveDateTime)>> = Mutex::new(None);
+static UI_CTX: std::sync::OnceLock<egui::Context> = std::sync::OnceLock::new();
+
+#[derive(Clone, Copy)]
+struct AiZone { line: bool, a: f32, b: f32, c: f32, d: f32 }
+impl AiZone {
+    fn parse(s: &str) -> Option<AiZone> {
+        let p: Vec<&str> = s.split_whitespace().collect();
+        if p.len() != 5 { return None }
+        let v: Vec<f32> = p[1..].iter().map(|x| x.parse().ok()).collect::<Option<_>>()?;
+        Some(AiZone { line: p[0] == "L", a: v[0], b: v[1], c: v[2], d: v[3] })
+    }
+    fn enc(&self) -> String { format!("{} {:.3} {:.3} {:.3} {:.3}", if self.line { "L" } else { "R" }, self.a, self.b, self.c, self.d) }
+    fn contains(&self, p: (f32, f32)) -> bool { p.0 >= self.a.min(self.c) && p.0 <= self.a.max(self.c) && p.1 >= self.b.min(self.d) && p.1 <= self.b.max(self.d) }
+    fn crosses(&self, p: (f32, f32), q: (f32, f32)) -> bool {
+        let side = |x: f32, y: f32, ax: f32, ay: f32, bx: f32, by: f32| (bx - ax) * (y - ay) - (by - ay) * (x - ax);
+        side(p.0, p.1, self.a, self.b, self.c, self.d) * side(q.0, q.1, self.a, self.b, self.c, self.d) < 0.0
+            && side(self.a, self.b, p.0, p.1, q.0, q.1) * side(self.c, self.d, p.0, p.1, q.0, q.1) < 0.0
+    }
+}
+
+/// Ειδοποίηση με κουμπί «Play clip» που ανοίγει την εγγραφή της στιγμής (Linux). Αλλού απλή ειδοποίηση.
+fn notify_clip(title: &str, body: &str, cam: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        let t = chrono::Local::now().naive_local();
+        let Ok(c) = Command::new("notify-send").args(["-a", "NVRDeck", "-i", "camera-web", "--action=open=Play clip", "--wait", title, body])
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else { return desktop_notify(title, body) };
+        std::thread::spawn(move || {
+            if let Ok(o) = c.wait_with_output() {
+                if String::from_utf8_lossy(&o.stdout).trim() == "open" {
+                    *CLIP_REQ.lock().unwrap() = Some((cam, t));
+                    if let Some(ctx) = UI_CTX.get() { ctx.send_viewport_cmd(egui::ViewportCommand::Focus); ctx.request_repaint(); }
+                }
+            }
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = cam; desktop_notify(title, body) }
 }
 
 /// Ειδοποίηση επιφάνειας εργασίας (Linux: notify-send, macOS: osascript).
@@ -800,6 +844,7 @@ struct NvrPb {
     nvr: usize,        // δείκτης κάμερας-«αντιπροσώπου» του NVR
     ch: u32,           // κανάλι (όπως στο RTSP)
     day: i64,          // 0 = σήμερα, -1 = χθες…
+    pending: Option<chrono::NaiveDateTime>,
     motion: bool,
     key: String,       // τι φορτώθηκε τελευταία
     files: Arc<Mutex<Option<Result<Vec<dvrip::RecFile>, String>>>>,
@@ -1093,6 +1138,14 @@ impl App {
                     let b = egui::Button::new(txt).fill(if sel { ACCENT() } else { Color32::TRANSPARENT }).stroke(Stroke::NONE).rounding(999.0);
                     if ui.add(b).clicked() { self.page = p; }
                 }
+                {
+                    let armed = self.store.settings.armed;
+                    let t = RichText::new(if armed { "● Armed" } else { "○ Disarmed" }).color(if armed { OK } else { MUTED() }).font(semibold(13.0));
+                    if ui.add(egui::Button::new(t).fill(if armed { OK.gamma_multiply(0.14) } else { Color32::TRANSPARENT }).stroke(Stroke::new(1.0, if armed { OK.gamma_multiply(0.5) } else { BORDER() })).rounding(999.0))
+                        .on_hover_text("Armed: motion and people/vehicle alerts are on. Disarmed: no alerts.").clicked() {
+                        self.store.settings.armed = !armed; self.save();
+                    }
+                }
                 if self.page == Page::Live {
                     ui.add_space(10.0);
                     ui.separator();
@@ -1232,7 +1285,8 @@ impl App {
 
         for i in motion_events {
             let name = self.store.camera[i].name.clone();
-            if self.store.settings.alerts { desktop_notify(&format!("Motion: {name}"), "Movement detected on this camera."); }
+            if !self.store.settings.armed { continue; }
+            if self.store.settings.alerts { notify_clip(&format!("Motion: {name}"), "Movement detected on this camera.", i); }
             self.toast(&format!("Motion on {name}"));
         }
         // αναγνώριση ανθρώπων/οχημάτων σε ξεχωριστό νήμα
@@ -1253,12 +1307,22 @@ impl App {
             // ό,τι βρίσκεται στην ίδια θέση με την προηγούμενη φορά (π.χ. παρκαρισμένο αυτοκίνητο) αγνοείται
             let known = self.det_known.insert(i, hits.clone());
             let Some(known) = known else { continue }; // πρώτη φορά: μόνο καταγραφή της σκηνής
-            let new: Vec<&detect::Hit> = hits.iter().filter(|h| !known.iter().any(|k| k.class == h.class && detect::iou(&k.bx, &h.bx) > 0.5)).collect();
+            if !self.store.settings.armed { continue; }
+            let zone = self.store.camera.get(i).and_then(|c| AiZone::parse(&c.ai_zone));
+            let foot = |h: &detect::Hit| ((h.bx[0] + h.bx[2]) / 2.0, h.bx[3]);
+            let new: Vec<&detect::Hit> = match zone {
+                None => hits.iter().filter(|h| !known.iter().any(|k| k.class == h.class && detect::iou(&k.bx, &h.bx) > 0.5)).collect(),
+                Some(z) if !z.line => hits.iter().filter(|h| !known.iter().any(|k| k.class == h.class && detect::iou(&k.bx, &h.bx) > 0.5) && z.contains(foot(h))).collect(),
+                // γραμμή: το ίδιο αντικείμενο (κοντινότερο ίδιας κατηγορίας) πέρασε από τη μία πλευρά στην άλλη
+                Some(z) => hits.iter().filter(|h| { let p = foot(h);
+                    known.iter().filter(|k| k.class == h.class).min_by(|a, b| { let d = |k: &detect::Hit| { let q = foot(k); (q.0 - p.0).powi(2) + (q.1 - p.1).powi(2) }; d(a).total_cmp(&d(b)) })
+                        .is_some_and(|k| z.crosses(foot(k), p)) }).collect(),
+            };
             if let Some(h) = new.first() {
                 let what = detect::label(h.class).unwrap_or("Object");
                 let name = self.store.camera.get(i).map(|c| c.name.clone()).unwrap_or_default();
                 if let Some(Some(s)) = self.streams.get_mut(i) { s.motion_note = Some(Instant::now()); }
-                if self.store.settings.alerts { desktop_notify(&format!("{what} at {name}"), &format!("Detected with {:.0}% confidence.", h.score * 100.0)); }
+                if self.store.settings.alerts { notify_clip(&format!("{what} at {name}"), &format!("Detected with {:.0}% confidence.", h.score * 100.0), i); }
                 self.toast(&format!("{what} at {name}"));
             }
         }
@@ -1530,6 +1594,8 @@ impl App {
 
         self.scan_ui(ctx);
         self.recorder_ui(ctx);
+        let _ = UI_CTX.set(ctx.clone());
+        if let Some((i, t)) = CLIP_REQ.lock().unwrap().take() { self.open_clip(i, t, ctx); }
         self.qr_ui(ctx);
         self.nvr_ui(ctx);
         self.editor_ui(ctx);
@@ -2398,6 +2464,19 @@ fn parse_t(s: &str) -> Option<chrono::NaiveDateTime> { chrono::NaiveDateTime::pa
 
 impl App {
     /// Όλα τα κανάλια στη στιγμή `t` (κάθε κανάλι: το αρχείο που την περιέχει ή το επόμενο).
+    /// Από ειδοποίηση: άνοιγμα αναπαραγωγής του καταγραφικού λίγα δευτερόλεπτα πριν το συμβάν.
+    fn open_clip(&mut self, i: usize, t: chrono::NaiveDateTime, ctx: &egui::Context) {
+        let Some(cam) = self.store.camera.get(i).cloned() else { return };
+        let groups = self.nvr_groups();
+        let Some(gi) = groups.iter().position(|g| g.iter().any(|x| x.0 == i)) else { self.page = Page::Playback; self.pb.local = true; return };
+        self.page = Page::Playback; self.pb.local = false; self.pb.nvr = gi;
+        self.pb.day = (t.date() - chrono::Local::now().date_naive()).num_days();
+        self.pb.big = Some(cam.channel);
+        self.pb.pending = Some(t - chrono::Duration::seconds(6));
+        self.pb.view = (((t - t.date().and_hms_opt(0, 0, 0).unwrap()).num_seconds() as f64 - 1800.0).max(0.0), 3600.0);
+        ctx.request_repaint();
+    }
+
     fn pb_seek(&mut self, cam: &Camera, t: chrono::NaiveDateTime, ctx: &egui::Context) {
         self.pb.cursor = Some(t);
         self.pb.players.clear();
@@ -2455,6 +2534,9 @@ impl App {
                 *out.lock().unwrap() = Some(r.map_err(|e| e.to_string()));
                 ctx2.request_repaint();
             });
+        }
+        if self.pb.pending.is_some() && matches!(&*self.pb.day_files.lock().unwrap(), Some(Ok(_))) {
+            if let Some(t) = self.pb.pending.take() { self.pb_seek(&cam, t, ctx); }
         }
         // καρέ → υφές· συνέχεια στο επόμενο αρχείο όταν τελειώσει ένα
         let mut next: Vec<(u32, chrono::NaiveDateTime)> = vec![];
@@ -3297,6 +3379,7 @@ impl App {
         let mut open = true;
         let mut do_save = false;
         let mut new_pw: Option<String> = None;
+        let mut zone_dirty = false;
         egui::Window::new("Recorder settings").open(&mut open).collapsible(false).resizable(false).default_width(700.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -3357,6 +3440,33 @@ impl App {
                         if ui.small_button("Select all").clicked() { for r in e.region.iter_mut() { *r = (1 << RW) - 1; } }
                         if ui.small_button("Clear").clicked() { for r in e.region.iter_mut() { *r = 0; } }
                     });
+                    // ── ζώνη AI του NVRDeck (αποθηκεύεται τοπικά) ──
+                    if let Some(ci) = rc.group.iter().find(|x| x.1 == rc.ch).map(|x| x.0) {
+                        ui.add_space(12.0);
+                        ui.label(RichText::new("NVRDeck alert zone").strong());
+                        ui.label(RichText::new("Checked by NVRDeck, not the recorder. Area: alert only for people/vehicles inside it. Line: alert only when one crosses it.").small().color(MUTED()));
+                        let mut z = self.store.camera.get(ci).and_then(|c| AiZone::parse(&c.ai_zone));
+                        let before = z.map(|z| z.enc());
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(z.is_none(), "Whole picture").clicked() { z = None; }
+                            if ui.selectable_label(z.is_some_and(|z| !z.line), "Area").clicked() { z = Some(AiZone { line: false, a: 0.25, b: 0.35, c: 0.75, d: 0.95 }); }
+                            if ui.selectable_label(z.is_some_and(|z| z.line), "Line").clicked() { z = Some(AiZone { line: true, a: 0.1, b: 0.6, c: 0.9, d: 0.6 }); }
+                        });
+                        if let Some(zz) = z.as_mut() {
+                            let (rect, resp) = ui.allocate_exact_size(egui::vec2(640.0, 360.0), egui::Sense::drag());
+                            let p = ui.painter_at(rect);
+                            p.rect_filled(rect, 10.0, Color32::from_rgb(5, 6, 10));
+                            if let Some(t) = &rc.snap_tex { let mut rs = egui::epaint::RectShape::filled(rect, 10.0, Color32::WHITE); rs.fill_texture_id = t.id(); rs.uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)); p.add(rs); }
+                            let n = |q: egui::Pos2| (((q.x - rect.left()) / rect.width()).clamp(0.0, 1.0), ((q.y - rect.top()) / rect.height()).clamp(0.0, 1.0));
+                            if resp.drag_started() { if let Some(q) = resp.interact_pointer_pos() { let (x, y) = n(q); zz.a = x; zz.b = y; zz.c = x; zz.d = y; } }
+                            if resp.dragged() { if let Some(q) = resp.interact_pointer_pos() { let (x, y) = n(q); zz.c = x; zz.d = y; } }
+                            let at = |x: f32, y: f32| rect.min + egui::vec2(x * rect.width(), y * rect.height());
+                            if zz.line { p.line_segment([at(zz.a, zz.b), at(zz.c, zz.d)], Stroke::new(3.0, BAD)); p.circle_filled(at(zz.a, zz.b), 5.0, BAD); p.circle_filled(at(zz.c, zz.d), 5.0, BAD); }
+                            else { let r = egui::Rect::from_two_pos(at(zz.a, zz.b), at(zz.c, zz.d)); p.rect_filled(r, 0.0, BAD.gamma_multiply(0.2)); p.rect_stroke(r, 0.0, Stroke::new(2.0, BAD)); }
+                            ui.label(RichText::new("Drag on the picture to draw it.").small().color(MUTED()));
+                        }
+                        if z.map(|z| z.enc()) != before { if let Some(c) = self.store.camera.get_mut(ci) { c.ai_zone = z.map(|z| z.enc()).unwrap_or_default(); } zone_dirty = true; }
+                    }
                 }
                 (1, Some(e)) => {
                     ui.label(RichText::new("When this camera records to the recorder's disk.").color(MUTED()));
@@ -3481,6 +3591,7 @@ impl App {
             self.save();
             self.restart_streams(ctx);
         }
+        if zone_dirty { self.save(); }
         if !open { self.rcfg = None; }
     }
 }

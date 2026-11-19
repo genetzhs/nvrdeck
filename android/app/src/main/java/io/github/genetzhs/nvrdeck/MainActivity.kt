@@ -82,7 +82,7 @@ class MainActivity : FragmentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         // εικόνα και κάτω από την εγκοπή της κάμερας σε οριζόντια θέση
         window.attributes = window.attributes.apply {
-            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30) WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS else WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
         enableEdgeToEdge()
         setContent {
@@ -250,6 +250,27 @@ fun MainScreen(store: Store, data: StoreData, onLock: () -> Unit) {
         if (Build.VERSION.SDK_INT >= 33 && data.settings.alerts) askNotif.launch(android.Manifest.permission.POST_NOTIFICATIONS)
     }
     val latest by rememberUpdatedState(data)
+    // Αυτόματη εύρεση καναλιών NVR που λείπουν: δοκιμάζει τα επόμενα κανάλια κάθε NVR και προσθέτει όσα δίνουν εικόνα
+    LaunchedEffect(Unit) {
+        kotlinx.coroutines.delay(3000)
+        val nvrs = latest.cameras.filter { it.proto in listOf(Proto.XMEYE, Proto.HIKVISION, Proto.DAHUA) }
+            .groupBy { Triple(it.host, it.port, it.proto) }.filter { it.value.size >= 2 }
+        for ((_, chans) in nvrs) {
+            val base = chans.maxBy { it.channel }
+            val prefix = base.name.substringBeforeLast(" CH", base.name)
+            var misses = 0
+            var ch = base.channel + 1
+            while (misses < 2 && ch <= 16 && latest.cameras.size < MAX_CH) {
+                val cand = base.copy(id = System.nanoTime(), channel = ch, name = "$prefix CH$ch", group = base.group)
+                if (probeCamera(ctx, cand.url()).isSuccess) {
+                    if (latest.cameras.none { it.host == cand.host && it.port == cand.port && it.channel == ch })
+                        store.update { it.copy(cameras = it.cameras + cand) }
+                    misses = 0
+                } else misses++
+                ch++
+            }
+        }
+    }
     LaunchedEffect(Unit) {
         while (true) {
             kotlinx.coroutines.delay(1000)

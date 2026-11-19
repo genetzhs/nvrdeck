@@ -1805,6 +1805,27 @@ fn nvr_test() -> anyhow::Result<()> {
             Err(e) => println!("no ({e})"),
             Ok(mut d) => {
                 let ch = d.channels().unwrap_or(0);
+                println!("storage {:?}", d.storage().map_err(|e| e.to_string()));
+                let from = (chrono::Local::now() - chrono::Duration::days(30)).format("%Y-%m-%d").to_string();
+                for k in 0..ch.min(6) {
+                    let n = d.files(k, &format!("{from} 00:00:00"), &chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(), "*").map(|v| (v.len(), v.first().map(|f| f.begin.clone()), v.last().map(|f| f.end.clone())));
+                    println!("  30 days, channel index {k}: {:?}", n.map_err(|e| e.to_string()));
+                }
+                if std::env::var_os("NVRDECK_DL").is_some() {
+                    let from = (chrono::Local::now() - chrono::Duration::hours(3)).format("%Y-%m-%d %H:%M:%S").to_string();
+                    let to = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                    if let Some(f) = d.files(2, &from, &to, "*").ok().and_then(|v| v.into_iter().rev().nth(1)) {
+                        let raw = std::env::temp_dir().join("nvrdeck_test.raw");
+                        let t = Instant::now();
+                        let r = d.download(&c.host, dvrip::PORT, &f, &raw, 8 << 20, |_| {});
+                        println!("  download {} → {:?} bytes in {:.1}s", f.begin, r.as_ref().map_err(|e| e.to_string()), t.elapsed().as_secs_f32());
+                        if let Ok(bytes) = std::fs::read(&raw) {
+                            let es = dvrip::strip_frames(&bytes);
+                            println!("  first bytes {:02X?} · stripped {} bytes", &bytes[..bytes.len().min(8)], es.len());
+                            let _ = std::fs::write(std::env::temp_dir().join("nvrdeck_test.es"), &es);
+                        }
+                    }
+                }
                 let today = chrono::Local::now().format("%Y-%m-%d").to_string();
                 let all = d.files(c.channel.saturating_sub(1), &format!("{today} 00:00:00"), &format!("{today} 23:59:59"), "*").map(|v| v.len());
                 let mot = d.files(c.channel.saturating_sub(1), &format!("{today} 00:00:00"), &format!("{today} 23:59:59"), "M").map(|v| v.len());

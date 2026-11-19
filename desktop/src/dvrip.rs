@@ -95,7 +95,24 @@ impl Dvr {
     pub fn channels(&mut self) -> anyhow::Result<u32> {
         let sid = self.sid();
         let r = self.call(1020, json!({"Name": "SystemInfo", "SessionID": sid}))?;
-        Ok(r["SystemInfo"]["VideoInChannel"].as_u64().unwrap_or(0) as u32)
+        let si = &r["SystemInfo"];
+        if std::env::var_os("NVRDECK_DEBUG").is_some() {
+            let keys: Vec<String> = si.as_object().map(|o| o.iter().filter(|(k, _)| k.contains("Chan") || k.contains("Num")).map(|(k, v)| format!("{k}={v}")).collect()).unwrap_or_default();
+            eprintln!("  SystemInfo channel fields: {}", keys.join(", "));
+        }
+        let n = |k: &str| si[k].as_u64().unwrap_or(0) as u32;
+        Ok(n("VideoInChannel").max(n("DigChannel")).max(n("CombineSwitch").min(0)))
+    }
+
+    /// Πληροφορίες δίσκων: (πλήθος, συνολικά MB, ελεύθερα MB)
+    pub fn storage(&mut self) -> anyhow::Result<(usize, u64, u64)> {
+        let sid = self.sid();
+        let r = self.call(1020, json!({"Name": "StorageInfo", "SessionID": sid}))?;
+        let hx = |v: &Value| v.as_str().and_then(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+        let disks = r["StorageInfo"].as_array().cloned().unwrap_or_default();
+        let (mut tot, mut free) = (0, 0);
+        for d in &disks { for p in d["Partition"].as_array().cloned().unwrap_or_default() { tot += hx(&p["TotalSpace"]); free += hx(&p["RemainSpace"]); } }
+        Ok((disks.len(), tot, free))
     }
 
     /// Λίστα εγγραφών. `event`: "*" όλες, "M" κίνηση. Χρόνος "YYYY-MM-DD HH:MM:SS". Κανάλι 0-based.
@@ -107,7 +124,7 @@ impl Dvr {
         for _ in 0..50 {
             let r = self.call(1440, json!({"Name": "OPFileQuery", "SessionID": sid, "OPFileQuery": {
                 "BeginTime": from, "EndTime": end, "Channel": channel, "DriverTypeMask": "0x0000FFFF",
-                "Event": event, "Type": "h264", "StreamType": "0x00000000", "HighChannel": 0, "LowChannel": 1u32 << channel.min(31),
+                "Event": event, "Type": "h264",
             }}))?;
             let list = r["OPFileQuery"].as_array().cloned().unwrap_or_default();
             let n = list.len();
@@ -144,32 +161,36 @@ impl Dvr {
                         start: a["Status"].as_str() == Some("Start"), time: a["StartTime"].as_str().unwrap_or("").into() }))
     }
 
-    /// Κατεβάζει μια εγγραφή ως ακατέργαστο H.264/H.265 (για μετατροπή σε MP4 με ffmpeg).
-    pub fn download(&mut self, f: &RecFile, out: &std::path::Path, mut progress: impl FnMut(u64)) -> anyhow::Result<u64> {
+    /// Κατεβάζει μια εγγραφή ως ακατέργαστο ρεύμα (H.264/H.265 με κεφαλίδες XMeye).
+    /// Ροή όπως στο XMeye: δεύτερη σύνδεση με το ίδιο session → Claim (1424) εκεί,
+    /// μετά DownloadStart (1420) στην κύρια· τα δεδομένα έρχονται στη δεύτερη ως 1426.
+    pub fn download(&mut self, host: &str, port: u16, f: &RecFile, out: &std::path::Path, max: u64, mut progress: impl FnMut(u64)) -> anyhow::Result<u64> {
         let sid = self.sid();
         let pb = |action: &str| json!({"Name": "OPPlayBack", "SessionID": sid, "OPPlayBack": {
             "Action": action, "StartTime": f.begin, "EndTime": f.end,
             "Parameter": {"FileName": f.name, "PlayMode": "ByName", "TransMode": "TCP", "Value": 0, "StreamType": 0, "IntelligentPlayBackEvent": "", "IntelligentPlayBackSpeed": 0},
         }});
-        self.call(1420, pb("Claim"))?;
-        self.send(1424, &pb("DownloadStart"))?;
+        let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| anyhow::anyhow!("bad address"))?;
+        let mut data = Dvr { s: TcpStream::connect_timeout(&addr, Duration::from_secs(5))?, session: self.session, seq: 0 };
+        data.s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let dbg = std::env::var_os("NVRDECK_DEBUG").is_some();
+        let c = data.call(1424, pb("Claim"))?;
+        if dbg { eprintln!("  data claim ret={:?}", c["Ret"]); }
+        let r = self.call(1420, pb("DownloadStart"))?;
+        if dbg { eprintln!("  download start ret={:?}", r["Ret"]); }
         let mut file = std::fs::File::create(out)?;
         let mut total = 0u64;
-        self.s.set_read_timeout(Some(Duration::from_secs(15)))?;
         loop {
-            let (m, b) = self.recv()?;
-            match m {
-                1426 => {
-                    if b.is_empty() { break; }
-                    total += b.len() as u64;
-                    file.write_all(&b)?;
-                    progress(total);
-                }
-                1425 => {} // απάντηση στο DownloadStart
-                _ => {}
-            }
+            let (m, b) = data.recv()?;
+            if m == 1426 {
+                if b.is_empty() { break; }
+                total += b.len() as u64;
+                file.write_all(&b)?;
+                progress(total);
+                if total >= max { break; }
+            } else if dbg { eprintln!("  data got {m}"); }
         }
-        let _ = self.send(1424, &pb("DownloadStop"));
+        let _ = self.send(1420, &pb("DownloadStop"));
         Ok(total)
     }
 }
@@ -178,11 +199,16 @@ impl Dvr {
 pub fn strip_frames(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());
     let mut i = 0;
-    while i + 8 <= raw.len() {
+    while i + 16 <= raw.len() {
         if raw[i] == 0 && raw[i + 1] == 0 && raw[i + 2] == 1 && (0xF9..=0xFD).contains(&raw[i + 3]) {
-            let (hdr, len_at) = match raw[i + 3] { 0xFC | 0xFE => (16, 12), 0xFD => (12, 8), 0xFA => (8, 4), 0xF9 => (8, 4), _ => (8, 4) };
+            // FC: I-frame, 16 bytes κεφαλίδα, μήκος u32 στο 12 · FD: P-frame, 8 bytes, μήκος u32 στο 4
+            // FA: ήχος, F9: πληροφορίες — 8 bytes, μήκος u16 στο 6 (παραλείπονται)
+            let (hdr, len) = match raw[i + 3] {
+                0xFC => (16, u32::from_le_bytes([raw[i + 12], raw[i + 13], raw[i + 14], raw[i + 15]]) as usize),
+                0xFD => (8, u32::from_le_bytes([raw[i + 4], raw[i + 5], raw[i + 6], raw[i + 7]]) as usize),
+                _ => (8, u16::from_le_bytes([raw[i + 6], raw[i + 7]]) as usize),
+            };
             if i + hdr > raw.len() { break; }
-            let len = u32::from_le_bytes([raw[i + len_at], raw[i + len_at + 1], raw[i + len_at + 2], raw[i + len_at + 3]]) as usize;
             let start = i + hdr;
             let end = (start + len).min(raw.len());
             if matches!(raw[i + 3], 0xFC | 0xFD) { out.extend_from_slice(&raw[start..end]); }

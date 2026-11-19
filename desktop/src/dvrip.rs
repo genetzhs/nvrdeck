@@ -42,6 +42,8 @@ impl Dvr {
     }
 
     fn sid(&self) -> String { format!("0x{:08X}", self.session) }
+    pub fn session_id(&self) -> String { self.sid() }
+    pub fn send_raw(&mut self, msg: u16, body: &Value) -> anyhow::Result<()> { self.send(msg, body) }
 
     fn send(&mut self, msg: u16, body: &Value) -> anyhow::Result<()> {
         let mut data = serde_json::to_vec(body)?;
@@ -140,6 +142,22 @@ impl Dvr {
         }
         out.dedup_by(|a, b| a.name == b.name);
         Ok(out)
+    }
+
+    /// Στιγμιότυπο JPEG από κανάλι (0-based), μέσω του ίδιου του καταγραφικού.
+    pub fn snapshot(&mut self, channel: u32) -> anyhow::Result<Vec<u8>> {
+        let sid = self.sid();
+        self.send(1560, &json!({"Name": "OPSNAP", "SessionID": sid, "OPSNAP": {"Channel": channel}}))?;
+        loop {
+            let (m, b) = self.recv()?;
+            if m == 1561 {
+                // ορισμένα μοντέλα στέλνουν πρώτα JSON με Ret, άλλα κατευθείαν το JPEG
+                if b.starts_with(&[0xFF, 0xD8]) { return Ok(b); }
+                if let Some(p) = b.windows(2).position(|w| w == [0xFF, 0xD8]) { return Ok(b[p..].to_vec()); }
+                let v = Self::json_of(&b);
+                anyhow::bail!("snapshot refused ({:?})", v["Ret"]);
+            }
+        }
     }
 
     /// Εγγραφή στα συμβάντα (κίνηση κ.λπ.). Μετά καλούμε `next_alarm` σε βρόχο.

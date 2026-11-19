@@ -12,8 +12,8 @@ android {
         applicationId = "io.github.genetzhs.nvrdeck"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.4.0"
+        versionCode = 5
+        versionName = "0.5.0"
     }
     // Υπογραφή release: από μεταβλητές περιβάλλοντος (GitHub Secrets). Χωρίς αυτές → debug key.
     val ks = System.getenv("ANDROID_KEYSTORE_FILE")

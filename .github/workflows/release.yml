@@ -30,13 +30,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15]   # Apple Silicon
+        os: [macos-15]   # ένα καθολικό .dmg (Intel + Apple Silicon)
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Build .app and .dmg
         run: packaging/macos-bundle.sh
+        env: { UNIVERSAL: "1", MACOSX_DEPLOYMENT_TARGET: "10.15" }
       - uses: actions/upload-artifact@v4
         with: { name: "macos-${{ matrix.os }}", path: "dist/*.dmg" }
 

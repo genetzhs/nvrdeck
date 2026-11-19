@@ -1879,10 +1879,18 @@ fn nvr_test() -> anyhow::Result<()> {
                     let n = d.files(k, &format!("{from} 00:00:00"), &chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(), "*").map(|v| (v.len(), v.first().map(|f| f.begin.clone()), v.last().map(|f| f.end.clone())));
                     println!("  30 days, channel index {k}: {:?}", n.map_err(|e| e.to_string()));
                 }
+                if std::env::var_os("NVRDECK_SNAP").is_some() && ch > 1 {
+                    for k in [1u32, 5] {
+                        match d.snapshot(k) { Ok(j) => { let _ = std::fs::write(format!("/tmp/claude-1000/-home-genetzhs/a1a28aaf-1048-437b-8fa8-d043de974315/scratchpad/snap{k}.jpg"), &j); println!("  snapshot ch index {k}: {} KB jpeg", j.len() / 1024) }
+                                              Err(e) => println!("  snapshot ch index {k}: {e}") }
+                    }
+                }
                 if std::env::var_os("NVRDECK_ALARM").is_some() && ch > 1 {
                     println!("  subscribe {:?}", d.subscribe_alarms().map_err(|e| e.to_string()));
                     let t = Instant::now();
-                    while t.elapsed() < Duration::from_secs(60) {
+                    let mut ka = Instant::now();
+                    while t.elapsed() < Duration::from_secs(120) {
+                        if ka.elapsed() > Duration::from_secs(15) { ka = Instant::now(); let sid = d.session_id(); let _ = d.send_raw(1006, &serde_json::json!({"Name": "KeepAlive", "SessionID": sid})); }
                         match d.next_alarm() { Ok(Some(a)) => println!("  alarm ch{} {} {} {}", a.channel, a.event, if a.start { "start" } else { "stop" }, a.time),
                                                Ok(None) => {}, Err(e) => { println!("  alarm error {e}"); break } }
                     }

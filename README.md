@@ -29,7 +29,7 @@ Download the latest packages from the [Releases](https://github.com/genetzhs/nvr
 |---|---|---|
 | Ubuntu / Debian | `nvrdeck_<ver>_amd64.deb` | `sudo apt install ./nvrdeck_<ver>_amd64.deb` (pulls in `ffmpeg`) |
 | Any Linux | `NVRDeck-<ver>-x86_64.AppImage` | `chmod +x` and run; needs `ffmpeg` installed |
-| macOS (Apple Silicon) | `NVRDeck-<ver>-arm64.dmg` | needs `brew install ffmpeg`; ad-hoc signed — first launch: right-click → Open |
+| macOS (Intel + Apple Silicon) | `NVRDeck-<ver>-universal.dmg` | needs `brew install ffmpeg`; ad-hoc signed — first launch: right-click → Open |
 | Android 8.0+ | `NVRDeck-<ver>.apk` | allow "Install unknown apps" |
 
 Packages are built by GitHub Actions (`.github/workflows/release.yml`) when a `v*` tag is pushed.

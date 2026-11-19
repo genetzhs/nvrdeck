@@ -81,6 +81,7 @@ impl Dvr {
         self.send(msg, &body)?;
         loop {
             let (m, b) = self.recv()?;
+            if std::env::var_os("NVRDECK_DEBUG").is_some() { eprintln!("  sent {msg} got {m} ({} bytes) ret={:?}", b.len(), Self::json_of(&b)["Ret"]); }
             if m == msg + 1 { return Ok(Self::json_of(&b)); }
         }
     }

@@ -1800,7 +1800,7 @@ fn nvr_test() -> anyhow::Result<()> {
     let mut seen = std::collections::HashSet::new();
     for c in store.camera.iter().filter(|c| c.proto == Proto::XMeye) {
         if !seen.insert(c.host.clone()) { continue; }
-        print!("{} : ", c.name);
+        print!("{} : ", c.name); use std::io::Write as _; let _ = std::io::stdout().flush();
         match dvrip::Dvr::connect(&c.host, dvrip::PORT, &c.user, &c.pass) {
             Err(e) => println!("no ({e})"),
             Ok(mut d) => {

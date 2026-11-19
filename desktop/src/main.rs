@@ -108,12 +108,24 @@ fn apply_theme(ctx: &egui::Context, idx: u32) {
     v.widgets.hovered.bg_stroke = Stroke::new(1.0, P.border);
     v.widgets.active.bg_fill = P.hover;
     v.widgets.active.weak_bg_fill = P.hover;
+    // παράθυρα φορμών: ίδια κάρτα με τη σύνδεση
+    v.window_fill = if P.dark { Color32::from_rgb(17, 18, 21) } else { PANEL() };
+    v.window_rounding = Rounding::same(20.0);
+    v.window_shadow = egui::epaint::Shadow { offset: egui::vec2(0.0, 18.0), blur: 48.0, spread: 0.0, color: Color32::from_black_alpha(if P.dark { 130 } else { 35 }) };
+    v.popup_shadow = egui::epaint::Shadow { offset: egui::vec2(0.0, 8.0), blur: 24.0, spread: 0.0, color: Color32::from_black_alpha(if P.dark { 110 } else { 25 }) };
+    v.text_cursor.stroke = Stroke::new(2.0, ACCENT());
+    for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] { w.rounding = Rounding::same(10.0); }
+    // η μπάρα τίτλου των παραθύρων παίρνει το ίδιο χρώμα με την κάρτα
+    v.widgets.open.weak_bg_fill = v.window_fill;
     ctx.set_visuals(v);
 
     ctx.style_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 8.0);
         s.spacing.button_padding = egui::vec2(16.0, 8.0);
-        s.spacing.interact_size.y = 34.0;
+        s.spacing.interact_size = egui::vec2(64.0, 38.0);
+        s.spacing.window_margin = egui::Margin::same(24.0);
+        s.spacing.icon_width = 18.0;
+        s.spacing.icon_spacing = 8.0;
         // γρήγορη, όχι «νωχελική» ανταπόκριση
         s.animation_time = 0.12;
         use egui::{FontId, TextStyle::*};
@@ -768,6 +780,7 @@ struct App {
     last_tick: Instant,
     wall: bool,
     chrome: bool,
+    login_show: bool,
     qr: Option<QrState>,
     media: Vec<(PathBuf, bool, std::time::SystemTime, u64)>,
     pb: NvrPb,
@@ -818,7 +831,7 @@ impl App {
               scan: Arc::new(Mutex::new(ScanState::default())), scan_open: false, nvr: None,
               hd: None, zoom: 1.0, zoom_c: egui::pos2(0.5, 0.5), recs: Default::default(),
               inbox: Arc::new(Mutex::new(vec![])), health: vec![], last_tick: Instant::now(),
-              wall: false, chrome: true, qr: None, media: vec![], pb: NvrPb::default(), det_tx: None, det_rx: None, det_busy: Default::default(), det_known: Default::default() }
+              wall: false, chrome: true, login_show: false, qr: None, media: vec![], pb: NvrPb::default(), det_tx: None, det_rx: None, det_busy: Default::default(), det_known: Default::default() }
     }
 
     fn restart_streams(&mut self, ctx: &egui::Context) {
@@ -895,54 +908,93 @@ impl App {
     // ── Οθόνη σύνδεσης / πρώτης ρύθμισης ──
     fn login_ui(&mut self, ctx: &egui::Context) {
         let first = self.store.admin_hash.is_empty();
-        egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT)).show(ctx, |ui| {
-            let card = egui::Rect::from_center_size(ui.max_rect().center(), egui::vec2(360.0, if first { 360.0 } else { 300.0 }));
-            ui.allocate_ui_at_rect(card, |ui| {
-                egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0, BORDER())).rounding(26.0)
-                    .inner_margin(egui::Margin::same(28.0)).show(ui, |ui| {
-                    ui.set_width(card.width() - 56.0);
-                    ui.label(RichText::new("●  NVR Viewer").size(22.0).strong());
-                    ui.label(RichText::new(if first { "First run – create an admin account" } else { "Sign in to continue" }).color(MUTED()));
-                    ui.add_space(14.0);
-                    ui.label(RichText::new("Username").color(MUTED()).small());
-                    ui.add(egui::TextEdit::singleline(&mut self.login_user).desired_width(f32::INFINITY));
-                    ui.label(RichText::new("Password").color(MUTED()).small());
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.login_pass).password(true).desired_width(f32::INFINITY));
-                    if first {
-                        ui.label(RichText::new("Repeat password").color(MUTED()).small());
-                        ui.add(egui::TextEdit::singleline(&mut self.login_pass2).password(true).desired_width(f32::INFINITY));
-                    }
-                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if !self.login_err.is_empty() {
-                        ui.label(RichText::new(&self.login_err).color(BAD).small());
-                    }
-                    ui.add_space(6.0);
-                    let go = ui.add_sized([ui.available_width(), 34.0], primary(if first { "Create & sign in" } else { "Sign in" })).clicked();
-                    if go || enter {
-                        if first {
-                            if self.login_user.trim().is_empty() || self.login_pass.len() < 4 {
-                                self.login_err = "Password needs at least 4 characters".into();
-                            } else if self.login_pass != self.login_pass2 {
-                                self.login_err = "Passwords do not match".into();
-                            } else {
-                                let (u, p) = (self.login_user.trim().to_string(), self.login_pass.clone());
-                                self.store.set_admin(&u, &p);
-                                self.save();
-                                self.enter(ctx);
-                            }
-                        } else if self.store.check(self.login_user.trim(), &self.login_pass) {
-                            self.enter(ctx);
-                        } else {
-                            self.login_err = "Wrong username or password".into();
-                            self.login_pass.clear();
-                        }
-                    }
+        let icon = ctx.data_mut(|d| d.get_temp::<egui::TextureHandle>(egui::Id::new("appicon"))).unwrap_or_else(|| {
+            let img = image_from_png(include_bytes!("../assets/icon.png"));
+            let t = ctx.load_texture("appicon", img, egui::TextureOptions::LINEAR);
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("appicon"), t.clone()));
+            t
+        });
+        let mut submit = false;
+        egui::Area::new(egui::Id::new("login")).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -12.0)).show(ctx, |ui| {
+            egui::Frame::none()
+                .fill(if pal().dark { Color32::from_rgb(17, 18, 21) } else { PANEL() })
+                .stroke(Stroke::new(1.0, BORDER()))
+                .rounding(24.0)
+                .shadow(egui::epaint::Shadow { offset: egui::vec2(0.0, 18.0), blur: 48.0, spread: 0.0, color: Color32::from_black_alpha(if pal().dark { 120 } else { 30 }) })
+                .inner_margin(egui::Margin { left: 32.0, right: 32.0, top: 32.0, bottom: 28.0 })
+                .show(ui, |ui| {
+                ui.set_width(336.0);
+                ui.spacing_mut().item_spacing.y = 0.0;
+                // ταυτότητα
+                ui.horizontal(|ui| {
+                    ui.add(egui::Image::new((icon.id(), egui::vec2(44.0, 44.0))).rounding(11.0));
+                    ui.add_space(12.0);
+                    ui.vertical(|ui| {
+                        ui.add_space(2.0);
+                        ui.label(RichText::new("NVRDeck").font(semibold(22.0)).extra_letter_spacing(-0.5).color(TEXT()));
+                        ui.add_space(3.0);
+                        ui.label(RichText::new(if first { "Create the admin account for this computer" } else { "Sign in to view your cameras" }).size(13.0).color(MUTED()));
+                    });
                 });
+                ui.add_space(28.0);
+
+                let r1 = login_field(ui, "Username", &mut self.login_user, FieldIcon::User, None, false);
+                ui.add_space(14.0);
+                let af = !first && !self.login_user.is_empty() && self.login_pass.is_empty();
+                let r2 = login_field(ui, "Password", &mut self.login_pass, FieldIcon::Lock, Some(&mut self.login_show), af);
+                let mut r3 = None;
+                if first {
+                    ui.add_space(14.0);
+                    let mut show = self.login_show;
+                    r3 = Some(login_field(ui, "Repeat password", &mut self.login_pass2, FieldIcon::Lock, Some(&mut show), false));
+                    self.login_show = show;
+                }
+                let enter = ui.input(|i| i.key_pressed(egui::Key::Enter)) && (r1.lost_focus() || r2.lost_focus() || r3.as_ref().map_or(false, |r| r.lost_focus()));
+                if !self.login_err.is_empty() {
+                    ui.add_space(14.0);
+                    egui::Frame::none().fill(BAD.gamma_multiply(0.12)).stroke(Stroke::new(1.0, BAD.gamma_multiply(0.35))).rounding(10.0)
+                        .inner_margin(egui::Margin::symmetric(12.0, 9.0)).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(&self.login_err).size(13.0).color(if pal().dark { Color32::from_rgb(255, 160, 175) } else { BAD }));
+                    });
+                }
+                ui.add_space(22.0);
+                let label = RichText::new(if first { "Create account" } else { "Sign in" }).font(semibold(15.0)).color(Color32::WHITE);
+                let btn = egui::Button::new(label).fill(ACCENT()).stroke(Stroke::NONE).rounding(12.0);
+                let br = ui.add_sized([ui.available_width(), 46.0], btn);
+                if br.hovered() { ui.painter().rect_filled(br.rect, 12.0, Color32::from_white_alpha(14)); }
+                submit = br.clicked() || enter;
+            });
+            ui.add_space(16.0);
+            ui.vertical_centered(|ui| {
+                ui.label(RichText::new(format!("v{} · credentials stay on this computer", env!("CARGO_PKG_VERSION"))).size(11.5).color(MUTED().gamma_multiply(0.8)));
             });
         });
+        if submit {
+            if first {
+                if self.login_user.trim().is_empty() {
+                    self.login_err = "Choose a username.".into();
+                } else if self.login_pass.chars().count() < 4 {
+                    self.login_err = "Use a password with at least 4 characters.".into();
+                } else if self.login_pass != self.login_pass2 {
+                    self.login_err = "The two passwords don't match. Type them again.".into();
+                } else {
+                    let (u, p) = (self.login_user.trim().to_string(), self.login_pass.clone());
+                    self.store.set_admin(&u, &p);
+                    self.save();
+                    self.enter(ctx);
+                }
+            } else if self.store.check(self.login_user.trim(), &self.login_pass) {
+                self.enter(ctx);
+            } else {
+                self.login_err = "Wrong username or password. Check Caps Lock and try again.".into();
+                self.login_pass.clear();
+            }
+        }
     }
 
     fn enter(&mut self, ctx: &egui::Context) {
+        self.login_show = false;
         self.logged_in = true;
         self.login_err.clear();
         self.login_pass.clear();
@@ -1469,7 +1521,7 @@ impl App {
             ui.add_space(6.0);
             egui::Grid::new("nvrform").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
                 ui.label(RichText::new("Name").color(MUTED()));
-                ui.add(egui::TextEdit::singleline(&mut f.name).desired_width(240.0));
+                input(ui, "nvr_name", &mut f.name, "e.g. Home NVR", 260.0, None);
                 ui.end_row();
                 ui.label(RichText::new("Type").color(MUTED()));
                 egui::ComboBox::from_id_salt("nvrproto").selected_text(f.cam.proto.label()).width(240.0).show_ui(ui, |ui| {
@@ -1477,19 +1529,16 @@ impl App {
                 });
                 ui.end_row();
                 ui.label(RichText::new("IP / Host").color(MUTED()));
-                ui.add(egui::TextEdit::singleline(&mut f.cam.host).hint_text("e.g. 192.168.1.50").desired_width(240.0));
+                input(ui, "nvr_host", &mut f.cam.host, "e.g. 192.168.1.50", 260.0, None);
                 ui.end_row();
                 ui.label(RichText::new("RTSP port").color(MUTED()));
                 ui.add(egui::DragValue::new(&mut f.cam.port).range(1..=65535));
                 ui.end_row();
                 ui.label(RichText::new("Username").color(MUTED()));
-                ui.add(egui::TextEdit::singleline(&mut f.cam.user).desired_width(240.0));
+                input(ui, "nvr_user", &mut f.cam.user, "admin", 260.0, None);
                 ui.end_row();
                 ui.label(RichText::new("Password").color(MUTED()));
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut f.cam.pass).password(!f.show_pass).desired_width(194.0));
-                    if ui.small_button(if f.show_pass { "🙈" } else { "👁" }).clicked() { f.show_pass ^= true; }
-                });
+                input(ui, "nvr_pass", &mut f.cam.pass, "", 260.0, Some(&mut f.show_pass));
                 ui.end_row();
                 ui.label(RichText::new("Channels").color(MUTED()));
                 ui.horizontal(|ui| {
@@ -1562,11 +1611,11 @@ impl App {
             let c = &mut ed.cam;
             egui::Grid::new("camform").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
                 ui.label(RichText::new("Name").color(MUTED()));
-                ui.add(egui::TextEdit::singleline(&mut c.name).hint_text("e.g. Yard").desired_width(260.0));
+                input(ui, "cam_name", &mut c.name, "e.g. Yard", 280.0, None);
                 ui.end_row();
 
                 ui.label(RichText::new("Group").color(MUTED()));
-                ui.add(egui::TextEdit::singleline(&mut c.group).hint_text("optional, e.g. Outside").desired_width(260.0));
+                input(ui, "cam_group", &mut c.group, "Optional, e.g. Outside", 280.0, None);
                 ui.end_row();
 
                 ui.label(RichText::new("Motion").color(MUTED()));
@@ -1582,7 +1631,7 @@ impl App {
                 ui.end_row();
 
                 ui.label(RichText::new("IP / Host").color(MUTED()));
-                ui.add(egui::TextEdit::singleline(&mut c.host).hint_text("e.g. 192.168.1.10").desired_width(260.0));
+                input(ui, "cam_host", &mut c.host, "e.g. 192.168.1.10", 280.0, None);
                 ui.end_row();
 
                 ui.label(RichText::new("RTSP port").color(MUTED()));
@@ -1591,7 +1640,7 @@ impl App {
 
                 if c.proto == Proto::Custom {
                     ui.label(RichText::new("Path").color(MUTED()));
-                    ui.add(egui::TextEdit::singleline(&mut c.path).hint_text("live1.264").desired_width(260.0));
+                    input(ui, "cam_path", &mut c.path, "e.g. live1.264", 280.0, None);
                     ui.end_row();
                 }
 
@@ -1605,14 +1654,11 @@ impl App {
                 }
 
                 ui.label(RichText::new("Username").color(MUTED()));
-                ui.add(egui::TextEdit::singleline(&mut c.user).desired_width(260.0));
+                input(ui, "cam_user", &mut c.user, "admin", 280.0, None);
                 ui.end_row();
 
                 ui.label(RichText::new("Password").color(MUTED()));
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut c.pass).password(!ed.show_pass).desired_width(214.0));
-                    if ui.small_button(if ed.show_pass { "🙈" } else { "👁" }).clicked() { ed.show_pass ^= true; }
-                });
+                input(ui, "cam_pass", &mut c.pass, "", 280.0, Some(&mut ed.show_pass));
                 ui.end_row();
 
                 ui.label(RichText::new("Stream").color(MUTED()));
@@ -1802,8 +1848,10 @@ impl App {
         });
         Self::card(ui, "Admin account", "Login password for this app.", |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut self.login_pass).password(true).hint_text("New password").desired_width(170.0));
-                ui.add(egui::TextEdit::singleline(&mut self.login_pass2).password(true).hint_text("Repeat").desired_width(170.0));
+                let sid_hide = egui::Id::new(("show", "adm_p1")); let mut hide = ui.data(|d| d.get_temp::<bool>(sid_hide).unwrap_or(false));
+                input(ui, "adm_p1", &mut self.login_pass, "New password", 190.0, Some(&mut hide)); ui.data_mut(|d| d.insert_temp(sid_hide, hide));
+                let sid_hide2 = egui::Id::new(("show", "adm_p2")); let mut hide2 = ui.data(|d| d.get_temp::<bool>(sid_hide2).unwrap_or(false));
+                input(ui, "adm_p2", &mut self.login_pass2, "Repeat password", 190.0, Some(&mut hide2)); ui.data_mut(|d| d.insert_temp(sid_hide2, hide2));
                 if ui.button("Change").clicked() {
                     if self.login_pass.len() < 4 { self.toast("Password needs at least 4 characters"); }
                     else if self.login_pass != self.login_pass2 { self.toast("Passwords do not match"); }
@@ -1992,8 +2040,10 @@ impl App {
             } else {
                 ui.label("Choose a passphrase. You will type it on the phone to decrypt.");
                 ui.add_space(6.0);
-                ui.add(egui::TextEdit::singleline(&mut q.pass).password(true).hint_text("Passphrase (8+ characters)").desired_width(300.0));
-                ui.add(egui::TextEdit::singleline(&mut q.pass2).password(true).hint_text("Repeat").desired_width(300.0));
+                let sid_sh = egui::Id::new(("show", "qr_p1")); let mut sh = ui.data(|d| d.get_temp::<bool>(sid_sh).unwrap_or(false));
+                input(ui, "qr_p1", &mut q.pass, "Passphrase (8+ characters)", 320.0, Some(&mut sh)); ui.data_mut(|d| d.insert_temp(sid_sh, sh));
+                let sid_sh2 = egui::Id::new(("show", "qr_p2")); let mut sh2 = ui.data(|d| d.get_temp::<bool>(sid_sh2).unwrap_or(false));
+                input(ui, "qr_p2", &mut q.pass2, "Repeat passphrase", 320.0, Some(&mut sh2)); ui.data_mut(|d| d.insert_temp(sid_sh2, sh2));
                 if !q.err.is_empty() { ui.label(RichText::new(&q.err).color(BAD)); }
                 ui.add_space(6.0);
                 if ui.add(primary("Create QR code")).clicked() { gen = true; }
@@ -2602,4 +2652,94 @@ fn fetch_recording(cam: &Camera, f: &dvrip::RecFile, name: &str, job: &Arc<Mutex
     let _ = std::fs::remove_file(&tmp);
     anyhow::ensure!(st.success(), "conversion failed");
     Ok(out)
+}
+
+// ── Πεδία σύνδεσης ──
+#[derive(Clone, Copy)]
+enum FieldIcon { User, Lock }
+
+fn image_from_png(bytes: &[u8]) -> egui::ColorImage {
+    let d = eframe::icon_data::from_png_bytes(bytes).unwrap_or_default();
+    egui::ColorImage::from_rgba_unmultiplied([d.width as usize, d.height as usize], &d.rgba)
+}
+
+/// Ετικέτα + ψηλό πεδίο με εικονίδιο, δαχτυλίδι εστίασης και (για κωδικό) κουμπί εμφάνισης.
+fn login_field(ui: &mut egui::Ui, label: &str, value: &mut String, icon: FieldIcon, show: Option<&mut bool>, autofocus: bool) -> egui::Response {
+    ui.label(RichText::new(label).size(12.5).color(TEXT().gamma_multiply(0.78)));
+    ui.add_space(7.0);
+    let w = ui.available_width();
+    field_box(ui, ("lf", label), value, Some(icon), show, autofocus, w, 46.0, "")
+}
+
+/// Πεδίο φόρμας με την ίδια εμφάνιση παντού (ρυθμίσεις, κάμερα, NVR, QR).
+fn input(ui: &mut egui::Ui, key: impl std::hash::Hash, value: &mut String, hint: &str, width: f32, show: Option<&mut bool>) -> egui::Response {
+    let w = if width <= 0.0 { ui.available_width() } else { width };
+    field_box(ui, key, value, None, show, false, w, 38.0, hint)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn field_box(ui: &mut egui::Ui, key: impl std::hash::Hash, value: &mut String, icon: Option<FieldIcon>, show: Option<&mut bool>, autofocus: bool, width: f32, h: f32, hint: &str) -> egui::Response {
+    let id = ui.make_persistent_id(key);
+    let focused = ui.memory(|m| m.has_focus(id));
+    let rad = if h > 42.0 { 12.0 } else { 10.0 };
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
+    let hovered = ui.rect_contains_pointer(rect);
+    let p = ui.painter();
+    let fill = if pal().dark { Color32::from_rgb(10, 10, 12) } else { Color32::WHITE };
+    p.rect_filled(rect, rad, fill);
+    if focused {
+        p.rect_stroke(rect.expand(3.0), rad + 3.0, Stroke::new(3.0, ACCENT().gamma_multiply(0.25)));
+        p.rect_stroke(rect, rad, Stroke::new(1.0, ACCENT()));
+    } else {
+        p.rect_stroke(rect, rad, Stroke::new(1.0, if hovered { MUTED().gamma_multiply(0.6) } else { BORDER() }));
+    }
+    // εικονίδιο (ζωγραφισμένο, ίδιο πάχος γραμμής)
+    let ic = egui::pos2(rect.left() + 22.0, rect.center().y);
+    let col = if focused { ACCENT() } else { MUTED() };
+    let st = Stroke::new(1.6, col);
+    if let Some(icon) = icon { match icon {
+        FieldIcon::User => {
+            p.circle_stroke(ic + egui::vec2(0.0, -3.5), 3.6, st);
+            let pts: Vec<egui::Pos2> = (0..=16).map(|k| { let a = std::f32::consts::PI * (1.0 + k as f32 / 16.0); ic + egui::vec2(7.0 * a.cos(), 8.5 + 6.0 * a.sin()) }).collect();
+            p.add(egui::Shape::line(pts, st));
+        }
+        FieldIcon::Lock => {
+            let body = egui::Rect::from_center_size(ic + egui::vec2(0.0, 3.5), egui::vec2(13.0, 9.5));
+            p.rect_stroke(body, 2.5, st);
+            // κρίκος: δύο κάθετα σκέλη + τόξο
+            let (r, top, base) = (3.6, -4.5, body.top() - ic.y);
+            let mut pts = vec![ic + egui::vec2(-r, base), ic + egui::vec2(-r, top)];
+            pts.extend((1..16).map(|k| { let a = std::f32::consts::PI * (1.0 + k as f32 / 16.0); ic + egui::vec2(r * a.cos(), top + r * a.sin()) }));
+            pts.push(ic + egui::vec2(r, top)); pts.push(ic + egui::vec2(r, base));
+            p.add(egui::Shape::line(pts, st));
+            p.circle_filled(body.center(), 1.3, col);
+        }
+    } }
+    let has_toggle = show.is_some();
+    let visible = show.as_ref().map_or(true, |v| **v);
+    let text_rect = egui::Rect::from_min_max(egui::pos2(rect.left() + if icon.is_some() { 40.0 } else { 12.0 }, rect.top()), egui::pos2(rect.right() - if has_toggle { 40.0 } else { 12.0 }, rect.bottom()));
+    // κλικ οπουδήποτε στο πεδίο εστιάζει (κάτω από το κείμενο, ώστε ο κέρσορας να μπαίνει σωστά)
+    if ui.interact(rect, id.with("bg"), egui::Sense::click()).clicked() { ui.memory_mut(|m| m.request_focus(id)); }
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(text_rect).layout(egui::Layout::left_to_right(egui::Align::Center)));
+    let te = egui::TextEdit::singleline(value).id(id).frame(false).password(!visible).font(egui::FontId::proportional(if h > 42.0 { 15.0 } else { 14.0 }))
+        .hint_text(RichText::new(hint).color(MUTED().gamma_multiply(0.85)))
+        .text_color(TEXT()).margin(egui::Margin::symmetric(0.0, 0.0)).desired_width(text_rect.width());
+    let r = child.add(te);
+    if autofocus && !ui.memory(|m| m.focused().is_some()) { r.request_focus(); }
+    // εμφάνιση / απόκρυψη κωδικού
+    if let Some(show) = show {
+        let er = egui::Rect::from_center_size(egui::pos2(rect.right() - 20.0, rect.center().y), egui::vec2(28.0, 28.0));
+        let resp = ui.interact(er, id.with("eye"), egui::Sense::click()).on_hover_text(if *show { "Hide password" } else { "Show password" });
+        let p = ui.painter();
+        if resp.hovered() { p.rect_filled(er, 8.0, BORDER().gamma_multiply(0.6)); }
+        let c = er.center();
+        let st = Stroke::new(1.5, if resp.hovered() { TEXT() } else { MUTED() });
+        let lid = |s: f32| -> Vec<egui::Pos2> { (0..=16).map(|k| { let t = -1.0 + 2.0 * k as f32 / 16.0; c + egui::vec2(8.0 * t, s * 4.6 * (1.0 - t * t)) }).collect() };
+        p.add(egui::Shape::line(lid(-1.0), st));
+        p.add(egui::Shape::line(lid(1.0), st));
+        p.circle_stroke(c, 2.2, st);
+        if !*show { p.line_segment([c + egui::vec2(-7.0, 6.0), c + egui::vec2(7.0, -6.0)], st); }
+        if resp.clicked() { *show = !*show; r.request_focus(); }
+    }
+    r
 }

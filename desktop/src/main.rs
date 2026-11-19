@@ -1811,6 +1811,14 @@ fn nvr_test() -> anyhow::Result<()> {
                     let n = d.files(k, &format!("{from} 00:00:00"), &chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(), "*").map(|v| (v.len(), v.first().map(|f| f.begin.clone()), v.last().map(|f| f.end.clone())));
                     println!("  30 days, channel index {k}: {:?}", n.map_err(|e| e.to_string()));
                 }
+                if std::env::var_os("NVRDECK_ALARM").is_some() && ch > 1 {
+                    println!("  subscribe {:?}", d.subscribe_alarms().map_err(|e| e.to_string()));
+                    let t = Instant::now();
+                    while t.elapsed() < Duration::from_secs(60) {
+                        match d.next_alarm() { Ok(Some(a)) => println!("  alarm ch{} {} {} {}", a.channel, a.event, if a.start { "start" } else { "stop" }, a.time),
+                                               Ok(None) => {}, Err(e) => { println!("  alarm error {e}"); break } }
+                    }
+                }
                 if std::env::var_os("NVRDECK_DL").is_some() {
                     let from = (chrono::Local::now() - chrono::Duration::hours(3)).format("%Y-%m-%d %H:%M:%S").to_string();
                     let to = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();

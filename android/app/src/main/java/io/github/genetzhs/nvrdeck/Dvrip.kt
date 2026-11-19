@@ -137,6 +137,34 @@ class Dvr private constructor(private val host: String, private val port: Int, p
         }
     }
 
+    /**
+     * Αναπαραγωγή από συγκεκριμένη στιγμή μέσα σε αρχείο (ByName + StartTime): το καταγραφικό ξεκινά ~εκεί.
+     * Τα δεδομένα δίνονται στο `sink` (false = διακοπή).
+     */
+    fun streamFrom(f: RecFile, start: String, sink: (ByteArray) -> Boolean) {
+        fun pb(action: String) = buildJsonObject {
+            put("Name", "OPPlayBack"); put("SessionID", sid())
+            putJsonObject("OPPlayBack") {
+                put("Action", action); put("StartTime", start); put("EndTime", f.end)
+                putJsonObject("Parameter") {
+                    put("FileName", f.name); put("PlayMode", "ByName"); put("TransMode", "TCP"); put("Value", 0); put("StreamType", 0)
+                    put("IntelligentPlayBackEvent", ""); put("IntelligentPlayBackSpeed", 0)
+                }
+            }
+        }
+        val data = Dvr(host, port, open(host, port)).also { it.session = session }
+        data.use { dc ->
+            dc.call(1424, pb("Claim"))
+            call(1420, pb("DownloadStart"))
+            while (true) {
+                val (m, b) = dc.recv()
+                if (m != 1426) continue
+                if (b.isEmpty() || !sink(b)) break
+            }
+            runCatching { send(1420, pb("DownloadStop")) }
+        }
+    }
+
     override fun close() { runCatching { s.close() } }
 }
 
@@ -231,3 +259,51 @@ private fun splitNals(b: ByteArray): List<ByteArray> {
 }
 
 @Suppress("unused") private fun InputStream.skipFully(n: Long) { var r = n; while (r > 0) { val s = skip(r); if (s <= 0) { read(); r-- } else r -= s } }
+
+
+/** Σταδιακή ανάγνωση καρέ XMeye: δίνουμε κομμάτια, παίρνουμε (Annex-B καρέ, I-frame, χρονοσφραγίδα ms). */
+class FrameParser {
+    private var buf = ByteArray(0)
+    var fps = 15; var hevc = false; var width = 0; var height = 0
+    private var base = 0L; private var n = 0L
+
+    data class Frame(val data: ByteArray, val key: Boolean, val timeMs: Long)
+
+    fun push(chunk: ByteArray): List<Frame> {
+        buf += chunk
+        val out = mutableListOf<Frame>()
+        var i = 0
+        val b = buf
+        fun le32(o: Int) = (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8) or ((b[o + 2].toInt() and 0xFF) shl 16) or ((b[o + 3].toInt() and 0xFF) shl 24)
+        while (i + 16 <= b.size) {
+            if (!(b[i].toInt() == 0 && b[i + 1].toInt() == 0 && b[i + 2].toInt() == 1 && (b[i + 3].toInt() and 0xFF) in 0xF9..0xFD)) { i++; continue }
+            val t = b[i + 3].toInt() and 0xFF
+            val hdr: Int; val len: Int
+            when (t) {
+                0xFC -> { hdr = 16; len = le32(i + 12) }
+                0xFD -> { hdr = 8; len = le32(i + 4) }
+                else -> { hdr = 8; len = (b[i + 6].toInt() and 0xFF) or ((b[i + 7].toInt() and 0xFF) shl 8) }
+            }
+            if (len < 0 || len > (8 shl 20)) { i++; continue }
+            if (i + hdr + len > b.size) break
+            if (t == 0xFC) {
+                fps = (b[i + 5].toInt() and 0xFF).coerceIn(1, 60)
+                val ty = b[i + 4].toInt() and 0xFF
+                hevc = ty == 3 || ty == 0x12
+                width = (b[i + 6].toInt() and 0xFF) * 8; height = (b[i + 7].toInt() and 0xFF) * 8
+                val dt = le32(i + 8).toLong() and 0xFFFFFFFFL
+                base = java.time.LocalDateTime.of((2000 + (dt shr 26)).toInt(), ((dt shr 22) and 15).toInt().coerceIn(1, 12), ((dt shr 17) and 31).toInt().coerceIn(1, 31),
+                    ((dt shr 12) and 31).toInt().coerceIn(0, 23), ((dt shr 6) and 63).toInt().coerceIn(0, 59), (dt and 63).toInt().coerceIn(0, 59))
+                    .atZone(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+                n = 0
+            }
+            if (t == 0xFC || t == 0xFD) {
+                if (base > 0) out += Frame(b.copyOfRange(i + hdr, i + hdr + len), t == 0xFC, base + n * 1000 / fps)
+                n++
+            }
+            i += hdr + len
+        }
+        buf = b.copyOfRange(i, b.size)
+        return out
+    }
+}

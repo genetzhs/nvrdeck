@@ -724,6 +724,16 @@ fun SettingsScreen(store: Store, data: StoreData, onLock: () -> Unit) {
                 if (v) AlertService.start(sctx) else AlertService.stop(sctx)
             }
         }
+        val recs = remember(data.cameras) { data.cameras.filter { it.proto == Proto.XMEYE }.groupBy { it.host }.values.filter { it.size > 1 }.map { g -> g.sortedBy { it.channel } } }
+        var recOpen by remember { mutableStateOf(false) }
+        if (recs.isNotEmpty()) GlassCard(Modifier.fillMaxWidth()) {
+            Eyebrow("Recorder")
+            Spacer(Modifier.height(6.dp))
+            Text("Motion zones, sensitivity, recording schedule, clock, password, restart", color = c.muted, fontSize = 12.5.sp)
+            Spacer(Modifier.height(8.dp))
+            Button({ recOpen = true }, colors = ButtonDefaults.buttonColors(containerColor = c.accent)) { Text("Recorder settings") }
+        }
+        if (recOpen) RecorderDialog(store, recs.first()) { recOpen = false }
         GlassCard(Modifier.fillMaxWidth()) {
             Eyebrow("Security")
             Spacer(Modifier.height(6.dp))

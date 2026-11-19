@@ -192,6 +192,14 @@ class Dvr private constructor(private val host: String, private val port: Int, p
         throw Exception("No snapshot")
     }
 
+    private fun ok(r: JsonObject, what: String) { val ret = r["Ret"]?.jsonPrimitive?.intOrNull; if (ret != 100) throw Exception("$what refused ($ret)") }
+    fun getConfig(name: String): JsonElement { val r = call(1042, buildJsonObject { put("Name", name); put("SessionID", sid()) }); ok(r, name); return r[name] ?: JsonNull }
+    fun setConfig(name: String, v: JsonElement) { ok(call(1040, buildJsonObject { put("Name", name); put("SessionID", sid()); put(name, v) }), name) }
+    fun getTime(): String = call(1452, buildJsonObject { put("Name", "OPTimeQuery"); put("SessionID", sid()) })["OPTimeQuery"]?.jsonPrimitive?.contentOrNull ?: ""
+    fun setTime(t: String) { ok(call(1450, buildJsonObject { put("Name", "OPTimeSetting"); put("SessionID", sid()); put("OPTimeSetting", t) }), "time") }
+    fun changePassword(user: String, old: String, new: String) { ok(call(1488, buildJsonObject { put("EncryptType", "MD5"); put("NewPassWord", sofiaHash(new)); put("PassWord", sofiaHash(old)); put("SessionID", sid()); put("UserName", user) }), "password") }
+    fun reboot() = send(1450, buildJsonObject { put("Name", "OPMachine"); put("SessionID", sid()); putJsonObject("OPMachine") { put("Action", "Reboot") } })
+
     override fun close() { runCatching { s.close() } }
 }
 

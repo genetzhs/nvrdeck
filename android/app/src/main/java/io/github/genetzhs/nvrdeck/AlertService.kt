@@ -60,6 +60,7 @@ class AlertService : Service() {
         val recorders = data.cameras.filter { it.proto == Proto.XMEYE }.groupBy { it.host }.values.filter { it.size > 1 }
         val detector = runCatching { Detector(this) }.getOrNull() ?: return
         for (group in recorders) threads += Thread { watch(group, detector) }.apply { isDaemon = true; start() }
+        for (group in recorders) threads += Thread { healthLoop(group.sortedBy { it.channel }) }.apply { isDaemon = true; start() }
     }
 
     private fun watch(group: List<Camera>, det: Detector) {
@@ -121,6 +122,24 @@ class AlertService : Service() {
                 // χαμένη σύνδεση (VPN εκτός κ.λπ.): νέα προσπάθεια σε λίγο
                 Thread.sleep(backoff); backoff = (backoff * 2).coerceAtMost(120_000L)
             }
+        }
+    }
+
+    /** Κάθε 10 λεπτά: ειδοποίηση αν κανάλι σταμάτησε να γράφει (> 30 λεπτά, ενώ έγραφε το τελευταίο 24ωρο). */
+    private fun healthLoop(group: List<Camera>) {
+        val warned = HashSet<String>()
+        while (running) {
+            val h = readHealth(group); val now = System.currentTimeMillis()
+            if (h.err == null) h.chans.forEach { (name, _, last) ->
+                val stale = last != null && now - last > 30 * 60_000 && now - last < 86_400_000
+                if (stale && warned.add(name)) {
+                    val n = NotificationCompat.Builder(this, CH_AI).setSmallIcon(R.drawable.ic_stat_cam).setContentTitle("$name stopped recording")
+                        .setContentText("Last recording at ${hms(last!!).take(5)}.").setPriority(NotificationCompat.PRIORITY_HIGH).setAutoCancel(true).build()
+                    runCatching { NotificationManagerCompat.from(this).notify(name.hashCode(), n) }
+                }
+                if (!stale) warned.remove(name)
+            }
+            repeat(600) { if (running) Thread.sleep(1000) }
         }
     }
 

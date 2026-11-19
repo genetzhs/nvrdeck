@@ -200,6 +200,16 @@ class Dvr private constructor(private val host: String, private val port: Int, p
     fun changePassword(user: String, old: String, new: String) { ok(call(1488, buildJsonObject { put("EncryptType", "MD5"); put("NewPassWord", sofiaHash(new)); put("PassWord", sofiaHash(old)); put("SessionID", sid()); put("UserName", user) }), "password") }
     fun reboot() = send(1450, buildJsonObject { put("Name", "OPMachine"); put("SessionID", sid()); putJsonObject("OPMachine") { put("Action", "Reboot") } })
 
+    /** Δίσκοι: (πλήθος, σύνολο MB, ελεύθερα MB). */
+    fun storage(): Triple<Int, Long, Long> {
+        val r = call(1020, buildJsonObject { put("Name", "StorageInfo"); put("SessionID", sid()) })
+        val disks = r["StorageInfo"]?.jsonArray ?: JsonArray(emptyList())
+        var tot = 0L; var free = 0L
+        fun hx(e: JsonElement?) = e?.jsonPrimitive?.contentOrNull?.removePrefix("0x")?.toLongOrNull(16) ?: 0L
+        disks.forEach { d -> d.jsonObject["Partition"]?.jsonArray?.forEach { p -> tot += hx(p.jsonObject["TotalSpace"]); free += hx(p.jsonObject["RemainSpace"]) } }
+        return Triple(disks.size, tot, free)
+    }
+
     override fun close() { runCatching { s.close() } }
 }
 

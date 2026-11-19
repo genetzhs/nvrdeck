@@ -19,6 +19,8 @@ class Detector(ctx: Context) : AutoCloseable {
     private val input = session.inputNames.first()
 
     companion object {
+        @Volatile private var inst: Detector? = null
+        fun shared(ctx: Context): Detector = inst ?: synchronized(this) { inst ?: Detector(ctx.applicationContext).also { inst = it } }
         const val SIZE = 416
         fun label(c: Int) = when (c) { 0 -> "Person"; 1 -> "Bicycle"; 2 -> "Car"; 3 -> "Motorcycle"; 5 -> "Bus"; 7 -> "Truck"; else -> null }
         fun iou(a: FloatArray, b: FloatArray): Float {

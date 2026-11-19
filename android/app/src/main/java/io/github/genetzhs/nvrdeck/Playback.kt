@@ -34,20 +34,22 @@ import androidx.compose.ui.viewinterop.AndroidView
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
+import androidx.compose.ui.graphics.asImageBitmap
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 
 private val MOTION = Color(0xFFFFB020)
-private val TF = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
-private fun ms(s: String) = runCatching { LocalDateTime.parse(s, TF).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli() }.getOrDefault(0L)
-private fun hms(t: Long) = java.time.Instant.ofEpochMilli(t).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("HH:mm:ss"))
+internal val TF = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+internal fun ms(s: String) = runCatching { LocalDateTime.parse(s, TF).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli() }.getOrDefault(0L)
+internal fun hms(t: Long) = java.time.Instant.ofEpochMilli(t).atZone(ZoneId.systemDefault()).format(DateTimeFormatter.ofPattern("HH:mm:ss"))
 
 /** NVR = καταγραφικό με 2+ κανάλια XMeye στην ίδια διεύθυνση. */
 private fun recorders(cams: List<Camera>) = cams.filter { it.proto == Proto.XMEYE }.groupBy { it.host }.values.filter { it.size > 1 }.toList()
 
-private class Day(val all: Map<Int, List<Dvr.RecFile>>, val motion: Map<Int, List<Dvr.RecFile>>)
+internal class Day(val all: Map<Int, List<Dvr.RecFile>>, val motion: Map<Int, List<Dvr.RecFile>>)
 
 @Composable
 fun PlaybackScreen(data: StoreData) {
@@ -107,6 +109,17 @@ fun PlaybackScreen(data: StoreData) {
     // από ειδοποίηση: λίγα δευτερόλεπτα πριν το συμβάν, μεγάλο το κανάλι
     LaunchedEffect(files, pending) { val p = pending; if (files != null && p != null) { pending = null; big = p.first; zoom = 2; seek(p.second - 6_000) } }
 
+    var showEvents by remember { mutableStateOf(false) }
+    var showHealth by remember { mutableStateOf(false) }
+    var health by remember { mutableStateOf<RecHealth?>(null) }
+    var markIn by remember { mutableLongStateOf(0L) }
+    var markOut by remember { mutableLongStateOf(0L) }
+    var exporting by remember { mutableStateOf<Float?>(null) }
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(showHealth) { if (showHealth && health == null) health = withContext(Dispatchers.IO) { readHealth(group) } }
+    if (showHealth) HealthSheet(health) { showHealth = false }
+    if (showEvents && files != null) EventsSheet(group, files.all, files.motion, onPick = { ch, t -> showEvents = false; big = ch; zoom = 2; seek(t - 2000) }) { showEvents = false }
+
     val players = remember { mutableStateMapOf<Int, NvrPlayer>() }
     // ρολόι: η πιο πρόσφατη ώρα από τα κανάλια που παίζουν
     LaunchedEffect(Unit) { while (true) { delay(250); players.values.maxOfOrNull { it.clock.get() }?.takeIf { it > 0 }?.let { cursor = it } } }
@@ -118,6 +131,8 @@ fun PlaybackScreen(data: StoreData) {
                 Eyebrow("Recorder")
                 Text("Playback", style = TitleStyle, color = c.fg)
             }
+            IconButton({ showHealth = true; health = null }) { Icon(Icons.Outlined.Storage, "Recorder health", tint = c.fg) }
+            IconButton({ showEvents = true }, enabled = files != null) { Icon(Icons.Outlined.NotificationsActive, "Events", tint = c.fg) }
             Row(Modifier.clip(RoundedCornerShape(50)).background(c.glassStrong).border(1.dp, c.glassBorder, RoundedCornerShape(50))
                 .clickable {
                     DatePickerDialog(ctx, { _, y, m, d -> date = LocalDate.of(y, m + 1, d) }, date.year, date.monthValue - 1, date.dayOfMonth)
@@ -161,8 +176,31 @@ fun PlaybackScreen(data: StoreData) {
             Text(if (cursor > 0) hms(cursor) else "--:--:--", style = MonoMeta.copy(fontSize = 15.sp, fontWeight = FontWeight.Medium), color = c.fg)
         }
 
+        // ── εξαγωγή κλιπ: σημάδια αρχής/τέλους ──
+        Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp).padding(bottom = 6.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Chip(if (markIn > 0) "In ${hms(markIn).take(5)}" else "Mark in", markIn > 0) { if (cursor > 0) { markIn = cursor; if (markOut in 1..cursor) markOut = 0 } }
+            Chip(if (markOut > 0) "Out ${hms(markOut).take(5)}" else "Mark out", markOut > 0) { if (cursor > markIn && markIn > 0) markOut = cursor }
+            Spacer(Modifier.weight(1f))
+            val chExp = big ?: group.first().channel
+            val e = exporting
+            if (e != null) { LinearProgressIndicator({ e }, Modifier.width(70.dp), color = c.accent, trackColor = c.inset); Spacer(Modifier.width(6.dp)) }
+            TextButton({
+                val camE = group.first { it.channel == chExp }
+                val (a, b) = if (markIn > 0 && markOut > markIn) markIn to markOut else (cursor - 10_000) to (cursor + 20_000)
+                exporting = 0f
+                scope.launch {
+                    val r = runCatching { withContext(Dispatchers.IO) { exportClip(ctx, camE, files?.all?.get(chExp).orEmpty(), a, b) { p -> exporting = p } } }
+                    exporting = null
+                    android.widget.Toast.makeText(ctx, r.fold({ "Saved to Movies/NVRDeck: $it" }, { "Export failed: ${it.message}" }), android.widget.Toast.LENGTH_LONG).show()
+                }
+            }, enabled = cursor > 0 && e == null && true) {
+                Icon(Icons.Outlined.Download, null, Modifier.size(16.dp)); Spacer(Modifier.width(4.dp))
+                Text(if (big != null || group.size == 1) "Export" else "Export ${group.first().name}", maxLines = 1)
+            }
+        }
+
         // ── χρονολόγιο ──
-        Timeline(group, files, day, day0, cursor, zoom, onZoom = { zoom = (zoom + 1) % 3 }, onSeek = { seek(it) })
+        Timeline(group, files, day, day0, cursor, zoom, markIn, markOut, onZoom = { zoom = (zoom + 1) % 3 }, onSeek = { seek(it) })
     }
 }
 
@@ -225,7 +263,7 @@ private fun ChannelView(ch: Camera, files: Day?, seekReq: Long, cursor: Long, pa
 }
 
 @Composable
-private fun Timeline(group: List<Camera>, files: Day?, day: Result<Day>?, day0: Long, cursor: Long, zoom: Int, onZoom: () -> Unit, onSeek: (Long) -> Unit) {
+private fun Timeline(group: List<Camera>, files: Day?, day: Result<Day>?, day0: Long, cursor: Long, zoom: Int, markIn: Long, markOut: Long, onZoom: () -> Unit, onSeek: (Long) -> Unit) {
     val c = cine
     val span = when (zoom) { 1 -> 6 * 3_600_000L; 2 -> 3_600_000L; else -> 86_400_000L }
     // ορατό παράθυρο γύρω από την τρέχουσα θέση
@@ -276,6 +314,7 @@ private fun Timeline(group: List<Camera>, files: Day?, day: Result<Day>?, day0: 
                 drawLine(muted, Offset(xx, base), Offset(xx, base + 4), 1.5f)
                 t += step
             }
+            if (markIn > 0) { val a = x(markIn); val b = if (markOut > markIn) x(markOut) else a + 2f; drawRect(fg.copy(alpha = .14f), Offset(a, 0f), Size((b - a).coerceAtLeast(2f), base)) }
             val playhead = drag ?: cursor
             if (playhead > 0) {
                 val px = x(playhead)
@@ -291,6 +330,15 @@ private fun Timeline(group: List<Camera>, files: Day?, day: Result<Day>?, day0: 
                     color = c.muted, fontSize = 9.5.sp, style = MonoMeta, modifier = Modifier.weight(1f))
             }
         }
-        drag?.let { Text("→ ${hms(it)}", color = c.accent, style = MonoMeta.copy(fontSize = 12.sp, fontWeight = FontWeight.Medium)) }
+        drag?.let { dt ->
+            val ctx = LocalContext.current
+            val cam = group.firstOrNull { cm -> files?.all?.get(cm.channel)?.any { ms(it.begin) <= dt && dt < ms(it.end) } == true }
+            var th by remember { mutableStateOf<android.graphics.Bitmap?>(null) }
+            LaunchedEffect(dt / 60_000, cam?.channel) { th = cam?.let { cm -> Thumbs.cached(cm.channel, dt) }; if (cam != null && th == null) { delay(350); th = Thumbs.get(ctx, cam, files?.all?.get(cam.channel).orEmpty(), dt) } }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                th?.let { androidx.compose.foundation.Image(it.asImageBitmap(), null, Modifier.width(128.dp).aspectRatio(16f / 9f).clip(RoundedCornerShape(8.dp))); Spacer(Modifier.width(8.dp)) }
+                Text("→ ${hms(dt)}", color = c.accent, style = MonoMeta.copy(fontSize = 12.sp, fontWeight = FontWeight.Medium))
+            }
+        }
     }
 }

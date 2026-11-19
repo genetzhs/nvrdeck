@@ -842,6 +842,23 @@ fun SoloView(cam: Camera, idx: Int, s: Settings, onClose: () -> Unit) {
             if (scale > 1.01f) TextButton(onClick = { scale = 1f; off = androidx.compose.ui.geometry.Offset.Zero }) {
                 Text("${"%.1f".format(scale)}×  reset", color = Color.White, fontSize = 12.sp)
             }
+            if (cam.proto == Proto.XMEYE) {
+                val tctx = LocalContext.current
+                var talking by remember { mutableStateOf<java.util.concurrent.atomic.AtomicBoolean?>(null) }
+                val askMic = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { ok -> if (!ok) msg = "Microphone permission is needed to talk" }
+                Box(Modifier.clip(RoundedCornerShape(50)).background(if (talking != null) cine.accent else Color.Transparent)
+                    .pointerInput(cam.id) {
+                        detectTapGestures(onPress = {
+                            if (androidx.core.content.ContextCompat.checkSelfPermission(tctx, android.Manifest.permission.RECORD_AUDIO) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                                askMic.launch(android.Manifest.permission.RECORD_AUDIO); return@detectTapGestures
+                            }
+                            val f = java.util.concurrent.atomic.AtomicBoolean(false); talking = f; msg = "Connecting…"
+                            Thread { Talk.run(cam, f) { s -> msg = s } }.start()
+                            tryAwaitRelease()
+                            f.set(true); talking = null
+                        })
+                    }.padding(12.dp)) { Icon(Icons.Outlined.Mic, "Hold to talk", tint = Color.White) }
+            }
             Text(res.ifEmpty { "…" }, color = Color.White.copy(alpha = .7f), fontSize = 11.sp, fontFamily = GeistMono, modifier = Modifier.padding(horizontal = 8.dp))
             IconButton(onClick = onClose) { Icon(Icons.Outlined.Close, "Close", tint = Color.White) }
         }

@@ -192,6 +192,23 @@ class Dvr private constructor(private val host: String, private val port: Int, p
         throw Exception("No snapshot")
     }
 
+    fun sendBin(msg: Int, data: ByteArray) {
+        val b = ByteBuffer.allocate(20 + data.size).order(ByteOrder.LITTLE_ENDIAN)
+        b.put(0xFF.toByte()).put(0).put(0).put(0).putInt(session).putInt(seq++).put(0).put(0).putShort(msg.toShort()).putInt(data.size).put(data)
+        out.write(b.array()); out.flush()
+    }
+    private fun talkBody(action: String, ch: Int?) = buildJsonObject { put("Name", "OPTalk"); put("SessionID", sid()); putJsonObject("OPTalk") {
+        put("Action", action); if (ch != null) put("Channel", ch)
+        putJsonObject("AudioFormat") { put("BitRate", 128); put("EncodeType", "G711_ALAW"); put("SampleBit", 8); put("SampleRate", 8000) } } }
+    /** Ομιλία: Start εδώ, Claim σε δεύτερη σύνδεση που επιστρέφεται για αποστολή ήχου (μήνυμα 1432). */
+    fun talkStart(ch: Int?): Dvr {
+        ok(call(1430, talkBody("Start", ch)), "talk")
+        val d = Dvr(host, port, open(host, port)).also { it.session = session }
+        d.ok(d.call(1434, talkBody("Claim", ch)), "talk claim")
+        return d
+    }
+    fun talkStop() = runCatching { send(1430, buildJsonObject { put("Name", "OPTalk"); put("SessionID", sid()); putJsonObject("OPTalk") { put("Action", "Stop") } }) }
+
     private fun ok(r: JsonObject, what: String) { val ret = r["Ret"]?.jsonPrimitive?.intOrNull; if (ret != 100) throw Exception("$what refused ($ret)") }
     fun getConfig(name: String): JsonElement { val r = call(1042, buildJsonObject { put("Name", name); put("SessionID", sid()) }); ok(r, name); return r[name] ?: JsonNull }
     fun setConfig(name: String, v: JsonElement) { ok(call(1040, buildJsonObject { put("Name", name); put("SessionID", sid()); put(name, v) }), name) }

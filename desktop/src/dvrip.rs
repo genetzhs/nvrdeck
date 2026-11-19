@@ -45,6 +45,43 @@ impl Dvr {
     pub fn session_id(&self) -> String { self.sid() }
     pub fn send_raw(&mut self, msg: u16, body: &Value) -> anyhow::Result<()> { self.send(msg, body) }
 
+    /// Δυαδικό μήνυμα (π.χ. ήχος ομιλίας).
+    pub fn send_bin(&mut self, msg: u16, data: &[u8]) -> anyhow::Result<()> {
+        let mut h = Vec::with_capacity(20 + data.len());
+        h.extend_from_slice(&[0xFF, 0x00, 0, 0]);
+        h.extend_from_slice(&self.session.to_le_bytes());
+        h.extend_from_slice(&self.seq.to_le_bytes());
+        h.extend_from_slice(&[0, 0]);
+        h.extend_from_slice(&msg.to_le_bytes());
+        h.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        h.extend_from_slice(data);
+        self.s.write_all(&h)?;
+        self.seq += 1;
+        Ok(())
+    }
+
+    /// Ομιλία (OPTalk): Start στη βασική σύνδεση, Claim σε δεύτερη. Επιστρέφει τη σύνδεση ήχου.
+    pub fn talk_start(&mut self, host: &str, port: u16, channel: Option<u32>) -> anyhow::Result<Dvr> {
+        let sid = self.sid();
+        let body = |action: &str| {
+            let mut t = json!({"Action": action, "AudioFormat": {"BitRate": 128, "EncodeType": "G711_ALAW", "SampleBit": 8, "SampleRate": 8000}});
+            if let Some(c) = channel { t["Channel"] = json!(c); }
+            json!({"Name": "OPTalk", "SessionID": sid, "OPTalk": t})
+        };
+        let r = self.call(1430, body("Start"))?;
+        anyhow::ensure!(r["Ret"].as_i64() == Some(100), "talk refused ({:?})", r["Ret"]);
+        let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| anyhow::anyhow!("bad address"))?;
+        let mut data = Dvr { s: TcpStream::connect_timeout(&addr, Duration::from_secs(5))?, session: self.session, seq: 0 };
+        data.s.set_read_timeout(Some(Duration::from_millis(500)))?;
+        let c = data.call(1434, body("Claim"))?;
+        anyhow::ensure!(c["Ret"].as_i64() == Some(100), "talk claim refused ({:?})", c["Ret"]);
+        Ok(data)
+    }
+    pub fn talk_stop(&mut self) -> anyhow::Result<()> {
+        let sid = self.sid();
+        self.send(1430, &json!({"Name": "OPTalk", "SessionID": sid, "OPTalk": {"Action": "Stop"}}))
+    }
+
     fn send(&mut self, msg: u16, body: &Value) -> anyhow::Result<()> {
         let mut data = serde_json::to_vec(body)?;
         data.extend_from_slice(b"\x0a\x00");

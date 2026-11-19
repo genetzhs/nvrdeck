@@ -556,6 +556,38 @@ fn notify_clip(title: &str, body: &str, cam: usize) {
     { let _ = cam; desktop_notify(title, body) }
 }
 
+/// Ομιλία: μικρόφωνο (ffmpeg) → G.711 A-law 8 kHz → καταγραφικό. Σταματά όταν σηκωθεί η σημαία.
+fn start_talk(cam: Camera, msg: Arc<Mutex<String>>, ctx: egui::Context) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let st = stop.clone();
+    *msg.lock().unwrap() = "Connecting…".into();
+    std::thread::spawn(move || {
+        let r = (|| -> anyhow::Result<()> {
+            let mut d = dvrip::Dvr::connect(&cam.host, dvrip::PORT, &cam.user, &cam.pass)?;
+            let mut t = d.talk_start(&cam.host, dvrip::PORT, Some(cam.channel.saturating_sub(1)))?;
+            #[cfg(target_os = "macos")] let input = ["-f", "avfoundation", "-i", ":0"];
+            #[cfg(not(target_os = "macos"))] let input = ["-f", "pulse", "-i", "default"];
+            let mut ff = Command::new(tool("ffmpeg")).args(["-v", "error", "-fflags", "nobuffer"]).args(input)
+                .args(["-ac", "1", "-ar", "8000", "-f", "alaw", "-"]).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+            let mut out = ff.stdout.take().unwrap();
+            *msg.lock().unwrap() = "Live".into(); ctx.request_repaint();
+            let mut buf = [0u8; 320];
+            while !st.load(Ordering::Relaxed) {
+                out.read_exact(&mut buf)?;
+                let mut pkt = vec![0x00, 0x00, 0x01, 0xFA, 0x0E, 0x02, 0x40, 0x01];
+                pkt.extend_from_slice(&buf);
+                t.send_bin(1432, &pkt)?;
+            }
+            let _ = ff.kill(); let _ = ff.wait();
+            let _ = d.talk_stop();
+            Ok(())
+        })();
+        *msg.lock().unwrap() = match r { Ok(()) => String::new(), Err(e) => format!("Talk failed: {e}") };
+        ctx.request_repaint();
+    });
+    stop
+}
+
 /// Ειδοποίηση επιφάνειας εργασίας (Linux: notify-send, macOS: osascript).
 fn desktop_notify(title: &str, body: &str) {
     #[cfg(target_os = "macos")]
@@ -808,6 +840,8 @@ struct App {
     page: Page,
     streams: Vec<Option<Stream>>,
     solo: Option<usize>,
+    talk: Option<Arc<AtomicBool>>,
+    talk_msg: Arc<Mutex<String>>,
     editor: Option<Editor>,
     confirm_delete: Option<usize>,
     settings_draft: Settings,
@@ -939,7 +973,7 @@ impl App {
         apply_theme(&cc.egui_ctx, store.settings.theme);
         let settings_draft = store.settings.clone();
         App { store, logged_in: false, login_user: "admin".into(), login_pass: String::new(), login_pass2: String::new(),
-              login_err: String::new(), page: Page::Live, streams: vec![], solo: None, editor: None,
+              login_err: String::new(), page: Page::Live, streams: vec![], solo: None, talk: None, talk_msg: Default::default(), editor: None,
               confirm_delete: None, settings_draft, toast: None,
               scan: Arc::new(Mutex::new(ScanState::default())), scan_open: false, nvr: None,
               hd: None, zoom: 1.0, zoom_c: egui::pos2(0.5, 0.5), recs: Default::default(),
@@ -1467,6 +1501,16 @@ impl App {
                                 if ui.add(rb).on_hover_text("R").clicked() { toggle_rec = Some(i); }
                                 if self.zoom > 1.0 && ui.add(egui::Button::new(format!("{:.1}×  reset", self.zoom)).rounding(999.0)).on_hover_text("Z").clicked() {
                                     self.zoom = 1.0; self.zoom_c = egui::pos2(0.5, 0.5);
+                                }
+                                if cam.proto == Proto::XMeye {
+                                    let on = self.talk.is_some();
+                                    let tb = ui.add(egui::Button::new(RichText::new(if on { "🎙  Talking…" } else { "🎙  Hold to talk" }).color(if on { Color32::WHITE } else { TEXT() }))
+                                        .fill(if on { ACCENT() } else { SURFACE() }).rounding(999.0).sense(egui::Sense::drag()))
+                                        .on_hover_text("Hold to speak through the camera's speaker");
+                                    if tb.drag_started() && self.talk.is_none() { self.talk = Some(start_talk(cam.clone(), self.talk_msg.clone(), ctx.clone())); }
+                                    if (tb.drag_stopped() || !ui.input(|i| i.pointer.primary_down())) && self.talk.is_some() { if let Some(f) = self.talk.take() { f.store(true, Ordering::Relaxed); } }
+                                    let m = self.talk_msg.lock().unwrap().clone();
+                                    if !m.is_empty() { ui.label(RichText::new(m).small().color(MUTED())); }
                                 }
                                 ui.label(RichText::new(if hd_on { "HD" } else { "SD" }).monospace().color(if hd_on { OK } else { MUTED() }));
                             });
@@ -2090,6 +2134,25 @@ fn nvr_test() -> anyhow::Result<()> {
                         if ka.elapsed() > Duration::from_secs(15) { ka = Instant::now(); let sid = d.session_id(); let _ = d.send_raw(1006, &serde_json::json!({"Name": "KeepAlive", "SessionID": sid})); }
                         match d.next_alarm() { Ok(Some(a)) => println!("  alarm ch{} {} {} {}", a.channel, a.event, if a.start { "start" } else { "stop" }, a.time),
                                                Ok(None) => {}, Err(e) => { println!("  alarm error {e}"); break } }
+                    }
+                }
+                if std::env::var_os("NVRDECK_TALK").is_some() && ch > 1 {
+                    // δοκιμή ομιλίας: στέλνει σιωπή 2 s και μετρά ήχο που έρχεται
+                    for chan in [None, Some(ch - 1)] {
+                        let r = (|| -> anyhow::Result<(usize, usize)> {
+                            let mut d2 = dvrip::Dvr::connect(&c.host, dvrip::PORT, &c.user, &c.pass)?;
+                            let mut t = d2.talk_start(&c.host, dvrip::PORT, chan)?;
+                            let mut pkt = vec![0x00, 0x00, 0x01, 0xFA, 0x0E, 0x02, 0x40, 0x01]; pkt.extend(std::iter::repeat(0xD5u8).take(320));
+                            let (mut sent, mut got) = (0, 0);
+                            let t0 = Instant::now();
+                            while t0.elapsed() < Duration::from_secs(3) {
+                                if sent < 50 { t.send_bin(1432, &pkt)?; sent += 1; }
+                                if let Ok((m, b)) = t.recv() { if m == 1433 { got += b.len(); } }
+                            }
+                            let _ = d2.talk_stop();
+                            Ok((sent, got))
+                        })();
+                        println!("  talk channel={chan:?}: {:?}", r.map_err(|e| e.to_string()));
                     }
                 }
                 if std::env::var_os("NVRDECK_CFG").is_some() && ch > 1 {

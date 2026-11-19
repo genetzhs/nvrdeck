@@ -230,9 +230,9 @@ impl Camera {
 struct Settings { width: usize, height: usize, fps: u32, #[serde(default)] theme: u32, #[serde(default = "yes")] show_clock: bool, #[serde(default)] layout: u32, #[serde(default)] main_ch: usize,
     #[serde(default = "yes")] auto_hd: bool, #[serde(default = "yes")] alerts: bool, #[serde(default = "alert_secs")] alert_after: u64,
     #[serde(default)] group: String, #[serde(default = "sens")] motion_sens: u32, #[serde(default)] wall_autologin: bool }
-fn sens() -> u32 { 50 }
+fn sens() -> u32 { 30 }
 fn alert_secs() -> u64 { 60 }
-impl Default for Settings { fn default() -> Self { Settings { width: 960, height: 540, fps: 12, theme: 0, show_clock: true, layout: 0, main_ch: 0, auto_hd: true, alerts: true, alert_after: 60, group: String::new(), motion_sens: 50, wall_autologin: false } } }
+impl Default for Settings { fn default() -> Self { Settings { width: 960, height: 540, fps: 12, theme: 0, show_clock: true, layout: 0, main_ch: 0, auto_hd: true, alerts: true, alert_after: 60, group: String::new(), motion_sens: 30, wall_autologin: false } } }
 
 #[derive(Serialize, Deserialize, Default)]
 struct Store {
@@ -315,6 +315,7 @@ struct Stream {
     prev: Vec<u8>,
     motion_at: Option<Instant>,
     motion_note: Option<Instant>,
+    motion_run: u32,
 }
 
 impl Stream {
@@ -325,7 +326,7 @@ impl Stream {
         let pid = Arc::new(AtomicU32::new(0));
         let (sh, st, pd) = (shared.clone(), stop.clone(), pid.clone());
         std::thread::spawn(move || worker(url, s, sh, st, pd, ctx));
-        Stream { shared, stop, pid, tex: None, w, h, prev: vec![], motion_at: None, motion_note: None }
+        Stream { shared, stop, pid, tex: None, w, h, prev: vec![], motion_at: None, motion_note: None, motion_run: 0 }
     }
 }
 
@@ -1066,13 +1067,16 @@ impl App {
                         if self.store.camera.get(i).map_or(false, |c| c.motion) {
                             let samp: Vec<u8> = f.chunks_exact(4).step_by(8).map(|p| ((p[0] as u16 + 2 * p[1] as u16 + p[2] as u16) / 4) as u8).collect();
                             if s.prev.len() == samp.len() {
-                                let changed = samp.iter().zip(&s.prev).filter(|(a, b)| (**a as i16 - **b as i16).abs() > 28).count();
-                                // ευαισθησία 1..100 → κατώφλι 6%..0.3% των δειγμάτων
+                                // αγνοούμε μικρές διαφορές φωτεινότητας (θόρυβος, φύλλα, IR)
+                                let changed = samp.iter().zip(&s.prev).filter(|(a, b)| (**a as i16 - **b as i16).abs() > 45).count();
+                                // ευαισθησία 1..100 → κατώφλι 12%..2% της εικόνας
                                 let sens = self.store.settings.motion_sens.clamp(1, 100) as f32;
-                                let thr = samp.len() as f32 * (0.06 - 0.057 * sens / 100.0);
-                                if changed as f32 > thr {
+                                let thr = samp.len() as f32 * (0.12 - 0.10 * sens / 100.0);
+                                // κίνηση μόνο αν κρατήσει σε 4 συνεχόμενα καρέ
+                                if changed as f32 > thr { s.motion_run += 1; } else { s.motion_run = 0; }
+                                if s.motion_run >= 4 {
                                     s.motion_at = Some(Instant::now());
-                                    if s.motion_note.map_or(true, |t| t.elapsed() > Duration::from_secs(60)) {
+                                    if s.motion_note.map_or(true, |t| t.elapsed() > Duration::from_secs(300)) {
                                         s.motion_note = Some(Instant::now());
                                         motion_events.push(i);
                                     }
@@ -2217,8 +2221,10 @@ impl App {
                     let (a, b) = (format!("{date} 00:00:00"), format!("{date} 23:59:59"));
                     let mut m = std::collections::BTreeMap::new();
                     for ch in chans {
-                        let all = d.files(ch, &a, &b, "*").unwrap_or_default();
-                        let mot = d.files(ch, &a, &b, "M").unwrap_or_default();
+                        // στο DVRIP τα κανάλια μετρούν από 0, στο RTSP από 1
+                        let idx = ch.saturating_sub(1);
+                        let all = d.files(idx, &a, &b, "*").unwrap_or_default();
+                        let mot = d.files(idx, &a, &b, "M").unwrap_or_default();
                         m.insert(ch, (all, mot));
                     }
                     Ok(m)

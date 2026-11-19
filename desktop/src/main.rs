@@ -786,6 +786,7 @@ struct App {
     pb: NvrPb,
     rec_health: Arc<Mutex<Option<RecHealth>>>,
     rec_health_on: bool,
+    rcfg: Option<RecCfg>,
     det_tx: Option<std::sync::mpsc::Sender<(usize, Vec<u8>)>>,
     det_rx: Option<std::sync::mpsc::Receiver<(usize, Vec<detect::Hit>)>>,
     det_busy: std::collections::HashSet<usize>,
@@ -853,6 +854,37 @@ struct RecHealth {
     err: String,
 }
 
+/// Παράθυρο ρυθμίσεων καταγραφικού
+struct RecCfg {
+    group: Vec<(usize, u32, String)>,
+    tab: u8,
+    ch: u32,
+    loaded_ch: u32,
+    data: Arc<Mutex<Option<Result<ChCfg, String>>>>,
+    edit: Option<ChCfg>,
+    snap_tex: Option<egui::TextureHandle>,
+    msg: Arc<Mutex<String>>,
+    busy: Arc<AtomicBool>,
+    time: Arc<Mutex<String>>,
+    pw_old: String, pw_new: String, pw_new2: String,
+    confirm_reboot: bool,
+    paint: Option<bool>,
+}
+#[derive(Clone)]
+struct ChCfg {
+    motion: serde_json::Value,
+    record: serde_json::Value,
+    snap: Option<Vec<u8>>, // RGBA 640x360
+    region: Vec<u32>,      // 18 γραμμές × 22 στήλες
+    level: i64,
+    enable: bool,
+    to_net: bool,
+    mode: u8,              // 0 πάντα, 1 μόνο κίνηση, 2 εκτός
+    from_h: u32, to_h: u32,
+}
+const RW: usize = 22;
+const RH: usize = 18;
+
 struct QrState { pass: String, pass2: String, tex: Option<egui::TextureHandle>, err: String, n: usize }
 
 impl App {
@@ -867,7 +899,7 @@ impl App {
               scan: Arc::new(Mutex::new(ScanState::default())), scan_open: false, nvr: None,
               hd: None, zoom: 1.0, zoom_c: egui::pos2(0.5, 0.5), recs: Default::default(),
               inbox: Arc::new(Mutex::new(vec![])), health: vec![], last_tick: Instant::now(),
-              wall: false, chrome: true, login_show: false, qr: None, media: vec![], pb: NvrPb::default(), rec_health: Default::default(), rec_health_on: false, det_tx: None, det_rx: None, det_busy: Default::default(), det_known: Default::default() }
+              wall: false, chrome: true, login_show: false, qr: None, media: vec![], pb: NvrPb::default(), rec_health: Default::default(), rec_health_on: false, rcfg: None, det_tx: None, det_rx: None, det_busy: Default::default(), det_known: Default::default() }
     }
 
     fn restart_streams(&mut self, ctx: &egui::Context) {
@@ -1406,6 +1438,13 @@ impl App {
                             count: (MAX_CH - self.store.camera.len()) as u32, show_pass: false,
                             test: Arc::new(Mutex::new(None)), testing: false, err: String::new() });
                     }
+                    if let Some(g) = self.nvr_groups().into_iter().next() {
+                        if ui.button("Recorder settings").clicked() {
+                            let ch = g[0].1;
+                            self.rcfg = Some(RecCfg { group: g, tab: 0, ch, loaded_ch: 0, data: Default::default(), edit: None, snap_tex: None, msg: Default::default(),
+                                busy: Default::default(), time: Default::default(), pw_old: String::new(), pw_new: String::new(), pw_new2: String::new(), confirm_reboot: false, paint: None });
+                        }
+                    }
                     if ui.add_enabled(!self.store.camera.is_empty(), egui::Button::new("📱 Send to phone")).on_hover_text("Encrypted QR code for the NVRDeck Android app").clicked() {
                         self.qr = Some(QrState { pass: String::new(), pass2: String::new(), tex: None, err: String::new(), n: 0 });
                     }
@@ -1490,6 +1529,7 @@ impl App {
         }
 
         self.scan_ui(ctx);
+        self.recorder_ui(ctx);
         self.qr_ui(ctx);
         self.nvr_ui(ctx);
         self.editor_ui(ctx);
@@ -1984,6 +2024,25 @@ fn nvr_test() -> anyhow::Result<()> {
                         if ka.elapsed() > Duration::from_secs(15) { ka = Instant::now(); let sid = d.session_id(); let _ = d.send_raw(1006, &serde_json::json!({"Name": "KeepAlive", "SessionID": sid})); }
                         match d.next_alarm() { Ok(Some(a)) => println!("  alarm ch{} {} {} {}", a.channel, a.event, if a.start { "start" } else { "stop" }, a.time),
                                                Ok(None) => {}, Err(e) => { println!("  alarm error {e}"); break } }
+                    }
+                }
+                if std::env::var_os("NVRDECK_CFG").is_some() && ch > 1 {
+                    println!("  recorder time: {:?} · computer: {}", d.get_time().map_err(|e| e.to_string()), chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+                    if let Ok(v) = d.get_config("Detect.MotionDetect.[1]") {
+                        let mut o = v.as_object().cloned().unwrap_or_default();
+                        o.remove("EventHandler");
+                        println!("  motion fields: {}", serde_json::Value::Object(o));
+                    }
+                    for name in [] as [&str; 0] {
+                        match d.get_config(name) {
+                            Ok(v) => {
+                                // σχήμα: πρώτο στοιχείο πίνακα (αν είναι πίνακας), περικομμένο
+                                let first = if v.is_array() { v[1].clone() } else { v.clone() };
+                                let txt = first.to_string();
+                                println!("  {name}: {} item(s) → {}", v.as_array().map_or(1, |a| a.len()), &txt[..txt.len().min(900)]);
+                            }
+                            Err(e) => println!("  {name}: {e}"),
+                        }
                     }
                 }
                 if std::env::var_os("NVRDECK_THUMB").is_some() && ch > 1 {
@@ -3165,5 +3224,263 @@ fn health_card(ui: &mut egui::Ui, h: &RecHealth) {
             ui.label(RichText::new(name.as_str()).small());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.label(RichText::new(txt).small().color(if ok { MUTED() } else { BAD })); });
         });
+    }
+}
+
+fn jpeg_to_rgba(jpg: &[u8], w: usize, h: usize) -> Option<Vec<u8>> {
+    let mut c = Command::new(tool("ffmpeg")).args(["-v", "error", "-f", "image2pipe", "-i", "-", "-vf", &format!("scale={w}:{h}"), "-pix_fmt", "rgba", "-f", "rawvideo", "-"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
+    let mut i = c.stdin.take()?;
+    let data = jpg.to_vec();
+    std::thread::spawn(move || { let _ = std::io::Write::write_all(&mut i, &data); });
+    let mut out = vec![];
+    c.stdout.take()?.read_to_end(&mut out).ok()?;
+    let _ = c.wait();
+    (out.len() >= w * h * 4).then(|| { out.truncate(w * h * 4); out })
+}
+
+fn load_ch_cfg(cam: &Camera, ch: u32) -> anyhow::Result<ChCfg> {
+    let idx = ch.saturating_sub(1);
+    let mut d = dvrip::Dvr::connect(&cam.host, dvrip::PORT, &cam.user, &cam.pass)?;
+    let motion = d.get_config(&format!("Detect.MotionDetect.[{idx}]"))?;
+    let record = d.get_config(&format!("Record.[{idx}]"))?;
+    let snap = d.snapshot(idx).ok().and_then(|j| jpeg_to_rgba(&j, 640, 360));
+    let hx = |v: &serde_json::Value| v.as_str().and_then(|x| u32::from_str_radix(x.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
+    let region: Vec<u32> = (0..RH).map(|r| hx(&motion["Region"][r])).collect();
+    // λειτουργία εγγραφής από RecordMode / Mask της πρώτης ζώνης της Κυριακής (ίδια για όλες τις μέρες εδώ)
+    let mask = hx(&record["Mask"][0][0]);
+    let mode = match record["RecordMode"].as_str() { Some("ClosedRecord") => 2, _ if mask & 1 == 0 && mask != 0 => 1, _ => 0 };
+    let ts = record["TimeSection"][0][0].as_str().unwrap_or("1 00:00:00-24:00:00").to_string();
+    let hr = |s: &str| s.get(0..2).and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
+    let (from_h, to_h) = ts.split_once(' ').and_then(|(_, r)| r.split_once('-')).map(|(a, b)| (hr(a), hr(b))).unwrap_or((0, 24));
+    Ok(ChCfg { level: motion["Level"].as_i64().unwrap_or(3), enable: motion["Enable"].as_bool().unwrap_or(true),
+        to_net: motion["EventHandler"]["MsgtoNetEnable"].as_bool().unwrap_or(false), region, mode, from_h, to_h, motion, record, snap })
+}
+
+fn save_ch_cfg(cam: &Camera, ch: u32, c: &ChCfg) -> anyhow::Result<()> {
+    let idx = ch.saturating_sub(1);
+    let mut d = dvrip::Dvr::connect(&cam.host, dvrip::PORT, &cam.user, &cam.pass)?;
+    let mut m = c.motion.clone();
+    m["Enable"] = serde_json::json!(c.enable);
+    m["Level"] = serde_json::json!(c.level.clamp(1, 6));
+    m["EventHandler"]["MsgtoNetEnable"] = serde_json::json!(c.to_net);
+    if let Some(arr) = m["Region"].as_array_mut() {
+        for r in 0..RH.min(arr.len()) { arr[r] = serde_json::json!(format!("0x{:08X}", c.region[r])); }
+    }
+    d.set_config(&format!("Detect.MotionDetect.[{idx}]"), &m)?;
+    let mut r = c.record.clone();
+    r["RecordMode"] = serde_json::json!(if c.mode == 2 { "ClosedRecord" } else { "ConfigRecord" });
+    // ίδιο πρόγραμμα κάθε μέρα: ζώνη 1 = from–to, οι υπόλοιπες κενές
+    let mask = if c.mode == 1 { "0x00000006" } else { "0x00000007" };
+    let sec = format!("1 {:02}:00:00-{:02}:00:00", c.from_h.min(23), c.to_h.clamp(c.from_h + 1, 24));
+    for day in 0..7 {
+        if let Some(row) = r["TimeSection"][day].as_array_mut() { for (k, v) in row.iter_mut().enumerate() { *v = serde_json::json!(if k == 0 { sec.clone() } else { "0 00:00:00-00:00:00".to_string() }); } }
+        if let Some(row) = r["Mask"][day].as_array_mut() { for (k, v) in row.iter_mut().enumerate() { *v = serde_json::json!(if k == 0 { mask } else { "0x00000000" }); } }
+    }
+    d.set_config(&format!("Record.[{idx}]"), &r)?;
+    Ok(())
+}
+
+impl App {
+    fn recorder_ui(&mut self, ctx: &egui::Context) {
+        let Some(rc) = &mut self.rcfg else { return };
+        let cam = self.store.camera[rc.group[0].0].clone();
+        // φόρτωση καναλιού
+        if rc.loaded_ch != rc.ch {
+            rc.loaded_ch = rc.ch; rc.edit = None; rc.snap_tex = None;
+            *rc.data.lock().unwrap() = None;
+            let (out, c2, ch, ctx2) = (rc.data.clone(), cam.clone(), rc.ch, ctx.clone());
+            std::thread::spawn(move || { let r = load_ch_cfg(&c2, ch).map_err(|e| e.to_string()); *out.lock().unwrap() = Some(r); ctx2.request_repaint(); });
+        }
+        if rc.edit.is_none() { if let Some(Ok(c)) = &*rc.data.lock().unwrap() { rc.edit = Some(c.clone()); } }
+        if rc.snap_tex.is_none() { if let Some(Some(px)) = rc.edit.as_ref().map(|e| e.snap.clone()) { rc.snap_tex = Some(ctx.load_texture("rcsnap", egui::ColorImage::from_rgba_unmultiplied([640, 360], &px), egui::TextureOptions::LINEAR)); } }
+        let mut open = true;
+        let mut do_save = false;
+        let mut new_pw: Option<String> = None;
+        egui::Window::new("Recorder settings").open(&mut open).collapsible(false).resizable(false).default_width(700.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for (k, n) in [(0u8, "Motion"), (1, "Recording"), (2, "Recorder")] {
+                    let sel = rc.tab == k;
+                    if ui.add(egui::Button::new(RichText::new(n).color(if sel { Color32::WHITE } else { TEXT() })).fill(if sel { ACCENT() } else { SURFACE() }).rounding(999.0)).clicked() { rc.tab = k; }
+                }
+            });
+            ui.add_space(10.0);
+            if rc.tab < 2 {
+                ui.horizontal_wrapped(|ui| {
+                    for (_, ch, name) in &rc.group {
+                        if ui.selectable_label(rc.ch == *ch, name.as_str()).clicked() { rc.ch = *ch; }
+                    }
+                });
+                ui.add_space(8.0);
+            }
+            let busy = rc.busy.load(Ordering::Relaxed);
+            match (rc.tab, &mut rc.edit) {
+                (0 | 1, None) => {
+                    let err = match &*rc.data.lock().unwrap() { Some(Err(e)) => Some(e.clone()), _ => None };
+                    match err { Some(e) => { ui.label(RichText::new(format!("Could not read settings: {e}")).color(BAD)); }
+                                None => { ui.horizontal(|ui| { ui.spinner(); ui.label("Reading settings from the recorder…"); }); } }
+                }
+                (0, Some(e)) => {
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut e.enable, "Motion detection on");
+                        ui.add_space(16.0);
+                        ui.label(RichText::new("Sensitivity").color(MUTED()));
+                        egui::ComboBox::from_id_salt("lvl").selected_text(["", "Lowest", "Lower", "Medium", "Higher", "High", "Highest"][e.level.clamp(1, 6) as usize]).show_ui(ui, |ui| {
+                            for (k, n) in ["Lowest", "Lower", "Medium", "Higher", "High", "Highest"].iter().enumerate() { ui.selectable_value(&mut e.level, k as i64 + 1, *n); }
+                        });
+                    });
+                    ui.checkbox(&mut e.to_net, "Send motion events to NVRDeck (needed for phone and desktop alerts)");
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Detection area: drag to paint, start on a painted cell to erase. Exclude roads and trees to cut false alarms.").small().color(MUTED()));
+                    ui.add_space(4.0);
+                    let (rect, resp) = ui.allocate_exact_size(egui::vec2(640.0, 360.0), egui::Sense::click_and_drag());
+                    let p = ui.painter_at(rect);
+                    p.rect_filled(rect, 10.0, Color32::from_rgb(5, 6, 10));
+                    if let Some(t) = &rc.snap_tex { let mut rs = egui::epaint::RectShape::filled(rect, 10.0, Color32::WHITE); rs.fill_texture_id = t.id(); rs.uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)); p.add(rs); }
+                    let (cw, chh) = (rect.width() / RW as f32, rect.height() / RH as f32);
+                    for r in 0..RH { for c in 0..RW {
+                        let on = e.region[r] >> c & 1 == 1;
+                        let cell = egui::Rect::from_min_size(rect.min + egui::vec2(c as f32 * cw, r as f32 * chh), egui::vec2(cw, chh));
+                        if on { p.rect_filled(cell.shrink(0.5), 0.0, ACCENT().gamma_multiply(0.30)); }
+                        p.rect_stroke(cell, 0.0, Stroke::new(0.5, Color32::from_white_alpha(28)));
+                    } }
+                    if let Some(pp) = resp.interact_pointer_pos() {
+                        let c = (((pp.x - rect.left()) / cw) as usize).min(RW - 1); let r = (((pp.y - rect.top()) / chh) as usize).min(RH - 1);
+                        if resp.drag_started() || resp.clicked() || rc.paint.is_none() { rc.paint = Some(e.region[r] >> c & 1 == 0); }
+                        let v = rc.paint.unwrap_or(true);
+                        if v { e.region[r] |= 1 << c } else { e.region[r] &= !(1 << c) }
+                    }
+                    if !resp.dragged() && !resp.is_pointer_button_down_on() { rc.paint = None; }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Select all").clicked() { for r in e.region.iter_mut() { *r = (1 << RW) - 1; } }
+                        if ui.small_button("Clear").clicked() { for r in e.region.iter_mut() { *r = 0; } }
+                    });
+                }
+                (1, Some(e)) => {
+                    ui.label(RichText::new("When this camera records to the recorder's disk.").color(MUTED()));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        for (k, n) in [(0u8, "Always"), (1, "Motion only"), (2, "Off")] { if ui.selectable_label(e.mode == k, n).clicked() { e.mode = k; } }
+                    });
+                    ui.add_space(8.0);
+                    ui.add_enabled_ui(e.mode != 2, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Every day from").color(MUTED()));
+                            ui.add(egui::DragValue::new(&mut e.from_h).range(0..=23).suffix(":00"));
+                            ui.label(RichText::new("to").color(MUTED()));
+                            ui.add(egui::DragValue::new(&mut e.to_h).range(1..=24).suffix(":00"));
+                        });
+                    });
+                    ui.add_space(6.0);
+                    ui.label(RichText::new("Motion only saves disk space and keeps more days, but nothing is kept between events.").small().color(MUTED()));
+                }
+                _ => {
+                    // ── καταγραφικό: ώρα, κωδικός, επανεκκίνηση ──
+                    let t = rc.time.lock().unwrap().clone();
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Clock").strong());
+                        ui.label(RichText::new(if t.is_empty() { "—".into() } else { format!("recorder {t} · computer {}", chrono::Local::now().format("%H:%M:%S")) }).color(MUTED()));
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.add_enabled(!busy, egui::Button::new("Read clock")).clicked() {
+                            let (c2, out, b, ctx2) = (cam.clone(), rc.time.clone(), rc.busy.clone(), ctx.clone());
+                            b.store(true, Ordering::Relaxed);
+                            std::thread::spawn(move || { let r = dvrip::Dvr::connect(&c2.host, dvrip::PORT, &c2.user, &c2.pass).and_then(|mut d| d.get_time());
+                                *out.lock().unwrap() = r.unwrap_or_else(|e| format!("error: {e}")); b.store(false, Ordering::Relaxed); ctx2.request_repaint(); });
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("Sync to this computer")).clicked() {
+                            let (c2, out, msg, b, ctx2) = (cam.clone(), rc.time.clone(), rc.msg.clone(), rc.busy.clone(), ctx.clone());
+                            b.store(true, Ordering::Relaxed);
+                            std::thread::spawn(move || {
+                                let r = dvrip::Dvr::connect(&c2.host, dvrip::PORT, &c2.user, &c2.pass).and_then(|mut d| { d.set_time(&chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string())?; d.get_time() });
+                                match r { Ok(t) => { *out.lock().unwrap() = t; *msg.lock().unwrap() = "Clock synced.".into(); } Err(e) => *msg.lock().unwrap() = format!("Could not set the clock: {e}") }
+                                b.store(false, Ordering::Relaxed); ctx2.request_repaint();
+                            });
+                        }
+                    });
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("Recorder password").strong());
+                    ui.label(RichText::new(format!("For user \"{}\". NVRDeck updates its saved password for all channels after the change.", cam.user)).small().color(MUTED()));
+                    ui.add_space(4.0);
+                    let id_o = egui::Id::new("rc_pw_o"); let mut s_o = ui.data(|d| d.get_temp::<bool>(id_o).unwrap_or(false));
+                    input(ui, "rc_pw_o", &mut rc.pw_old, "Current password", 260.0, Some(&mut s_o)); ui.data_mut(|d| d.insert_temp(id_o, s_o));
+                    ui.add_space(6.0);
+                    let id_n = egui::Id::new("rc_pw_n"); let mut s_n = ui.data(|d| d.get_temp::<bool>(id_n).unwrap_or(false));
+                    input(ui, "rc_pw_n", &mut rc.pw_new, "New password", 260.0, Some(&mut s_n)); ui.data_mut(|d| d.insert_temp(id_n, s_n));
+                    ui.add_space(6.0);
+                    let id_r = egui::Id::new("rc_pw_r"); let mut s_r = ui.data(|d| d.get_temp::<bool>(id_r).unwrap_or(false));
+                    input(ui, "rc_pw_r", &mut rc.pw_new2, "Repeat new password", 260.0, Some(&mut s_r)); ui.data_mut(|d| d.insert_temp(id_r, s_r));
+                    ui.add_space(6.0);
+                    if ui.add_enabled(!busy, egui::Button::new("Change password")).clicked() {
+                        if rc.pw_new.chars().count() < 6 { *rc.msg.lock().unwrap() = "Use at least 6 characters.".into(); }
+                        else if rc.pw_new != rc.pw_new2 { *rc.msg.lock().unwrap() = "The new passwords don't match.".into(); }
+                        else if rc.pw_old != cam.pass { *rc.msg.lock().unwrap() = "The current password is not the one NVRDeck has saved.".into(); }
+                        else {
+                            let (c2, msg, b, newp, oldp) = (cam.clone(), rc.msg.clone(), rc.busy.clone(), rc.pw_new.clone(), rc.pw_old.clone());
+                            match dvrip::Dvr::connect(&c2.host, dvrip::PORT, &c2.user, &oldp).and_then(|mut d| d.change_password(&c2.user, &oldp, &newp)) {
+                                Ok(()) => { *msg.lock().unwrap() = "Password changed on the recorder.".into(); new_pw = Some(newp); }
+                                Err(e) => *msg.lock().unwrap() = format!("Not changed: {e}"),
+                            }
+                            b.store(false, Ordering::Relaxed);
+                            rc.pw_old.clear(); rc.pw_new.clear(); rc.pw_new2.clear();
+                        }
+                    }
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("Restart").strong());
+                    ui.label(RichText::new("All cameras go dark for about a minute while the recorder restarts.").small().color(MUTED()));
+                    ui.add_space(4.0);
+                    if !rc.confirm_reboot {
+                        if ui.add_enabled(!busy, danger("Restart recorder…")).clicked() { rc.confirm_reboot = true; }
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Restart now?").color(BAD));
+                            if ui.button("Cancel").clicked() { rc.confirm_reboot = false; }
+                            if ui.add(egui::Button::new(RichText::new("Restart").color(Color32::WHITE)).fill(BAD)).clicked() {
+                                rc.confirm_reboot = false;
+                                let r = dvrip::Dvr::connect(&cam.host, dvrip::PORT, &cam.user, &cam.pass).and_then(|mut d| d.reboot());
+                                *rc.msg.lock().unwrap() = match r { Ok(()) => "Restarting… cameras come back in about a minute.".into(), Err(e) => format!("Could not restart: {e}") };
+                            }
+                        });
+                    }
+                }
+            }
+            let m = rc.msg.lock().unwrap().clone();
+            if !m.is_empty() { ui.add_space(8.0); ui.label(RichText::new(m).color(MUTED())); }
+            if rc.tab < 2 && rc.edit.is_some() {
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if busy { ui.spinner(); }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(!busy, primary("Save to recorder")).clicked() { do_save = true; }
+                        if ui.button("Revert").clicked() { rc.loaded_ch = 0; }
+                    });
+                });
+            }
+        });
+        if do_save {
+            if let Some(e) = rc.edit.clone() {
+                let (c2, ch, msg, b, data, ctx2) = (cam.clone(), rc.ch, rc.msg.clone(), rc.busy.clone(), rc.data.clone(), ctx.clone());
+                b.store(true, Ordering::Relaxed);
+                *msg.lock().unwrap() = "Saving…".into();
+                std::thread::spawn(move || {
+                    // αποθήκευση και μετά επανανάγνωση για επιβεβαίωση
+                    let r = save_ch_cfg(&c2, ch, &e).and_then(|_| load_ch_cfg(&c2, ch));
+                    *msg.lock().unwrap() = match &r { Ok(n) if n.region == e.region && n.level == e.level.clamp(1, 6) && n.to_net == e.to_net && n.enable == e.enable => "Saved and verified on the recorder.".into(),
+                                                      Ok(_) => "Saved, but the recorder reports different values. Check the settings.".into(), Err(er) => format!("Not saved: {er}") };
+                    if let Ok(n) = r { *data.lock().unwrap() = Some(Ok(n)); }
+                    b.store(false, Ordering::Relaxed); ctx2.request_repaint();
+                });
+            }
+        }
+        if let Some(np) = new_pw {
+            let host = cam.host.clone();
+            for c in self.store.camera.iter_mut().filter(|c| c.host == host) { c.pass = np.clone(); }
+            self.save();
+            self.restart_streams(ctx);
+        }
+        if !open { self.rcfg = None; }
     }
 }

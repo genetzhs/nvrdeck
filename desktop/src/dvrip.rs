@@ -144,6 +144,51 @@ impl Dvr {
         Ok(out)
     }
 
+    /// Ανάγνωση ρύθμισης (CONFIG_GET 1042), π.χ. "Detect.MotionDetect", "Record".
+    pub fn get_config(&mut self, name: &str) -> anyhow::Result<Value> {
+        let sid = self.sid();
+        let r = self.call(1042, json!({"Name": name, "SessionID": sid}))?;
+        anyhow::ensure!(r["Ret"].as_i64() == Some(100), "config {name} refused ({:?})", r["Ret"]);
+        Ok(r[name].clone())
+    }
+
+    /// Αποθήκευση ρύθμισης (CONFIG_SET 1040). Γράφει στο καταγραφικό.
+    pub fn set_config(&mut self, name: &str, value: &Value) -> anyhow::Result<()> {
+        let sid = self.sid();
+        let r = self.call(1040, json!({"Name": name, "SessionID": sid, name: value}))?;
+        anyhow::ensure!(r["Ret"].as_i64() == Some(100), "saving {name} refused ({:?})", r["Ret"]);
+        Ok(())
+    }
+
+    /// Ώρα του καταγραφικού (OPTimeQuery 1452) → "YYYY-MM-DD HH:MM:SS"
+    pub fn get_time(&mut self) -> anyhow::Result<String> {
+        let sid = self.sid();
+        let r = self.call(1452, json!({"Name": "OPTimeQuery", "SessionID": sid}))?;
+        Ok(r["OPTimeQuery"].as_str().unwrap_or("").to_string())
+    }
+
+    /// Ρύθμιση ώρας (OPTimeSetting 1450).
+    pub fn set_time(&mut self, t: &str) -> anyhow::Result<()> {
+        let sid = self.sid();
+        let r = self.call(1450, json!({"Name": "OPTimeSetting", "SessionID": sid, "OPTimeSetting": t}))?;
+        anyhow::ensure!(r["Ret"].as_i64() == Some(100), "time refused ({:?})", r["Ret"]);
+        Ok(())
+    }
+
+    /// Αλλαγή κωδικού χρήστη του καταγραφικού (ModifyPassword 1488).
+    pub fn change_password(&mut self, user: &str, old: &str, new: &str) -> anyhow::Result<()> {
+        let sid = self.sid();
+        let r = self.call(1488, json!({"EncryptType": "MD5", "NewPassWord": sofia_hash(new), "PassWord": sofia_hash(old), "SessionID": sid, "UserName": user}))?;
+        anyhow::ensure!(r["Ret"].as_i64() == Some(100), "password change refused ({:?})", r["Ret"]);
+        Ok(())
+    }
+
+    /// Επανεκκίνηση καταγραφικού (OPMachine Reboot).
+    pub fn reboot(&mut self) -> anyhow::Result<()> {
+        let sid = self.sid();
+        self.send(1450, &json!({"Name": "OPMachine", "SessionID": sid, "OPMachine": {"Action": "Reboot"}}))
+    }
+
     /// Στιγμιότυπο JPEG από κανάλι (0-based), μέσω του ίδιου του καταγραφικού.
     pub fn snapshot(&mut self, channel: u32) -> anyhow::Result<Vec<u8>> {
         let sid = self.sid();

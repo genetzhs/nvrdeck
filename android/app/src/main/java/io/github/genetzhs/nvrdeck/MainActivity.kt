@@ -1,6 +1,9 @@
 package io.github.genetzhs.nvrdeck
 
-import android.os.Build
+import androidx.compose.material.icons.outlined.GridView
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.Check
+android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -376,19 +379,39 @@ fun LiveScreen(store: Store, data: StoreData, onSolo: (Long) -> Unit) {
     }
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 10.dp)) {
-            ScreenTitle(eyebrow = "${cams.size} cameras", title = "Live", leading = { StatusDot(cams.isNotEmpty(), 6.dp) })
+            ScreenTitle(eyebrow = "${cams.size} cameras", title = "Live", leading = { StatusDot(cams.isNotEmpty(), 6.dp) }, right = {
+                // μενού διάταξης (και ομάδων) δεξιά από τον τίτλο
+                var open by remember { mutableStateOf(false) }
+                Box {
+                    Row(Modifier.clip(RoundedCornerShape(50)).background(c.glassStrong).border(1.dp, c.glassBorder, RoundedCornerShape(50))
+                        .clickable { open = true }.padding(horizontal = 14.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Outlined.GridView, null, tint = c.fg, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(LAYOUTS.getOrElse(s.layout) { "Auto" } + if (s.group.isNotEmpty() && s.group in groups) " · ${s.group}" else "",
+                            color = c.fg, fontFamily = Geist, fontWeight = FontWeight.Medium, fontSize = 13.sp, maxLines = 1)
+                        Icon(Icons.Filled.ArrowDropDown, null, tint = c.muted, modifier = Modifier.size(18.dp))
+                    }
+                    DropdownMenu(open, { open = false }, containerColor = c.bgEnd, shape = RoundedCornerShape(16.dp)) {
+                        Text("LAYOUT", color = c.muted, fontSize = 11.sp, letterSpacing = 1.5.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
+                        LAYOUTS.forEachIndexed { i, name ->
+                            DropdownMenuItem(text = { Text(name, color = if (s.layout == i) c.accent else c.fg, fontWeight = if (s.layout == i) FontWeight.SemiBold else FontWeight.Normal) },
+                                trailingIcon = { if (s.layout == i) Icon(Icons.Filled.Check, null, tint = c.accent, modifier = Modifier.size(16.dp)) },
+                                onClick = { store.update { it.copy(settings = it.settings.copy(layout = i)) }; open = false })
+                        }
+                        if (groups.isNotEmpty()) {
+                            HorizontalDivider(color = c.glassBorder)
+                            Text("GROUP", color = c.muted, fontSize = 11.sp, letterSpacing = 1.5.sp, modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp))
+                            (listOf("") + groups).forEach { g ->
+                                val sel = s.group == g
+                                DropdownMenuItem(text = { Text(g.ifEmpty { "All cameras" }, color = if (sel) c.accent else c.fg) },
+                                    trailingIcon = { if (sel) Icon(Icons.Filled.Check, null, tint = c.accent, modifier = Modifier.size(16.dp)) },
+                                    onClick = { store.update { it.copy(settings = it.settings.copy(group = g)) }; open = false })
+                            }
+                        }
+                    }
+                }
+            })
         }
-        Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            LAYOUTS.forEachIndexed { i, name -> Chip(name, s.layout == i) { store.update { it.copy(settings = it.settings.copy(layout = i)) } } }
-        }
-        if (groups.isNotEmpty()) {
-            Spacer(Modifier.height(6.dp))
-            Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                Chip("All", s.group.isEmpty()) { store.update { it.copy(settings = it.settings.copy(group = "")) } }
-                groups.forEach { g -> Chip(g, s.group == g) { store.update { it.copy(settings = it.settings.copy(group = g)) } } }
-            }
-        }
-        Spacer(Modifier.height(10.dp))
         if (cams.isEmpty()) {
             Box(Modifier.fillMaxSize().padding(20.dp), contentAlignment = Alignment.Center) {
                 GlassCard(Modifier.fillMaxWidth()) {

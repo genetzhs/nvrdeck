@@ -195,6 +195,11 @@ impl Dvr {
     }
 }
 
+/// (fps, H.265;) από την πρώτη κεφαλίδα I-frame (0x000001FC: byte 4 = τύπος, byte 5 = fps).
+pub fn stream_info(raw: &[u8]) -> (u32, bool) {
+    raw.windows(6).find(|w| w[..4] == [0, 0, 1, 0xFC]).map(|w| (w[5] as u32, w[4] == 3 || w[4] == 0x12)).unwrap_or((15, false))
+}
+
 /// Αφαιρεί τις κεφαλίδες καρέ του XMeye (0x000001FC/FD/FA/F9) ώστε να μείνει καθαρό H.264/H.265 bitstream.
 pub fn strip_frames(raw: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(raw.len());

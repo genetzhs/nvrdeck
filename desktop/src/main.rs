@@ -768,7 +768,23 @@ struct App {
     chrome: bool,
     qr: Option<QrState>,
     media: Vec<(PathBuf, bool, std::time::SystemTime, u64)>,
+    pb: NvrPb,
 }
+
+/// Αναπαραγωγή από το καταγραφικό
+#[derive(Default)]
+struct NvrPb {
+    local: bool,
+    nvr: usize,        // δείκτης κάμερας-«αντιπροσώπου» του NVR
+    ch: u32,           // κανάλι (όπως στο RTSP)
+    day: i64,          // 0 = σήμερα, -1 = χθες…
+    motion: bool,
+    key: String,       // τι φορτώθηκε τελευταία
+    files: Arc<Mutex<Option<Result<Vec<dvrip::RecFile>, String>>>>,
+    dl: Arc<Mutex<DlJob>>,
+}
+#[derive(Default)]
+struct DlJob { name: String, bytes: u64, total: u64, busy: bool, done: Option<Result<PathBuf, String>> }
 
 struct QrState { pass: String, pass2: String, tex: Option<egui::TextureHandle>, err: String, n: usize }
 
@@ -784,7 +800,7 @@ impl App {
               scan: Arc::new(Mutex::new(ScanState::default())), scan_open: false, nvr: None,
               hd: None, zoom: 1.0, zoom_c: egui::pos2(0.5, 0.5), recs: Default::default(),
               inbox: Arc::new(Mutex::new(vec![])), health: vec![], last_tick: Instant::now(),
-              wall: false, chrome: true, qr: None, media: vec![] }
+              wall: false, chrome: true, qr: None, media: vec![], pb: NvrPb::default() }
     }
 
     fn restart_streams(&mut self, ctx: &egui::Context) {
@@ -1902,17 +1918,30 @@ impl App {
     }
 
     // ── #8 Αναπαραγωγή τοπικών εγγραφών / στιγμιοτύπων ──
+    /// Κάμερες XMeye ομαδοποιημένες ανά καταγραφικό (host:port) → [(δείκτης, κανάλι, όνομα)]
+    fn nvr_groups(&self) -> Vec<Vec<(usize, u32, String)>> {
+        let mut m: Vec<(String, Vec<(usize, u32, String)>)> = vec![];
+        for (i, c) in self.store.camera.iter().enumerate().filter(|(_, c)| c.proto == Proto::XMeye) {
+            let k = c.host.clone();
+            match m.iter_mut().find(|(h, _)| *h == k) { Some((_, v)) => v.push((i, c.channel, c.name.clone())), None => m.push((k, vec![(i, c.channel, c.name.clone())])) }
+        }
+        m.into_iter().map(|(_, v)| v).collect()
+    }
+
     fn playback_ui(&mut self, ctx: &egui::Context) {
+        let groups = self.nvr_groups();
+        if !self.pb.local && !groups.is_empty() { return self.nvr_playback_ui(ctx, groups); }
         if self.media.is_empty() || ctx.input(|i| i.time) as u64 % 5 == 0 { self.media = list_media(); }
         egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::same(24.0))).show(ctx, |ui| {
             ui.horizontal(|ui| {
                 screen_title(ui, "Saved on this computer", "Playback");
+                if !groups.is_empty() && ui.button("◀ Recorder").clicked() { self.pb.local = false; }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Open videos folder").clicked() { open_path(&media_dir(true)); }
                     if ui.button("Open pictures folder").clicked() { open_path(&media_dir(false)); }
                 });
             });
-            ui.label(RichText::new("Recordings and snapshots made with NVRDeck. NVR-side playback (the recorder's own disk) is not supported yet.").color(MUTED()).small());
+            ui.label(RichText::new("Recordings and snapshots made with NVRDeck on this computer.").color(MUTED()).small());
             ui.add_space(12.0);
             if self.media.is_empty() {
                 ui.label(RichText::new("Nothing yet. In full view press R to record or S for a snapshot.").color(MUTED()));
@@ -1981,4 +2010,137 @@ fn set_autostart(on: bool) -> anyhow::Result<()> {
     let body = format!("[Desktop Entry]\nType=Application\nName=NVRDeck\nExec=\"{}\" --wall\nIcon=nvrdeck\nX-GNOME-Autostart-enabled=true\n", exe.display());
     std::fs::write(&f, body)?;
     Ok(())
+}
+
+impl App {
+    fn nvr_playback_ui(&mut self, ctx: &egui::Context, groups: Vec<Vec<(usize, u32, String)>>) {
+        let gi = self.pb.nvr.min(groups.len() - 1);
+        let g = &groups[gi];
+        if !g.iter().any(|x| x.1 == self.pb.ch) { self.pb.ch = g[0].1; }
+        let date = (chrono::Local::now() + chrono::Duration::days(self.pb.day)).date_naive();
+        let key = format!("{gi}/{}/{date}/{}", self.pb.ch, self.pb.motion);
+        let cam = self.store.camera[g[0].0].clone();
+        if key != self.pb.key {
+            self.pb.key = key;
+            *self.pb.files.lock().unwrap() = None;
+            let (out, ch, motion, c2, ctx2) = (self.pb.files.clone(), self.pb.ch, self.pb.motion, cam.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let r = dvrip::Dvr::connect(&c2.host, dvrip::PORT, &c2.user, &c2.pass).and_then(|mut d|
+                    d.files(ch, &format!("{date} 00:00:00"), &format!("{date} 23:59:59"), if motion { "M" } else { "*" }));
+                *out.lock().unwrap() = Some(r.map_err(|e| e.to_string()));
+                ctx2.request_repaint();
+            });
+        }
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::same(24.0))).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                screen_title(ui, "Recorder", "Playback");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("This computer ▶").clicked() { self.pb.local = true; }
+                });
+            });
+            ui.add_space(10.0);
+            // φίλτρα
+            glass_frame().show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal_wrapped(|ui| {
+                    if groups.len() > 1 {
+                        egui::ComboBox::from_id_salt("nvrsel").selected_text(format!("Recorder {}", gi + 1)).show_ui(ui, |ui| {
+                            for k in 0..groups.len() { ui.selectable_value(&mut self.pb.nvr, k, format!("Recorder {}", k + 1)); }
+                        });
+                    }
+                    for (_, ch, name) in g {
+                        if ui.selectable_label(self.pb.ch == *ch, name.as_str()).clicked() { self.pb.ch = *ch; }
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("◀").clicked() { self.pb.day -= 1; }
+                    ui.label(RichText::new(match self.pb.day { 0 => format!("Today · {}", date.format("%d/%m/%Y")), -1 => format!("Yesterday · {}", date.format("%d/%m/%Y")), _ => date.format("%A %d/%m/%Y").to_string() }).strong());
+                    if ui.add_enabled(self.pb.day < 0, egui::Button::new("▶")).clicked() { self.pb.day += 1; }
+                    ui.add_space(16.0);
+                    if ui.selectable_label(!self.pb.motion, "All").clicked() { self.pb.motion = false; }
+                    if ui.selectable_label(self.pb.motion, "Motion only").clicked() { self.pb.motion = true; }
+                });
+            });
+            ui.add_space(10.0);
+            // λήψη σε εξέλιξη
+            {
+                let j = self.pb.dl.lock().unwrap();
+                if j.busy {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        let pct = if j.total > 0 { (100 * j.bytes / j.total).min(100) } else { 0 };
+                        ui.label(format!("Fetching {} from the recorder… {pct}%", j.name));
+                    });
+                    ctx.request_repaint_after(Duration::from_millis(300));
+                } else if let Some(Err(e)) = &j.done {
+                    ui.label(RichText::new(format!("Could not play: {e}")).color(BAD));
+                }
+            }
+            let files = self.pb.files.lock().unwrap();
+            match &*files {
+                None => { ui.horizontal(|ui| { ui.spinner(); ui.label("Loading recordings…"); }); }
+                Some(Err(e)) => { ui.label(RichText::new(format!("Recorder not reachable: {e}")).color(BAD)); }
+                Some(Ok(v)) if v.is_empty() => { ui.label(RichText::new("No recordings for this day.").color(MUTED())); }
+                Some(Ok(v)) => {
+                    ui.label(RichText::new(format!("{} recordings", v.len())).color(MUTED()).small());
+                    ui.add_space(4.0);
+                    let busy = self.pb.dl.lock().unwrap().busy;
+                    let mut play: Option<dvrip::RecFile> = None;
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        for f in v.iter().rev() {
+                            egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0, BORDER())).rounding(12.0).inner_margin(egui::Margin::symmetric(14.0, 8.0)).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    let t = |x: &str| x.get(11..19).unwrap_or(x).to_string();
+                                    ui.label(RichText::new(format!("{} – {}", t(&f.begin), t(&f.end))).monospace().strong());
+                                    ui.label(RichText::new(format!("{:.0} MB", f.size_kb as f64 / 1024.0)).color(MUTED()).small());
+                                    if f.name.contains("[M]") { ui.label(RichText::new("MOTION").small().color(Color32::from_rgb(255, 176, 32))); }
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        if ui.add_enabled(!busy, egui::Button::new("▶ Play")).clicked() { play = Some(f.clone()); }
+                                    });
+                                });
+                            });
+                            ui.add_space(4.0);
+                        }
+                    });
+                    if let Some(f) = play {
+                        let (job, c2, ctx2) = (self.pb.dl.clone(), cam.clone(), ctx.clone());
+                        let ch_name = g.iter().find(|x| x.1 == self.pb.ch).map(|x| x.2.clone()).unwrap_or_default();
+                        { let mut j = job.lock().unwrap(); *j = DlJob { name: format!("{} {}", ch_name, f.begin), total: f.size_kb * 1024, busy: true, ..Default::default() }; }
+                        std::thread::spawn(move || {
+                            let r = fetch_recording(&c2, &f, &ch_name, &job);
+                            if let Ok(p) = &r { open_path(p); }
+                            let mut j = job.lock().unwrap(); j.busy = false; j.done = Some(r.map_err(|e| e.to_string()));
+                            ctx2.request_repaint();
+                        });
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Κατεβάζει μια εγγραφή του NVR και τη μετατρέπει σε MP4 (χωρίς επανακωδικοποίηση).
+fn fetch_recording(cam: &Camera, f: &dvrip::RecFile, name: &str, job: &Arc<Mutex<DlJob>>) -> anyhow::Result<PathBuf> {
+    let dir = media_dir(true).join("Recorder");
+    std::fs::create_dir_all(&dir)?;
+    let stem = format!("{}_{}", name, f.begin).chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect::<String>();
+    let out = dir.join(format!("{stem}.mp4"));
+    if out.exists() { return Ok(out); }
+    let raw = std::env::temp_dir().join(format!("{stem}.raw"));
+    let mut d = dvrip::Dvr::connect(&cam.host, dvrip::PORT, &cam.user, &cam.pass)?;
+    let j2 = job.clone();
+    d.download(&cam.host, dvrip::PORT, f, &raw, u64::MAX, move |b| { j2.lock().unwrap().bytes = b; })?;
+    let bytes = std::fs::read(&raw)?;
+    let _ = std::fs::remove_file(&raw);
+    let (fps, hevc) = dvrip::stream_info(&bytes);
+    let es = dvrip::strip_frames(&bytes);
+    anyhow::ensure!(!es.is_empty(), "no video in recording");
+    let tmp = std::env::temp_dir().join(format!("{stem}.es"));
+    std::fs::write(&tmp, &es)?;
+    let st = Command::new(tool("ffmpeg")).args(["-v", "error", "-y", "-f", if hevc { "hevc" } else { "h264" }, "-r", &fps.max(1).to_string(), "-i"])
+        .arg(&tmp).args(["-c", "copy", "-movflags", "+faststart"]).arg(&out).stdout(Stdio::null()).stderr(Stdio::null()).status()?;
+    let _ = std::fs::remove_file(&tmp);
+    anyhow::ensure!(st.success(), "conversion failed");
+    Ok(out)
 }

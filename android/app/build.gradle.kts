@@ -6,6 +6,7 @@ plugins {
 }
 
 android {
+    androidResources { noCompress += "onnx" }
     namespace = "io.github.genetzhs.nvrdeck"
     compileSdk = 35
     defaultConfig {
@@ -14,6 +15,7 @@ android {
         targetSdk = 35
         versionCode = 5
         versionName = "0.5.0"
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
     // Υπογραφή release: από μεταβλητές περιβάλλοντος (GitHub Secrets). Χωρίς αυτές → debug key.
     val ks = System.getenv("ANDROID_KEYSTORE_FILE")
@@ -57,4 +59,5 @@ dependencies {
     implementation("androidx.fragment:fragment-ktx:1.8.5")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
 }

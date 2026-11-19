@@ -254,6 +254,7 @@ fun MainScreen(store: Store, data: StoreData, onLock: () -> Unit) {
         if (Build.VERSION.SDK_INT >= 33 && data.settings.alerts) askNotif.launch(android.Manifest.permission.POST_NOTIFICATIONS)
     }
     val latest by rememberUpdatedState(data)
+    LaunchedEffect(Unit) { if (data.settings.aiAlerts) runCatching { AlertService.start(ctx) } }
     // Αυτόματη εύρεση καναλιών NVR που λείπουν: δοκιμάζει τα επόμενα κανάλια κάθε NVR και προσθέτει όσα δίνουν εικόνα
     LaunchedEffect(Unit) {
         kotlinx.coroutines.delay(3000)
@@ -716,6 +717,12 @@ fun SettingsScreen(store: Store, data: StoreData, onLock: () -> Unit) {
             SettingSwitch("HD in full screen", "Grid uses the light stream, full screen the main one", s.autoHd) { v -> store.update { it.copy(settings = it.settings.copy(autoHd = v)) } }
             Spacer(Modifier.height(8.dp))
             SettingSwitch("Offline alerts", "Notify when a camera has no video for 60 s (while the app is open)", s.alerts) { v -> store.update { it.copy(settings = it.settings.copy(alerts = v)) } }
+            Spacer(Modifier.height(8.dp))
+            val sctx = LocalContext.current
+            SettingSwitch("People & vehicle alerts", "Runs in the background: the recorder's motion events are checked on the phone, and you get a photo only for people or vehicles", s.aiAlerts) { v ->
+                store.update { it.copy(settings = it.settings.copy(aiAlerts = v)) }
+                if (v) AlertService.start(sctx) else AlertService.stop(sctx)
+            }
         }
         GlassCard(Modifier.fillMaxWidth()) {
             Eyebrow("Security")

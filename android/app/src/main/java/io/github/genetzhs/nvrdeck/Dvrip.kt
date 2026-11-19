@@ -165,6 +165,33 @@ class Dvr private constructor(private val host: String, private val port: Int, p
         }
     }
 
+    // ── Συμβάντα (κίνηση) και στιγμιότυπα ──
+    data class Alarm(val channel: Int, val event: String, val start: Boolean)
+
+    fun subscribeAlarms() { call(1500, buildJsonObject { put("Name", ""); put("SessionID", sid()) }) }
+    fun keepAlive() = send(1006, buildJsonObject { put("Name", "KeepAlive"); put("SessionID", sid()) })
+
+    /** Επόμενο συμβάν ή null αν δεν ήρθε τίποτα μέσα στο χρονικό όριο. */
+    fun nextAlarm(): Alarm? {
+        val (m, b) = try { recv() } catch (_: java.net.SocketTimeoutException) { return null }
+        if (m != 1504) return null
+        val a = json(b)["AlarmInfo"]?.jsonObject ?: return null
+        return Alarm(a["Channel"]?.jsonPrimitive?.intOrNull ?: 0, a["Event"]?.jsonPrimitive?.content ?: "", a["Status"]?.jsonPrimitive?.content == "Start")
+    }
+
+    /** JPEG από κανάλι (0-based), μέσω του καταγραφικού. */
+    fun snapshot(channel: Int): ByteArray {
+        send(1560, buildJsonObject { put("Name", "OPSNAP"); put("SessionID", sid()); putJsonObject("OPSNAP") { put("Channel", channel) } })
+        repeat(50) {
+            val (m, b) = recv()
+            if (m == 1561) {
+                for (i in 0 until b.size - 1) if (b[i] == 0xFF.toByte() && b[i + 1] == 0xD8.toByte()) return b.copyOfRange(i, b.size)
+                throw Exception("Snapshot refused")
+            }
+        }
+        throw Exception("No snapshot")
+    }
+
     override fun close() { runCatching { s.close() } }
 }
 

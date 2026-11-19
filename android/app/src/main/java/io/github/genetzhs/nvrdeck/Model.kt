@@ -59,6 +59,7 @@ data class Settings(
     val alerts: Boolean = true,
     val group: String = "",
     val widgetId: Long = 0,
+    val aiAlerts: Boolean = false,
 )
 
 @Serializable

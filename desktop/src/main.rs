@@ -1610,115 +1610,143 @@ impl App {
         }
     }
 
-    // ── Ρυθμίσεις ──
+    // ── Ρυθμίσεις: κεντραρισμένες κάρτες σε δύο στήλες (μία σε στενό παράθυρο) ──
     fn settings_ui(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::same(24.0))).show(ctx, |ui| {
-            screen_title(ui, "Apply", "Settings");
-            ui.add_space(12.0);
-            glass_frame().show(ui, |ui| {
-                ui.label(RichText::new("Theme").strong());
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    for (i, (name, p)) in THEMES.iter().enumerate() {
-                        let sel = self.store.settings.theme == i as u32;
-                        let (r, resp) = ui.allocate_exact_size(egui::vec2(120.0, 64.0), egui::Sense::click());
-                        let pt = ui.painter();
-                        pt.rect_filled(r, 8.0, p.bg);
-                        pt.rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 16.0)), egui::Rounding { nw: 8.0, ne: 8.0, sw: 0.0, se: 0.0 }, p.panel);
-                        pt.rect_filled(egui::Rect::from_min_size(r.min + egui::vec2(10.0, 26.0), egui::vec2(40.0, 10.0)), 3.0, p.accent);
-                        pt.text(r.left_bottom() + egui::vec2(10.0, -8.0), egui::Align2::LEFT_BOTTOM, *name, egui::FontId::proportional(13.0), p.text);
-                        pt.rect_stroke(r, 8.0, if sel { Stroke::new(2.0, ACCENT()) } else { Stroke::new(1.0, BORDER()) });
-                        if resp.clicked() && !sel {
-                            self.store.settings.theme = i as u32;
-                            self.settings_draft.theme = i as u32;
-                            apply_theme(ctx, i as u32);
-                            let _ = self.store.save();
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::symmetric(24.0, 20.0))).show(ctx, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                let maxw = 1120.0_f32.min(ui.available_width());
+                let pad = ((ui.available_width() - maxw) / 2.0).max(0.0);
+                ui.horizontal_top(|ui| {
+                    ui.add_space(pad);
+                    ui.vertical(|ui| {
+                        ui.set_width(maxw);
+                        screen_title(ui, "Apply", "Settings");
+                        ui.add_space(16.0);
+                        if maxw > 820.0 {
+                            ui.columns(2, |cols| {
+                                let (l, r) = cols.split_at_mut(1);
+                                self.settings_left(ctx, &mut l[0]);
+                                self.settings_right(&mut r[0]);
+                            });
+                        } else {
+                            self.settings_left(ctx, ui);
+                            ui.add_space(14.0);
+                            self.settings_right(ui);
                         }
+                        ui.add_space(18.0);
+                        ui.label(RichText::new(format!("Config file: {}", store_path().display())).color(MUTED()).small());
+                        ui.label(RichText::new("Keys: 1–7 full view · Esc grid · double-click a channel · S snapshot · R record · wheel zoom, Z reset · W hide menus · F11 fullscreen").color(MUTED()).small());
+                    });
+                });
+            });
+        });
+    }
+
+    fn card(ui: &mut egui::Ui, title: &str, sub: &str, body: impl FnOnce(&mut egui::Ui)) {
+        glass_frame().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(RichText::new(title).font(semibold(15.0)));
+            if !sub.is_empty() { ui.label(RichText::new(sub).color(MUTED()).small()); }
+            ui.add_space(10.0);
+            body(ui);
+        });
+        ui.add_space(14.0);
+    }
+
+    fn settings_left(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        Self::card(ui, "Appearance", "Theme and on-video information.", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (i, (name, p)) in THEMES.iter().enumerate() {
+                    let sel = self.store.settings.theme == i as u32;
+                    let (r, resp) = ui.allocate_exact_size(egui::vec2(116.0, 64.0), egui::Sense::click());
+                    let pt = ui.painter();
+                    pt.rect_filled(r, 10.0, p.bg);
+                    pt.rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 16.0)), egui::Rounding { nw: 10.0, ne: 10.0, sw: 0.0, se: 0.0 }, p.panel);
+                    pt.rect_filled(egui::Rect::from_min_size(r.min + egui::vec2(10.0, 26.0), egui::vec2(40.0, 10.0)), 3.0, p.accent);
+                    pt.text(r.left_bottom() + egui::vec2(10.0, -8.0), egui::Align2::LEFT_BOTTOM, *name, egui::FontId::proportional(13.0), p.text);
+                    pt.rect_stroke(r, 10.0, if sel { Stroke::new(2.0, ACCENT()) } else { Stroke::new(1.0, BORDER()) });
+                    if resp.clicked() && !sel {
+                        self.store.settings.theme = i as u32;
+                        self.settings_draft.theme = i as u32;
+                        apply_theme(ctx, i as u32);
+                        let _ = self.store.save();
                     }
-                });
+                }
             });
-            ui.add_space(12.0);
-            glass_frame().show(ui, |ui| {
-                ui.label(RichText::new("View quality").strong());
-                ui.label(RichText::new("Lower resolution/FPS = less CPU on this computer.").color(MUTED()).small());
-                ui.add_space(6.0);
-                let d = &mut self.settings_draft;
-                ui.horizontal(|ui| {
-                    for (w, h, t) in [(640, 360, "360p"), (960, 540, "540p"), (1280, 720, "720p"), (1920, 1080, "1080p")] {
-                        if ui.selectable_label(d.width == w, t).clicked() { d.width = w; d.height = h; }
+            ui.add_space(10.0);
+            if ui.checkbox(&mut self.store.settings.show_clock, "Clock with seconds on the video (LIVE badge)").changed() {
+                self.settings_draft.show_clock = self.store.settings.show_clock;
+                let _ = self.store.save();
+            }
+        });
+        Self::card(ui, "Video quality", "Grid resolution and frame rate. Lower = less CPU.", |ui| {
+            let d = &mut self.settings_draft;
+            ui.horizontal(|ui| {
+                for (w, h, t) in [(640, 360, "360p"), (960, 540, "540p"), (1280, 720, "720p"), (1920, 1080, "1080p")] {
+                    if ui.selectable_label(d.width == w, t).clicked() { d.width = w; d.height = h; }
+                }
+            });
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("FPS").color(MUTED()));
+                ui.add(egui::Slider::new(&mut d.fps, 2..=25));
+            });
+            ui.add_space(6.0);
+            if ui.checkbox(&mut self.store.settings.auto_hd, "Full view switches to the HD main stream").changed() {
+                self.settings_draft.auto_hd = self.store.settings.auto_hd;
+                let _ = self.store.save();
+            }
+            ui.add_space(10.0);
+            let dirty = self.settings_draft.width != self.store.settings.width || self.settings_draft.fps != self.store.settings.fps;
+            if ui.add_enabled(dirty, primary("Apply")).clicked() {
+                self.store.settings.width = self.settings_draft.width;
+                self.store.settings.height = self.settings_draft.height;
+                self.store.settings.fps = self.settings_draft.fps;
+                self.save();
+                self.restart_streams(ctx);
+            }
+        });
+    }
+
+    fn settings_right(&mut self, ui: &mut egui::Ui) {
+        Self::card(ui, "Alerts", "Desktop notifications while NVRDeck is running.", |ui| {
+            let st = &mut self.store.settings;
+            let mut ch = ui.checkbox(&mut st.alerts, "Notify when a camera goes offline or detects motion").changed();
+            ui.add_space(6.0);
+            egui::Grid::new("alerts").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
+                ui.label(RichText::new("Offline after").color(MUTED()));
+                ch |= ui.add(egui::DragValue::new(&mut st.alert_after).range(10..=3600).suffix(" s")).changed();
+                ui.end_row();
+                ui.label(RichText::new("Motion sensitivity").color(MUTED()));
+                ch |= ui.add(egui::Slider::new(&mut st.motion_sens, 1..=100)).changed();
+                ui.end_row();
+            });
+            ui.label(RichText::new("Turn motion on per camera in Cameras → Edit.").color(MUTED()).small());
+            if ch { let _ = self.store.save(); }
+        });
+        Self::card(ui, "Monitor wall", "Fullscreen without menus (W toggles them). Start with --wall.", |ui| {
+            if ui.checkbox(&mut self.store.settings.wall_autologin, "In wall mode, skip the login screen").changed() { let _ = self.store.save(); }
+            let mut auto = autostart_enabled();
+            if ui.checkbox(&mut auto, "Open in wall mode when I log in to this computer").changed() {
+                self.toast = Some((match set_autostart(auto) { Ok(()) => if auto { "Autostart on".into() } else { "Autostart off".into() }, Err(e) => format!("Autostart: {e}") }, Instant::now()));
+            }
+        });
+        Self::card(ui, "Admin account", "Login password for this app.", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.login_pass).password(true).hint_text("New password").desired_width(170.0));
+                ui.add(egui::TextEdit::singleline(&mut self.login_pass2).password(true).hint_text("Repeat").desired_width(170.0));
+                if ui.button("Change").clicked() {
+                    if self.login_pass.len() < 4 { self.toast("Password needs at least 4 characters"); }
+                    else if self.login_pass != self.login_pass2 { self.toast("Passwords do not match"); }
+                    else {
+                        let (u, p) = (self.store.admin_user.clone(), self.login_pass.clone());
+                        self.store.set_admin(&u, &p);
+                        self.login_pass.clear();
+                        self.login_pass2.clear();
+                        self.save();
                     }
-                });
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("FPS").color(MUTED()));
-                    ui.add(egui::Slider::new(&mut d.fps, 2..=25));
-                });
-                ui.add_space(4.0);
-                if ui.checkbox(&mut self.store.settings.show_clock, "Clock with seconds on the video (LIVE badge)").changed() {
-                    d.show_clock = self.store.settings.show_clock;
-                    let _ = self.store.save();
-                }
-                ui.add_space(6.0);
-                if ui.add(primary("Apply")).clicked() {
-                    self.store.settings = self.settings_draft.clone();
-                    self.save();
-                    self.restart_streams(ctx);
                 }
             });
-            ui.add_space(12.0);
-            glass_frame().show(ui, |ui| {
-                ui.label(RichText::new("Behaviour").strong());
-                ui.add_space(4.0);
-                let st = &mut self.store.settings;
-                let mut ch = false;
-                ch |= ui.checkbox(&mut st.auto_hd, "Full view switches to the HD main stream").changed();
-                ch |= ui.checkbox(&mut st.alerts, "Desktop notifications (offline / motion)").changed();
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Offline alert after").color(MUTED()));
-                    ch |= ui.add(egui::DragValue::new(&mut st.alert_after).range(10..=3600).suffix(" s")).changed();
-                    ui.add_space(16.0);
-                    ui.label(RichText::new("Motion sensitivity").color(MUTED()));
-                    ch |= ui.add(egui::Slider::new(&mut st.motion_sens, 1..=100)).changed();
-                });
-                ui.add_space(6.0);
-                ui.label(RichText::new("Monitor wall").strong());
-                ui.label(RichText::new("Starts fullscreen without menus (W toggles them). Launch with --wall.").color(MUTED()).small());
-                ch |= ui.checkbox(&mut st.wall_autologin, "In wall mode, skip the login screen").changed();
-                let mut auto = autostart_enabled();
-                if ui.checkbox(&mut auto, "Start NVRDeck in wall mode when I log in to this computer").changed() {
-                    match set_autostart(auto) { Ok(()) => self.toast = Some((if auto { "Autostart on" } else { "Autostart off" }.into(), Instant::now())),
-                                                Err(e) => self.toast = Some((format!("Autostart: {e}"), Instant::now())) }
-                }
-                if ch {
-                    let (a, b, c, d, e) = (st.auto_hd, st.alerts, st.alert_after, st.motion_sens, st.wall_autologin);
-                    let dr = &mut self.settings_draft;
-                    dr.auto_hd = a; dr.alerts = b; dr.alert_after = c; dr.motion_sens = d; dr.wall_autologin = e;
-                    let _ = self.store.save();
-                }
-            });
-            ui.add_space(12.0);
-            glass_frame().show(ui, |ui| {
-                ui.label(RichText::new("Admin account").strong());
-                ui.label(RichText::new("Change the login password for this app.").color(MUTED()).small());
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.add(egui::TextEdit::singleline(&mut self.login_pass).password(true).hint_text("New password").desired_width(180.0));
-                    ui.add(egui::TextEdit::singleline(&mut self.login_pass2).password(true).hint_text("Repeat").desired_width(180.0));
-                    if ui.button("Change").clicked() {
-                        if self.login_pass.len() < 4 { self.toast("Password needs at least 4 characters"); }
-                        else if self.login_pass != self.login_pass2 { self.toast("Passwords do not match"); }
-                        else {
-                            let (u, p) = (self.store.admin_user.clone(), self.login_pass.clone());
-                            self.store.set_admin(&u, &p);
-                            self.login_pass.clear();
-                            self.login_pass2.clear();
-                            self.save();
-                        }
-                    }
-                });
-            });
-            ui.add_space(12.0);
-            ui.label(RichText::new(format!("Config file: {}", store_path().display())).color(MUTED()).small());
-            ui.label(RichText::new("Keys: 1–7 full view · Esc grid · double-click a channel · S snapshot · R record · wheel zoom, Z reset · W hide menus · F11 fullscreen").color(MUTED()).small());
         });
     }
 

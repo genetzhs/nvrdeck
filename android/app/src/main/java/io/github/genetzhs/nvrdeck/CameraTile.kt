@@ -87,19 +87,20 @@ suspend fun probeCamera(ctx: Context, url: String): Result<String> {
 
 @OptIn(UnstableApi::class)
 @Composable
-fun CameraTile(cam: Camera, index: Int, showClock: Boolean, modifier: Modifier = Modifier, fill: Boolean = false, cornerDp: androidx.compose.ui.unit.Dp = 14.dp) {
+fun CameraTile(cam: Camera, index: Int, showClock: Boolean, modifier: Modifier = Modifier, fill: Boolean = false, cornerDp: androidx.compose.ui.unit.Dp = 14.dp, hd: Boolean = false, onView: ((PlayerView) -> Unit)? = null) {
     val ctx = LocalContext.current
     var status by remember(cam) { mutableStateOf("Connecting…") }
     var live by remember(cam) { mutableStateOf(false) }
     var lastFrame by remember(cam) { mutableLongStateOf(0L) }
     var retry by remember(cam) { mutableIntStateOf(0) }
-    val player = remember(cam, retry) { buildPlayer(ctx, cam.url()) }
+    val player = remember(cam, retry, hd) { buildPlayer(ctx, (if (hd) cam.copy(mainStream = true) else cam).url()) }
+    LaunchedEffect(cam.id, retry) { if (retry > 0) HealthBook.report(cam.id, false, reconnect = true) }
 
     DisposableEffect(player) {
         val l = object : Player.Listener {
-            override fun onIsPlayingChanged(isPlaying: Boolean) { live = isPlaying; if (isPlaying) status = "" }
-            override fun onRenderedFirstFrame() { live = true; status = ""; lastFrame = System.currentTimeMillis() }
-            override fun onPlayerError(error: PlaybackException) { live = false; status = friendlyError(error) + " – reconnecting" }
+            override fun onIsPlayingChanged(isPlaying: Boolean) { live = isPlaying; if (isPlaying) status = ""; HealthBook.report(cam.id, isPlaying) }
+            override fun onRenderedFirstFrame() { live = true; status = ""; lastFrame = System.currentTimeMillis(); player.videoFormat?.let { f -> HealthBook.report(cam.id, true, "${f.width}×${f.height}") } }
+            override fun onPlayerError(error: PlaybackException) { live = false; status = friendlyError(error) + " – reconnecting"; HealthBook.report(cam.id, false) }
         }
         player.addListener(l)
         onDispose { player.removeListener(l); player.release() }
@@ -123,7 +124,7 @@ fun CameraTile(cam: Camera, index: Int, showClock: Boolean, modifier: Modifier =
                     resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
                 }
             },
-            update = { it.player = player; it.resizeMode = if (fill) AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT },
+            update = { onView?.invoke(it); it.player = player; it.resizeMode = if (fill) AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT },
             modifier = Modifier.fillMaxSize(),
         )
         Row(

@@ -25,6 +25,7 @@ data class Camera(
     val mainStream: Boolean = false,
     val path: String = "",
     val enabled: Boolean = true,
+    val group: String = "",
 ) {
     /** Διεύθυνση RTSP. Τα στοιχεία μπαίνουν στο userinfo (Digest/Basic από το Media3). */
     fun url(): String {
@@ -54,6 +55,10 @@ data class Settings(
     val theme: Int = 0,
     val showClock: Boolean = true,
     val biometric: Boolean = true,
+    val autoHd: Boolean = true,
+    val alerts: Boolean = true,
+    val group: String = "",
+    val widgetId: Long = 0,
 )
 
 @Serializable

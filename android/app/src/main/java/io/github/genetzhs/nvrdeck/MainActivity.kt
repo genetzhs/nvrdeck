@@ -1,5 +1,18 @@
 package io.github.genetzhs.nvrdeck
 
+import android.os.Build
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.material.icons.outlined.QrCodeScanner
+import androidx.compose.material.icons.outlined.PhotoCamera
+import androidx.compose.material.icons.outlined.Close
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
+import kotlinx.coroutines.launch
 import android.app.Activity
 import android.app.Application
 import android.content.pm.ActivityInfo
@@ -231,15 +244,26 @@ private fun PinField(v: String, label: String, on: (String) -> Unit) = OutlinedT
 fun MainScreen(store: Store, data: StoreData, onLock: () -> Unit) {
     var tab by rememberSaveable { mutableIntStateOf(if (data.cameras.isEmpty()) 1 else 0) }
     var solo by remember { mutableStateOf<Long?>(null) }
+    val ctx = LocalContext.current
+    val askNotif = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= 33 && data.settings.alerts) askNotif.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+    }
+    val latest by rememberUpdatedState(data)
+    LaunchedEffect(Unit) {
+        while (true) {
+            kotlinx.coroutines.delay(1000)
+            val notes = HealthBook.tick(latest.cameras.filter { it.enabled }, 60)
+            if (latest.settings.alerts) notes.forEach { (t, b) -> notify(ctx, t, b) }
+        }
+    }
 
     solo?.let { id ->
         val idx = data.cameras.indexOfFirst { it.id == id }
         if (idx >= 0) {
             ImmersiveLandscape()
             BackHandler { solo = null }
-            Box(Modifier.fillMaxSize().background(Color.Black).clickable(indication = null, interactionSource = remember { MutableInteractionSource() }) { solo = null }) {
-                CameraTile(data.cameras[idx], idx, data.settings.showClock, Modifier.fillMaxSize(), cornerDp = 0.dp)
-            }
+            SoloView(data.cameras[idx], idx, data.settings) { solo = null }
             return
         } else solo = null
     }
@@ -315,14 +339,33 @@ private fun layoutCells(kind: Int, n: Int): List<Cell> {
 @Composable
 fun LiveScreen(store: Store, data: StoreData, onSolo: (Long) -> Unit) {
     val c = cine
-    val cams = data.cameras.filter { it.enabled }
     val s = data.settings
+    val groups = data.cameras.map { it.group.trim() }.filter { it.isNotEmpty() }.distinct().sorted()
+    val cams = data.cameras.filter { it.enabled && (s.group.isEmpty() || it.group == s.group || s.group !in groups) }
+    val ctx = LocalContext.current
+    val views = remember { mutableMapOf<Long, androidx.media3.ui.PlayerView>() }
+    // #10 κάθε λεπτό: μικρογραφία της κύριας κάμερας για το widget
+    LaunchedEffect(cams.map { it.id }) {
+        kotlinx.coroutines.delay(4000)
+        while (true) {
+            val m = cams.firstOrNull { it.id == s.mainId } ?: cams.firstOrNull()
+            if (m != null) grab(views[m.id])?.let { updateWidget(ctx, it, m) }
+            kotlinx.coroutines.delay(60_000)
+        }
+    }
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 10.dp)) {
             ScreenTitle(eyebrow = "${cams.size} cameras", title = "Live", leading = { StatusDot(cams.isNotEmpty(), 6.dp) })
         }
         Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             LAYOUTS.forEachIndexed { i, name -> Chip(name, s.layout == i) { store.update { it.copy(settings = it.settings.copy(layout = i)) } } }
+        }
+        if (groups.isNotEmpty()) {
+            Spacer(Modifier.height(6.dp))
+            Row(Modifier.horizontalScroll(rememberScrollState()).padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Chip("All", s.group.isEmpty()) { store.update { it.copy(settings = it.settings.copy(group = "")) } }
+                groups.forEach { g -> Chip(g, s.group == g) { store.update { it.copy(settings = it.settings.copy(group = g)) } } }
+            }
         }
         Spacer(Modifier.height(10.dp))
         if (cams.isEmpty()) {
@@ -356,6 +399,7 @@ fun LiveScreen(store: Store, data: StoreData, onSolo: (Long) -> Unit) {
                                 onDoubleClick = { onSolo(cam.id) },
                             ),
                         fill = true,
+                        onView = { views[cam.id] = it },
                     )
                 }
             }
@@ -370,6 +414,10 @@ fun CamerasScreen(store: Store, data: StoreData) {
     var editing by remember { mutableStateOf<Camera?>(null) }
     var nvr by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf<Camera?>(null) }
+    var qrText by remember { mutableStateOf<String?>(null) }
+    val scan = rememberLauncherForActivityResult(ScanContract()) { r -> r.contents?.let { qrText = it } }
+    qrText?.let { t -> QrImportDialog(t, free = MAX_CH - data.cameras.size, onDismiss = { qrText = null }) { list ->
+        store.update { it.copy(cameras = it.cameras + list) }; qrText = null } }
     LazyColumn(
         Modifier.fillMaxSize(),
         contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 130.dp),
@@ -383,6 +431,7 @@ fun CamerasScreen(store: Store, data: StoreData) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 PrimaryButton("Camera", icon = Icons.Filled.Add) { editing = Camera() }
                 GhostButton("NVR", icon = Icons.Outlined.Storage) { nvr = true }
+                GhostButton("QR", icon = Icons.Outlined.QrCodeScanner) { scan.launch(ScanOptions().setPrompt("Scan the code from NVRDeck on your computer").setBeepEnabled(false).setOrientationLocked(false).setDesiredBarcodeFormats(ScanOptions.QR_CODE)) }
             }
             Spacer(Modifier.height(6.dp))
         }
@@ -399,7 +448,11 @@ fun CamerasScreen(store: Store, data: StoreData) {
                             "${cam.host}:${cam.port}" + (if (cam.proto in listOf(Proto.XMEYE, Proto.HIKVISION, Proto.DAHUA) && cam.channel > 1) " · ch ${cam.channel}" else ""),
                             style = MonoMeta, color = c.muted, maxLines = 1,
                         )
-                        Text(cam.proto.label, color = c.muted, fontSize = 11.5.sp, maxLines = 1)
+                        val h = HealthBook.map[cam.id]
+                        Text(listOfNotNull(cam.proto.label, cam.group.ifEmpty { null },
+                            h?.takeIf { it.total > 0 }?.let { "${"%.0f".format(100.0 * it.online / it.total)}% up" },
+                            h?.res?.ifEmpty { null }, h?.takeIf { it.reconnects > 0 }?.let { "${it.reconnects} reconnects" }).joinToString(" · "),
+                            color = c.muted, fontSize = 11.5.sp, maxLines = 1)
                     }
                     Switch(
                         checked = cam.enabled,
@@ -486,6 +539,7 @@ fun CameraEditor(initial: Camera, onDismiss: () -> Unit, onSave: (Camera) -> Uni
     val scope = rememberCoroutineScope()
     FormDialog(if (initial.name.isEmpty()) "New camera" else "Edit", "Camera", onDismiss) {
         Field("Name", c.name, "e.g. Yard") { c = c.copy(name = it) }
+        Field("Group (optional)", c.group, "e.g. Outside") { c = c.copy(group = it) }
         ProtoPicker(c.proto, Proto.entries) { p -> c = c.copy(proto = p, port = if (c.port == c.proto.defaultPort) p.defaultPort else c.port) }
         Field("IP / Host", c.host, "e.g. 192.168.1.10") { c = c.copy(host = it.trim()) }
         Field("RTSP port", c.port.toString(), number = true) { c = c.copy(port = it.filter(Char::isDigit).take(5).toIntOrNull() ?: 0) }
@@ -611,6 +665,13 @@ fun SettingsScreen(store: Store, data: StoreData, onLock: () -> Unit) {
             }
         }
         GlassCard(Modifier.fillMaxWidth()) {
+            Eyebrow("Behaviour")
+            Spacer(Modifier.height(6.dp))
+            SettingSwitch("HD in full screen", "Grid uses the light stream, full screen the main one", s.autoHd) { v -> store.update { it.copy(settings = it.settings.copy(autoHd = v)) } }
+            Spacer(Modifier.height(8.dp))
+            SettingSwitch("Offline alerts", "Notify when a camera has no video for 60 s (while the app is open)", s.alerts) { v -> store.update { it.copy(settings = it.settings.copy(alerts = v)) } }
+        }
+        GlassCard(Modifier.fillMaxWidth()) {
             Eyebrow("Security")
             Spacer(Modifier.height(6.dp))
             val act = LocalContext.current as FragmentActivity
@@ -641,4 +702,95 @@ fun SettingsScreen(store: Store, data: StoreData, onLock: () -> Unit) {
                 fontSize = 13.5.sp, color = c.mutedStrong)
         }
     }
+}
+
+
+@Composable
+fun SettingSwitch(title: String, sub: String, v: Boolean, on: (Boolean) -> Unit) {
+    val c = cine
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = c.fg, fontWeight = FontWeight.Medium)
+            Text(sub, color = c.muted, fontSize = 12.5.sp)
+        }
+        Switch(v, on, colors = SwitchDefaults.colors(checkedTrackColor = c.accent, uncheckedTrackColor = c.inset, uncheckedBorderColor = c.glassBorder))
+    }
+}
+
+/** Πλήρης προβολή: HD ροή, zoom με τσίμπημα, στιγμιότυπο. Μονό πάτημα κλείνει (όταν δεν υπάρχει zoom). */
+@Composable
+fun SoloView(cam: Camera, idx: Int, s: Settings, onClose: () -> Unit) {
+    val ctx = LocalContext.current
+    var scale by remember { mutableFloatStateOf(1f) }
+    var off by remember { mutableStateOf(androidx.compose.ui.geometry.Offset.Zero) }
+    var view by remember { mutableStateOf<androidx.media3.ui.PlayerView?>(null) }
+    var msg by remember { mutableStateOf("") }
+    LaunchedEffect(msg) { if (msg.isNotEmpty()) { kotlinx.coroutines.delay(2000); msg = "" } }
+    BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
+        val wPx = constraints.maxWidth.toFloat(); val hPx = constraints.maxHeight.toFloat()
+        CameraTile(cam, idx, s.showClock,
+            Modifier.fillMaxSize()
+                .pointerInput(Unit) {
+                    detectTransformGestures { _, pan, zoom, _ ->
+                        scale = (scale * zoom).coerceIn(1f, 8f)
+                        val mx = wPx * (scale - 1) / 2; val my = hPx * (scale - 1) / 2
+                        off = androidx.compose.ui.geometry.Offset((off.x + pan.x).coerceIn(-mx, mx), (off.y + pan.y).coerceIn(-my, my))
+                    }
+                }
+                .pointerInput(Unit) {
+                    detectTapGestures(
+                        onTap = { if (scale <= 1.01f) onClose() },
+                        onDoubleTap = { if (scale > 1f) { scale = 1f; off = androidx.compose.ui.geometry.Offset.Zero } else scale = 2.5f },
+                    )
+                }
+                .graphicsLayer { scaleX = scale; scaleY = scale; translationX = off.x; translationY = off.y },
+            cornerDp = 0.dp, hd = s.autoHd && !cam.mainStream, onView = { view = it })
+        Row(Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 18.dp)
+            .clip(RoundedCornerShape(50)).background(Color.Black.copy(alpha = .6f)).padding(horizontal = 6.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = {
+                val b = grab(view)
+                msg = if (b != null && saveSnapshot(ctx, b, cam)) "Saved to Pictures/NVRDeck" else "No image yet"
+            }) { Icon(Icons.Outlined.PhotoCamera, "Snapshot", tint = Color.White) }
+            if (scale > 1.01f) TextButton(onClick = { scale = 1f; off = androidx.compose.ui.geometry.Offset.Zero }) {
+                Text("${"%.1f".format(scale)}×  reset", color = Color.White, fontSize = 12.sp)
+            }
+            Text(if (s.autoHd || cam.mainStream) "HD" else "SD", color = Color.White.copy(alpha = .7f), fontSize = 11.sp, fontFamily = GeistMono, modifier = Modifier.padding(horizontal = 8.dp))
+            IconButton(onClick = onClose) { Icon(Icons.Outlined.Close, "Close", tint = Color.White) }
+        }
+        if (msg.isNotEmpty()) Text(msg, color = Color.White, fontSize = 13.sp,
+            modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 16.dp).clip(RoundedCornerShape(50)).background(Color.Black.copy(alpha = .6f)).padding(horizontal = 14.dp, vertical = 6.dp))
+    }
+}
+
+@Composable
+fun QrImportDialog(text: String, free: Int, onDismiss: () -> Unit, onAdd: (List<Camera>) -> Unit) {
+    val k = cine
+    var pass by remember { mutableStateOf("") }
+    var err by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    AlertDialog(
+        onDismissRequest = onDismiss, containerColor = k.bgEnd, shape = RoundedCornerShape(22.dp),
+        title = { Text("Import from computer", fontFamily = Geist, fontWeight = FontWeight.SemiBold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Type the passphrase you chose in NVRDeck on the computer.", color = k.mutedStrong, fontSize = 13.5.sp)
+                OutlinedTextField(pass, { pass = it; err = "" }, label = { Text("Passphrase") }, singleLine = true,
+                    visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation())
+                if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                if (err.isNotEmpty()) Text(err, color = k.down)
+            }
+        },
+        confirmButton = { TextButton(enabled = !busy, onClick = {
+            busy = true
+            scope.launch {
+                val r = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) { runCatching { decryptQr(text.trim(), pass) } }
+                busy = false
+                r.onSuccess { list -> if (list.size > free) err = "Only $free free slots (code has ${list.size})" else onAdd(list) }
+                 .onFailure { err = it.message ?: "Could not read code" }
+            }
+        }) { Text("Import", color = k.accent) } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel", color = k.mutedStrong) } },
+    )
 }

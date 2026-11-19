@@ -21,6 +21,20 @@ Watch all your cameras live over RTSP, without the vendor's cloud app.
 
 Remote access is expected to go through **your own VPN** (WireGuard, OpenVPN, Tailscale…) — NVRDeck never exposes cameras to the internet.
 
+## Install
+
+Download the latest packages from the [Releases](https://github.com/genetzhs/nvrdeck/releases) page.
+
+| Platform | File | Notes |
+|---|---|---|
+| Ubuntu / Debian | `nvrdeck_<ver>_amd64.deb` | `sudo apt install ./nvrdeck_<ver>_amd64.deb` (pulls in `ffmpeg`) |
+| Any Linux | `NVRDeck-<ver>-x86_64.AppImage` | `chmod +x` and run; needs `ffmpeg` installed |
+| macOS (Apple Silicon / Intel) | `NVRDeck-<ver>-arm64.dmg` / `-x86_64.dmg` | needs `brew install ffmpeg`; ad-hoc signed — first launch: right-click → Open |
+| Android 8.0+ | `NVRDeck-<ver>.apk` | allow "Install unknown apps" |
+
+Packages are built by GitHub Actions (`.github/workflows/release.yml`) when a `v*` tag is pushed.
+Local builds: `packaging/build-deb.sh`, `packaging/build-appimage.sh`, `packaging/macos-bundle.sh` (on a Mac).
+
 ## Desktop
 
 Requirements: Rust (stable), `ffmpeg` and `ffprobe` in `PATH`.

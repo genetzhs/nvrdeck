@@ -1,7 +1,10 @@
 [package]
 name = "nvrdeck"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
+description = "Lightweight NVR viewer for IP cameras"
+license = "Apache-2.0"
+repository = "https://github.com/genetzhs/nvrdeck"
 
 [dependencies]
 eframe = "0.29"
@@ -15,3 +18,18 @@ chrono = "0.4"
 
 [profile.release]
 opt-level = 3
+
+[package.metadata.deb]
+name = "nvrdeck"
+maintainer = "genetzhs <genetzhs@users.noreply.github.com>"
+copyright = "2026, genetzhs"
+license-file = ["../LICENSE", "0"]
+extended-description = "Lightweight NVR viewer for IP cameras: live RTSP grid, NVR channel import, network scan."
+depends = "$auto, ffmpeg"
+section = "video"
+priority = "optional"
+assets = [
+    ["target/release/nvrdeck", "usr/bin/", "755"],
+    ["../packaging/nvrdeck.desktop", "usr/share/applications/", "644"],
+    ["../packaging/nvrdeck.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+]

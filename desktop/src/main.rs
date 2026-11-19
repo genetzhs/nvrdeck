@@ -318,9 +318,26 @@ impl Drop for Stream {
     }
 }
 
+
+/// Βρίσκει το ffmpeg/ffprobe: δίπλα στο εκτελέσιμο (bundled), $NVRDECK_FFMPEG_DIR, PATH,
+/// και στις συνηθισμένες θέσεις (οι εφαρμογές GUI στο macOS δεν βλέπουν το PATH του Homebrew).
+fn tool(name: &str) -> PathBuf {
+    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let mut dirs: Vec<PathBuf> = vec![];
+    if let Some(d) = exe_dir { dirs.push(d.clone()); dirs.push(d.join("../Resources")); }
+    if let Ok(d) = std::env::var("NVRDECK_FFMPEG_DIR") { dirs.push(PathBuf::from(d)); }
+    if let Some(path) = std::env::var_os("PATH") { dirs.extend(std::env::split_paths(&path)); }
+    for d in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/snap/bin"] { dirs.push(PathBuf::from(d)); }
+    for d in dirs {
+        let p = d.join(name);
+        if p.is_file() { return p; }
+    }
+    PathBuf::from(name)
+}
+
 fn ffmpeg_cmd(url: &str, s: &Settings) -> Command {
     let (w, h, fps) = (s.width, s.height, s.fps);
-    let mut c = Command::new("ffmpeg");
+    let mut c = Command::new(tool("ffmpeg"));
     c.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-rtsp_transport", "tcp", "-timeout", "5000000",
             "-fflags", "nobuffer", "-flags", "low_delay", "-i", url, "-an", "-vf",
             &format!("fps={fps},scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
@@ -381,7 +398,7 @@ fn friendly_error(e: &str) -> &'static str {
 /// Γρήγορη δοκιμή σύνδεσης με ffprobe (στο παρασκήνιο)
 fn probe(url: String, out: Arc<Mutex<Option<Result<String, String>>>>, ctx: egui::Context) {
     std::thread::spawn(move || {
-        let r = Command::new("ffprobe")
+        let r = Command::new(tool("ffprobe"))
             .args(["-v", "error", "-rtsp_transport", "tcp", "-timeout", "5000000", "-select_streams", "v:0",
                    "-show_entries", "stream=codec_name,width,height", "-of", "csv=p=0", &url])
             .stdin(Stdio::null()).output();
@@ -1356,7 +1373,7 @@ impl eframe::App for App {
 
 fn main() -> anyhow::Result<()> {
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 780.0]).with_min_inner_size([720.0, 480.0]).with_title("NVRDeck"),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 780.0]).with_min_inner_size([720.0, 480.0]).with_title("NVRDeck").with_icon(std::sync::Arc::new(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap_or_default())),
         ..Default::default()
     };
     eframe::run_native("nvrdeck", opts, Box::new(|cc| Ok(Box::new(App::new(cc))))).map_err(|e| anyhow::anyhow!("{e}"))

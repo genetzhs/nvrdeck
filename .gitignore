@@ -21,3 +21,6 @@ nvrdeck.toml
 # OS / editors
 .DS_Store
 .vscode/
+
+# Packages
+dist/

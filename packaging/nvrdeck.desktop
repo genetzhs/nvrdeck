@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=NVRDeck
+GenericName=NVR Viewer
+Comment=Live view for IP cameras and NVRs
+Exec=nvrdeck
+Icon=nvrdeck
+Terminal=false
+Categories=AudioVideo;Video;Player;Security;
+Keywords=camera;cctv;nvr;rtsp;
+StartupWMClass=nvrdeck

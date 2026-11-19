@@ -3,7 +3,7 @@ package io.github.genetzhs.nvrdeck
 import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
-android.os.Build
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.gestures.detectTapGestures

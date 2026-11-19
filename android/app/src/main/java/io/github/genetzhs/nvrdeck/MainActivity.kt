@@ -1,5 +1,6 @@
 package io.github.genetzhs.nvrdeck
 
+import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.GridView
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Check
@@ -297,6 +298,7 @@ fun MainScreen(store: Store, data: StoreData, onLock: () -> Unit) {
             when (tab) {
                 0 -> LiveScreen(store, data) { solo = it }
                 1 -> CamerasScreen(store, data)
+                3 -> PlaybackScreen(data)
                 else -> SettingsScreen(store, data, onLock)
             }
         }
@@ -311,7 +313,7 @@ fun MainScreen(store: Store, data: StoreData, onLock: () -> Unit) {
 @Composable
 fun Dock(active: Int, modifier: Modifier = Modifier, onSelect: (Int) -> Unit) {
     val c = cine
-    val items = listOf(Triple("Live", Icons.Outlined.Videocam, 0), Triple("Cameras", Icons.Outlined.GridView, 1), Triple("Settings", Icons.Outlined.Settings, 2))
+    val items = listOf(Triple("Live", Icons.Outlined.Videocam, 0), Triple("Playback", Icons.Outlined.History, 3), Triple("Cameras", Icons.Outlined.GridView, 1), Triple("Settings", Icons.Outlined.Settings, 2))
     Row(
         modifier.clip(RoundedCornerShape(30.dp)).background(c.dock).border(1.dp, c.glassBorder, RoundedCornerShape(30.dp)).padding(7.dp),
         horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically,

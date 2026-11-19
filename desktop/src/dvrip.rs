@@ -161,10 +161,10 @@ impl Dvr {
                         start: a["Status"].as_str() == Some("Start"), time: a["StartTime"].as_str().unwrap_or("").into() }))
     }
 
-    /// Κατεβάζει μια εγγραφή ως ακατέργαστο ρεύμα (H.264/H.265 με κεφαλίδες XMeye).
-    /// Ροή όπως στο XMeye: δεύτερη σύνδεση με το ίδιο session → Claim (1424) εκεί,
-    /// μετά DownloadStart (1420) στην κύρια· τα δεδομένα έρχονται στη δεύτερη ως 1426.
-    pub fn download(&mut self, host: &str, port: u16, f: &RecFile, out: &std::path::Path, max: u64, mut progress: impl FnMut(u64)) -> anyhow::Result<u64> {
+    /// Κατεβάζει μια εγγραφή και δίνει τα δεδομένα σταδιακά στο `sink` (επιστρέφει false για διακοπή).
+    /// Ροή XMeye: δεύτερη σύνδεση με το ίδιο session → Claim (1424) εκεί, DownloadStart (1420) στην κύρια,
+    /// τα δεδομένα έρχονται στη δεύτερη ως 1426 (κενό πακέτο = τέλος).
+    pub fn stream(&mut self, host: &str, port: u16, f: &RecFile, mut sink: impl FnMut(&[u8]) -> bool) -> anyhow::Result<u64> {
         let sid = self.sid();
         let pb = |action: &str| json!({"Name": "OPPlayBack", "SessionID": sid, "OPPlayBack": {
             "Action": action, "StartTime": f.begin, "EndTime": f.end,
@@ -173,25 +173,97 @@ impl Dvr {
         let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| anyhow::anyhow!("bad address"))?;
         let mut data = Dvr { s: TcpStream::connect_timeout(&addr, Duration::from_secs(5))?, session: self.session, seq: 0 };
         data.s.set_read_timeout(Some(Duration::from_secs(10)))?;
-        let dbg = std::env::var_os("NVRDECK_DEBUG").is_some();
-        let c = data.call(1424, pb("Claim"))?;
-        if dbg { eprintln!("  data claim ret={:?}", c["Ret"]); }
-        let r = self.call(1420, pb("DownloadStart"))?;
-        if dbg { eprintln!("  download start ret={:?}", r["Ret"]); }
-        let mut file = std::fs::File::create(out)?;
+        data.call(1424, pb("Claim"))?;
+        self.call(1420, pb("DownloadStart"))?;
         let mut total = 0u64;
         loop {
             let (m, b) = data.recv()?;
-            if m == 1426 {
-                if b.is_empty() { break; }
-                total += b.len() as u64;
-                file.write_all(&b)?;
-                progress(total);
-                if total >= max { break; }
-            } else if dbg { eprintln!("  data got {m}"); }
+            if m != 1426 { continue; }
+            if b.is_empty() { break; }
+            total += b.len() as u64;
+            if !sink(&b) { break; }
         }
         let _ = self.send(1420, &pb("DownloadStop"));
         Ok(total)
+    }
+
+    /// Αναπαραγωγή από συγκεκριμένη ώρα (PlayMode ByTime): το καταγραφικό ξεκινά από το `start`.
+    pub fn stream_time(&mut self, host: &str, port: u16, channel: u32, start: &str, end: &str, variant: u8, mut sink: impl FnMut(&[u8]) -> bool) -> anyhow::Result<u64> {
+        let sid = self.sid();
+        let pb = |action: &str| {
+            let mut par = json!({"FileName": "", "PlayMode": "ByTime", "TransMode": "TCP", "Value": channel, "StreamType": 0, "IntelligentPlayBackEvent": "", "IntelligentPlayBackSpeed": 0});
+            if variant == 1 { par["Channel"] = json!(channel); par["Value"] = json!(0); }
+            json!({"Name": "OPPlayBack", "SessionID": sid, "OPPlayBack": { "Action": action, "StartTime": start, "EndTime": end, "Parameter": par }})
+        };
+        let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| anyhow::anyhow!("bad address"))?;
+        let mut data = Dvr { s: TcpStream::connect_timeout(&addr, Duration::from_secs(5))?, session: self.session, seq: 0 };
+        data.s.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let c = data.call(1424, pb("Claim"))?;
+        anyhow::ensure!(c["Ret"].as_i64() == Some(100), "claim refused ({:?})", c["Ret"]);
+        let r = self.call(1420, pb("Start"))?;
+        anyhow::ensure!(r["Ret"].as_i64() == Some(100), "start refused ({:?})", r["Ret"]);
+        let mut total = 0u64;
+        loop {
+            let (m, b) = data.recv()?;
+            if m != 1426 { continue; }
+            if b.is_empty() { break; }
+            total += b.len() as u64;
+            if !sink(&b) { break; }
+        }
+        let _ = self.send(1420, &pb("Stop"));
+        Ok(total)
+    }
+
+    /// Κατεβάζει μια εγγραφή σε αρχείο (ακατέργαστο ρεύμα XMeye).
+    pub fn download(&mut self, host: &str, port: u16, f: &RecFile, out: &std::path::Path, max: u64, mut progress: impl FnMut(u64)) -> anyhow::Result<u64> {
+        let mut file = std::fs::File::create(out)?;
+        let mut total = 0u64;
+        let mut err = None;
+        self.stream(host, port, f, |b| {
+            if let Err(e) = file.write_all(b) { err = Some(e); return false; }
+            total += b.len() as u64;
+            progress(total);
+            total < max
+        })?;
+        if let Some(e) = err { return Err(e.into()); }
+        Ok(total)
+    }
+}
+
+/// Σταδιακή αφαίρεση κεφαλίδων καρέ: δίνουμε κομμάτια, παίρνουμε ολόκληρα καρέ βίντεο (Annex-B).
+#[derive(Default)]
+pub struct FrameParser { buf: Vec<u8>, pub time: String, pub fps: u32, pub hevc: bool, pub width: u32, pub height: u32 }
+
+impl FrameParser {
+    /// Επιστρέφει (καρέ, είναι I-frame)
+    pub fn push(&mut self, data: &[u8]) -> Vec<(Vec<u8>, bool)> {
+        self.buf.extend_from_slice(data);
+        let mut out = vec![];
+        let mut i = 0;
+        let b = &self.buf;
+        while i + 16 <= b.len() {
+            if !(b[i] == 0 && b[i + 1] == 0 && b[i + 2] == 1 && (0xF9..=0xFD).contains(&b[i + 3])) { i += 1; continue; }
+            let t = b[i + 3];
+            let (hdr, len) = match t {
+                0xFC => (16, u32::from_le_bytes([b[i + 12], b[i + 13], b[i + 14], b[i + 15]]) as usize),
+                0xFD => (8, u32::from_le_bytes([b[i + 4], b[i + 5], b[i + 6], b[i + 7]]) as usize),
+                _ => (8, u16::from_le_bytes([b[i + 6], b[i + 7]]) as usize),
+            };
+            if len > 8 << 20 { i += 1; continue; }
+            if i + hdr + len > b.len() { break; } // περιμένουμε τα υπόλοιπα
+            if t == 0xFC {
+                let dt = u32::from_le_bytes([b[i + 8], b[i + 9], b[i + 10], b[i + 11]]);
+                self.time = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", 2000 + (dt >> 26), (dt >> 22) & 15, (dt >> 17) & 31, (dt >> 12) & 31, (dt >> 6) & 63, dt & 63);
+                self.fps = (b[i + 5] as u32).clamp(1, 60);
+                self.hevc = b[i + 4] == 3 || b[i + 4] == 0x12;
+                self.width = b[i + 6] as u32 * 8;
+                self.height = b[i + 7] as u32 * 8;
+            }
+            if t == 0xFC || t == 0xFD { out.push((b[i + hdr..i + hdr + len].to_vec(), t == 0xFC)); }
+            i += hdr + len;
+        }
+        self.buf.drain(..i);
+        out
     }
 }
 

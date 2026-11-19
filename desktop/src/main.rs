@@ -782,6 +782,7 @@ struct NvrPb {
     key: String,       // τι φορτώθηκε τελευταία
     files: Arc<Mutex<Option<Result<Vec<dvrip::RecFile>, String>>>>,
     dl: Arc<Mutex<DlJob>>,
+    player: Option<NvrPlayer>,
 }
 #[derive(Default)]
 struct DlJob { name: String, bytes: u64, total: u64, busy: bool, done: Option<Result<PathBuf, String>> }
@@ -1835,6 +1836,17 @@ fn nvr_test() -> anyhow::Result<()> {
                                                Ok(None) => {}, Err(e) => { println!("  alarm error {e}"); break } }
                     }
                 }
+                if std::env::var_os("NVRDECK_SEEK").is_some() && ch > 1 {
+                    let t0 = (chrono::Local::now() - chrono::Duration::minutes(47)).format("%Y-%m-%d %H:%M:%S").to_string();
+                    let t1 = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+                    for v in 0..2u8 {
+                        let mut p = dvrip::FrameParser::default();
+                        let mut first = String::new();
+                        let t = Instant::now();
+                        let r = d.stream_time(&c.host, dvrip::PORT, 2, &t0, &t1, v, |b| { for (_, k) in p.push(b) { if k && first.is_empty() { first = p.time.clone(); } } first.is_empty() && t.elapsed() < Duration::from_secs(8) });
+                        println!("  seek variant {v}: asked {t0} → first I-frame at {first:?} after {:.1}s ({:?})", t.elapsed().as_secs_f32(), r.map_err(|e| e.to_string()));
+                    }
+                }
                 if std::env::var_os("NVRDECK_DL").is_some() {
                     let from = (chrono::Local::now() - chrono::Duration::hours(3)).format("%Y-%m-%d %H:%M:%S").to_string();
                     let to = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
@@ -1925,7 +1937,7 @@ impl App {
             let k = c.host.clone();
             match m.iter_mut().find(|(h, _)| *h == k) { Some((_, v)) => v.push((i, c.channel, c.name.clone())), None => m.push((k, vec![(i, c.channel, c.name.clone())])) }
         }
-        m.into_iter().map(|(_, v)| v).collect()
+        m.into_iter().map(|(_, v)| v).filter(|v| v.len() > 1).collect()
     }
 
     fn playback_ui(&mut self, ctx: &egui::Context) {
@@ -2012,16 +2024,105 @@ fn set_autostart(on: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Αναπαραγωγή εγγραφής του NVR μέσα στην εφαρμογή, ενώ κατεβαίνει (ffmpeg αποκωδικοποιεί από stdin).
+struct NvrPlayer {
+    shared: Arc<Mutex<Shared>>,
+    stop: Arc<AtomicBool>,
+    pause: Arc<AtomicBool>,
+    speed: Arc<AtomicU32>,
+    pos: Arc<Mutex<f64>>,       // δευτερόλεπτα από την αρχή του αρχείου
+    begin: chrono::NaiveDateTime,
+    tex: Option<egui::TextureHandle>,
+    file: dvrip::RecFile,
+}
+const PW: usize = 1280;
+const PH: usize = 720;
+
+impl NvrPlayer {
+    fn start(cam: &Camera, f: dvrip::RecFile, skip: f64, ctx: egui::Context) -> NvrPlayer {
+        let shared = Arc::new(Mutex::new(Shared { status: "Connecting to the recorder…".into(), ..Default::default() }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pause = Arc::new(AtomicBool::new(false));
+        let speed = Arc::new(AtomicU32::new(1));
+        let pos = Arc::new(Mutex::new(skip));
+        let begin = chrono::NaiveDateTime::parse_from_str(&f.begin, "%Y-%m-%d %H:%M:%S").unwrap_or_default();
+        let (sh, st, pa, sp, po, c2, f2) = (shared.clone(), stop.clone(), pause.clone(), speed.clone(), pos.clone(), cam.clone(), f.clone());
+        std::thread::spawn(move || {
+            let r = (|| -> anyhow::Result<()> {
+                let mut d = dvrip::Dvr::connect(&c2.host, dvrip::PORT, &c2.user, &c2.pass)?;
+                let mut parser = dvrip::FrameParser::default();
+                let mut ff: Option<std::process::Child> = None;
+                let mut stdin: Option<std::process::ChildStdin> = None;
+                d.stream(&c2.host, dvrip::PORT, &f2, |chunk| {
+                    if st.load(Ordering::Relaxed) { return false; }
+                    for (frame, key) in parser.push(chunk) {
+                        if ff.is_none() {
+                            if !key { continue; }
+                            // ffmpeg ξεκινά με το πρώτο I-frame (τότε ξέρουμε codec και fps)
+                            let mut child = match Command::new(tool("ffmpeg")).args(["-hide_banner", "-loglevel", "error", "-f", if parser.hevc { "hevc" } else { "h264" },
+                                    "-r", &parser.fps.to_string(), "-i", "-", "-an", "-vf",
+                                    &format!("scale={PW}:{PH}:force_original_aspect_ratio=decrease,pad={PW}:{PH}:(ow-iw)/2:(oh-ih)/2"),
+                                    "-pix_fmt", "rgba", "-f", "rawvideo", "-"])
+                                .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn() { Ok(c) => c, Err(_) => return false };
+                            stdin = child.stdin.take();
+                            let mut out = child.stdout.take().unwrap();
+                            let (sh, st, pa, sp, po, fps, ctx) = (sh.clone(), st.clone(), pa.clone(), sp.clone(), po.clone(), parser.fps as f64, ctx.clone());
+                            // αναγνώστης: ρυθμός αναπαραγωγής, παράλειψη μέχρι το σημείο εκκίνησης
+                            std::thread::spawn(move || {
+                                let mut buf = vec![0u8; PW * PH * 4];
+                                let mut k = 0u64;
+                                let mut clock = Instant::now();
+                                let mut shown = 0u64;
+                                let skip_frames = (skip * fps) as u64;
+                                while !st.load(Ordering::Relaxed) && out.read_exact(&mut buf).is_ok() {
+                                    k += 1;
+                                    if k < skip_frames { if k % 50 == 0 { sh.lock().unwrap().status = format!("Seeking… {}%", 100 * k / skip_frames.max(1)); ctx.request_repaint(); } continue; }
+                                    while pa.load(Ordering::Relaxed) && !st.load(Ordering::Relaxed) { std::thread::sleep(Duration::from_millis(50)); clock = Instant::now(); shown = 0; }
+                                    let spd = sp.load(Ordering::Relaxed).max(1) as f64;
+                                    let due = clock + Duration::from_secs_f64(shown as f64 / fps / spd);
+                                    if let Some(w) = due.checked_duration_since(Instant::now()) { std::thread::sleep(w); }
+                                    shown += 1;
+                                    if sp.load(Ordering::Relaxed) as f64 != spd { clock = Instant::now(); shown = 0; }
+                                    *po.lock().unwrap() = k as f64 / fps;
+                                    let mut g = sh.lock().unwrap();
+                                    g.frame = Some(buf.clone()); g.fresh = true; g.last = Some(Instant::now()); g.status.clear();
+                                    drop(g);
+                                    ctx.request_repaint();
+                                }
+                                let mut g = sh.lock().unwrap();
+                                if !st.load(Ordering::Relaxed) { g.status = "End of recording".into(); }
+                            });
+                            ff = Some(child);
+                        }
+                        if let Some(i) = stdin.as_mut() { if std::io::Write::write_all(i, &frame).is_err() { return false; } }
+                    }
+                    true
+                })?;
+                drop(stdin); // τέλος δεδομένων → το ffmpeg ολοκληρώνει
+                if let Some(mut c) = ff { if st.load(Ordering::Relaxed) { let _ = c.kill(); } let _ = c.wait(); }
+                Ok(())
+            })();
+            if let Err(e) = r { if !st.load(Ordering::Relaxed) { sh.lock().unwrap().status = format!("Recorder error: {e}"); } }
+        });
+        NvrPlayer { shared, stop, pause, speed, pos, begin, tex: None, file: f }
+    }
+    fn now(&self) -> chrono::NaiveDateTime { self.begin + chrono::Duration::milliseconds((*self.pos.lock().unwrap() * 1000.0) as i64) }
+}
+impl Drop for NvrPlayer { fn drop(&mut self) { self.stop.store(true, Ordering::Relaxed); } }
+
+fn parse_t(s: &str) -> Option<chrono::NaiveDateTime> { chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").ok() }
+
 impl App {
     fn nvr_playback_ui(&mut self, ctx: &egui::Context, groups: Vec<Vec<(usize, u32, String)>>) {
         let gi = self.pb.nvr.min(groups.len() - 1);
-        let g = &groups[gi];
+        let g = groups[gi].clone();
         if !g.iter().any(|x| x.1 == self.pb.ch) { self.pb.ch = g[0].1; }
         let date = (chrono::Local::now() + chrono::Duration::days(self.pb.day)).date_naive();
         let key = format!("{gi}/{}/{date}/{}", self.pb.ch, self.pb.motion);
         let cam = self.store.camera[g[0].0].clone();
         if key != self.pb.key {
             self.pb.key = key;
+            self.pb.player = None;
             *self.pb.files.lock().unwrap() = None;
             let (out, ch, motion, c2, ctx2) = (self.pb.files.clone(), self.pb.ch, self.pb.motion, cam.clone(), ctx.clone());
             std::thread::spawn(move || {
@@ -2031,92 +2132,152 @@ impl App {
                 ctx2.request_repaint();
             });
         }
-        egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::same(24.0))).show(ctx, |ui| {
+        // υφή καρέ
+        if let Some(pl) = &mut self.pb.player {
+            let mut gd = pl.shared.lock().unwrap();
+            if gd.fresh {
+                if let Some(f) = &gd.frame {
+                    let img = egui::ColorImage::from_rgba_unmultiplied([PW, PH], f);
+                    match &mut pl.tex { Some(t) => t.set(img, egui::TextureOptions::LINEAR), None => pl.tex = Some(ctx.load_texture("nvrpb", img, egui::TextureOptions::LINEAR)) }
+                }
+                gd.fresh = false;
+            }
+        }
+        let files: Option<Result<Vec<dvrip::RecFile>, String>> = self.pb.files.lock().unwrap().clone();
+        let mut play_at: Option<(dvrip::RecFile, f64)> = None;
+
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::symmetric(20.0, 14.0))).show(ctx, |ui| {
+            // ── γραμμή επιλογών ──
             ui.horizontal(|ui| {
-                screen_title(ui, "Recorder", "Playback");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("This computer ▶").clicked() { self.pb.local = true; }
-                });
-            });
-            ui.add_space(10.0);
-            // φίλτρα
-            glass_frame().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal_wrapped(|ui| {
-                    if groups.len() > 1 {
-                        egui::ComboBox::from_id_salt("nvrsel").selected_text(format!("Recorder {}", gi + 1)).show_ui(ui, |ui| {
-                            for k in 0..groups.len() { ui.selectable_value(&mut self.pb.nvr, k, format!("Recorder {}", k + 1)); }
-                        });
-                    }
-                    for (_, ch, name) in g {
-                        if ui.selectable_label(self.pb.ch == *ch, name.as_str()).clicked() { self.pb.ch = *ch; }
-                    }
-                });
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui.button("◀").clicked() { self.pb.day -= 1; }
-                    ui.label(RichText::new(match self.pb.day { 0 => format!("Today · {}", date.format("%d/%m/%Y")), -1 => format!("Yesterday · {}", date.format("%d/%m/%Y")), _ => date.format("%A %d/%m/%Y").to_string() }).strong());
-                    if ui.add_enabled(self.pb.day < 0, egui::Button::new("▶")).clicked() { self.pb.day += 1; }
-                    ui.add_space(16.0);
-                    if ui.selectable_label(!self.pb.motion, "All").clicked() { self.pb.motion = false; }
-                    if ui.selectable_label(self.pb.motion, "Motion only").clicked() { self.pb.motion = true; }
-                });
-            });
-            ui.add_space(10.0);
-            // λήψη σε εξέλιξη
-            {
-                let j = self.pb.dl.lock().unwrap();
-                if j.busy {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        let pct = if j.total > 0 { (100 * j.bytes / j.total).min(100) } else { 0 };
-                        ui.label(format!("Fetching {} from the recorder… {pct}%", j.name));
+                ui.label(RichText::new("Playback").font(semibold(22.0)).extra_letter_spacing(-0.6));
+                ui.add_space(14.0);
+                if groups.len() > 1 {
+                    egui::ComboBox::from_id_salt("nvrsel").selected_text(format!("Recorder {}", gi + 1)).show_ui(ui, |ui| {
+                        for k in 0..groups.len() { ui.selectable_value(&mut self.pb.nvr, k, format!("Recorder {}", k + 1)); }
                     });
-                    ctx.request_repaint_after(Duration::from_millis(300));
-                } else if let Some(Err(e)) = &j.done {
-                    ui.label(RichText::new(format!("Could not play: {e}")).color(BAD));
+                }
+                for (_, ch, name) in &g {
+                    let sel = self.pb.ch == *ch;
+                    let b = egui::Button::new(RichText::new(name.as_str()).color(if sel { Color32::WHITE } else { TEXT() })).fill(if sel { ACCENT() } else { SURFACE() }).rounding(999.0);
+                    if ui.add(b).clicked() { self.pb.ch = *ch; }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("This computer").clicked() { self.pb.local = true; self.pb.player = None; }
+                    ui.add_space(8.0);
+                    if ui.selectable_label(self.pb.motion, "Motion only").clicked() { self.pb.motion ^= true; }
+                    ui.add_space(8.0);
+                    if ui.add_enabled(self.pb.day < 0, egui::Button::new("▶")).clicked() { self.pb.day += 1; }
+                    ui.label(RichText::new(match self.pb.day { 0 => "Today".to_string(), -1 => "Yesterday".to_string(), _ => date.format("%a %d %b").to_string() }).strong());
+                    if ui.button("◀").clicked() { self.pb.day -= 1; }
+                });
+            });
+            ui.add_space(10.0);
+
+            // ── περιοχή βίντεο ──
+            let tl_h = 86.0;
+            let avail = ui.available_rect_before_wrap();
+            let vid_area = egui::Rect::from_min_max(avail.min, egui::pos2(avail.max.x, avail.max.y - tl_h - 10.0));
+            let mut sz = vid_area.size();
+            let ar = 16.0 / 9.0;
+            if sz.x / sz.y > ar { sz.x = sz.y * ar } else { sz.y = sz.x / ar }
+            let vr = egui::Rect::from_center_size(vid_area.center(), sz);
+            let p = ui.painter();
+            p.rect_filled(vr, 16.0, Color32::from_rgb(5, 6, 10));
+            p.rect_stroke(vr, 16.0, Stroke::new(1.0, BORDER()));
+            match &self.pb.player {
+                Some(pl) => {
+                    if let Some(t) = &pl.tex {
+                        let mut rs = egui::epaint::RectShape::filled(vr, 16.0, Color32::WHITE); rs.fill_texture_id = t.id(); rs.uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)); p.add(rs);
+                    }
+                    let status = pl.shared.lock().unwrap().status.clone();
+                    if !status.is_empty() {
+                        p.text(vr.center(), egui::Align2::CENTER_CENTER, &status, egui::FontId::proportional(15.0), Color32::from_gray(200));
+                    }
+                    // χρόνος πάνω αριστερά
+                    let name = g.iter().find(|x| x.1 == self.pb.ch).map(|x| x.2.clone()).unwrap_or_default();
+                    let gal = p.layout_no_wrap(format!("{name}  ·  {}", pl.now().format("%d/%m/%Y %H:%M:%S")), egui::FontId::monospace(12.0), Color32::WHITE);
+                    let br = egui::Rect::from_min_size(vr.min + egui::vec2(12.0, 12.0), gal.size() + egui::vec2(18.0, 10.0));
+                    p.rect_filled(br, 999.0, Color32::from_black_alpha(150));
+                    p.galley(br.min + egui::vec2(9.0, 5.0), gal, Color32::WHITE);
+                    ctx.request_repaint_after(Duration::from_millis(200));
+                }
+                None => {
+                    let msg = match &files {
+                        None => "Loading recordings…".to_string(),
+                        Some(Err(e)) => format!("Recorder not reachable: {e}"),
+                        Some(Ok(v)) if v.is_empty() => "No recordings for this day.".to_string(),
+                        Some(Ok(_)) => "Click on the timeline to play from that moment".to_string(),
+                    };
+                    p.text(vr.center(), egui::Align2::CENTER_CENTER, msg, egui::FontId::proportional(15.0), MUTED());
                 }
             }
-            let files = self.pb.files.lock().unwrap();
-            match &*files {
-                None => { ui.horizontal(|ui| { ui.spinner(); ui.label("Loading recordings…"); }); }
-                Some(Err(e)) => { ui.label(RichText::new(format!("Recorder not reachable: {e}")).color(BAD)); }
-                Some(Ok(v)) if v.is_empty() => { ui.label(RichText::new("No recordings for this day.").color(MUTED())); }
-                Some(Ok(v)) => {
-                    ui.label(RichText::new(format!("{} recordings", v.len())).color(MUTED()).small());
-                    ui.add_space(4.0);
-                    let busy = self.pb.dl.lock().unwrap().busy;
-                    let mut play: Option<dvrip::RecFile> = None;
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        for f in v.iter().rev() {
-                            egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0, BORDER())).rounding(12.0).inner_margin(egui::Margin::symmetric(14.0, 8.0)).show(ui, |ui| {
-                                ui.horizontal(|ui| {
-                                    let t = |x: &str| x.get(11..19).unwrap_or(x).to_string();
-                                    ui.label(RichText::new(format!("{} – {}", t(&f.begin), t(&f.end))).monospace().strong());
-                                    ui.label(RichText::new(format!("{:.0} MB", f.size_kb as f64 / 1024.0)).color(MUTED()).small());
-                                    if f.name.contains("[M]") { ui.label(RichText::new("MOTION").small().color(Color32::from_rgb(255, 176, 32))); }
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.add_enabled(!busy, egui::Button::new("▶ Play")).clicked() { play = Some(f.clone()); }
-                                    });
-                                });
-                            });
-                            ui.add_space(4.0);
-                        }
-                    });
-                    if let Some(f) = play {
-                        let (job, c2, ctx2) = (self.pb.dl.clone(), cam.clone(), ctx.clone());
-                        let ch_name = g.iter().find(|x| x.1 == self.pb.ch).map(|x| x.2.clone()).unwrap_or_default();
-                        { let mut j = job.lock().unwrap(); *j = DlJob { name: format!("{} {}", ch_name, f.begin), total: f.size_kb * 1024, busy: true, ..Default::default() }; }
-                        std::thread::spawn(move || {
-                            let r = fetch_recording(&c2, &f, &ch_name, &job);
-                            if let Ok(p) = &r { open_path(p); }
-                            let mut j = job.lock().unwrap(); j.busy = false; j.done = Some(r.map_err(|e| e.to_string()));
-                            ctx2.request_repaint();
+            // κουμπιά αναπαραγωγής κάτω στο βίντεο
+            if self.pb.player.is_some() {
+                let bar = egui::Rect::from_center_size(egui::pos2(vr.center().x, vr.bottom() - 30.0), egui::vec2(300.0, 40.0));
+                let mut close = false;
+                ui.allocate_ui_at_rect(bar, |ui| {
+                    egui::Frame::none().fill(Color32::from_black_alpha(170)).rounding(999.0).inner_margin(egui::Margin::symmetric(10.0, 5.0)).show(ui, |ui| {
+                        ui.horizontal_centered(|ui| {
+                            let pl = self.pb.player.as_ref().unwrap();
+                            let paused = pl.pause.load(Ordering::Relaxed);
+                            if ui.add(egui::Button::new(if paused { "▶  Play" } else { "⏸  Pause" }).rounding(999.0)).clicked() { pl.pause.store(!paused, Ordering::Relaxed); }
+                            let sp = pl.speed.load(Ordering::Relaxed);
+                            for x in [1u32, 2, 4] {
+                                if ui.selectable_label(sp == x, format!("{x}×")).clicked() { pl.speed.store(x, Ordering::Relaxed); }
+                            }
+                            if ui.add(egui::Button::new("✕").rounding(999.0)).clicked() { close = true; }
                         });
+                    });
+                });
+                if close { self.pb.player = None; }
+            }
+
+            // ── χρονολόγιο 24 ωρών ──
+            let tl = egui::Rect::from_min_max(egui::pos2(avail.min.x, avail.max.y - tl_h), avail.max);
+            let bar = egui::Rect::from_min_max(tl.min + egui::vec2(0.0, 18.0), egui::pos2(tl.max.x, tl.min.y + 58.0));
+            let resp = ui.interact(bar, ui.id().with("timeline"), egui::Sense::click());
+            let p = ui.painter();
+            p.rect_filled(bar, 10.0, glass());
+            p.rect_stroke(bar, 10.0, Stroke::new(1.0, BORDER()));
+            let day0 = date.and_hms_opt(0, 0, 0).unwrap();
+            let x_of = |t: chrono::NaiveDateTime| bar.left() + bar.width() * ((t - day0).num_seconds() as f32 / 86400.0).clamp(0.0, 1.0);
+            if let Some(Ok(v)) = &files {
+                for f in v {
+                    if let (Some(a), Some(b)) = (parse_t(&f.begin), parse_t(&f.end)) {
+                        let r = egui::Rect::from_min_max(egui::pos2(x_of(a), bar.top() + 6.0), egui::pos2(x_of(b).max(x_of(a) + 1.5), bar.bottom() - 6.0));
+                        p.rect_filled(r, 2.0, if self.pb.motion { Color32::from_rgb(255, 176, 32) } else { ACCENT().gamma_multiply(0.75) });
+                    }
+                }
+            }
+            for h in (0..=24).step_by(2) {
+                let x = bar.left() + bar.width() * h as f32 / 24.0;
+                p.line_segment([egui::pos2(x, bar.bottom()), egui::pos2(x, bar.bottom() + 5.0)], Stroke::new(1.0, BORDER()));
+                p.text(egui::pos2(x, bar.bottom() + 8.0), egui::Align2::CENTER_TOP, format!("{h:02}"), egui::FontId::monospace(10.5), MUTED());
+            }
+            p.text(tl.min, egui::Align2::LEFT_TOP, "Timeline", egui::FontId::proportional(12.0), MUTED());
+            if let Some(pl) = &self.pb.player {
+                let x = x_of(pl.now());
+                p.line_segment([egui::pos2(x, bar.top() - 4.0), egui::pos2(x, bar.bottom() + 4.0)], Stroke::new(2.0, Color32::WHITE));
+                p.circle_filled(egui::pos2(x, bar.top() - 4.0), 4.0, Color32::WHITE);
+            }
+            if let Some(hp) = resp.hover_pos() {
+                let t = day0 + chrono::Duration::seconds(((hp.x - bar.left()) / bar.width() * 86400.0) as i64);
+                p.line_segment([egui::pos2(hp.x, bar.top()), egui::pos2(hp.x, bar.bottom())], Stroke::new(1.0, TEXT().gamma_multiply(0.5)));
+                p.text(egui::pos2(hp.x, bar.top() - 3.0), egui::Align2::CENTER_BOTTOM, t.format("%H:%M").to_string(), egui::FontId::monospace(11.0), TEXT());
+                if resp.clicked() {
+                    if let Some(Ok(v)) = &files {
+                        // το αρχείο που περιέχει τη στιγμή, αλλιώς το επόμενο
+                        let hit = v.iter().find(|f| matches!((parse_t(&f.begin), parse_t(&f.end)), (Some(a), Some(b)) if a <= t && t <= b))
+                            .map(|f| (f.clone(), (t - parse_t(&f.begin).unwrap()).num_seconds() as f64))
+                            .or_else(|| v.iter().filter(|f| parse_t(&f.begin).map_or(false, |a| a > t)).min_by_key(|f| f.begin.clone()).map(|f| (f.clone(), 0.0)));
+                        match hit { Some(h) => play_at = Some(h), None => self.toast("No recording at that time") }
                     }
                 }
             }
         });
+        if let Some((f, skip)) = play_at {
+            self.pb.player = Some(NvrPlayer::start(&cam, f, skip, ctx.clone()));
+        }
     }
 }
 

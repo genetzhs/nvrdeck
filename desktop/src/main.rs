@@ -1,0 +1,1363 @@
+//! NVRDeck – ελαφρύ καταγραφικό ζωντανής προβολής για κάμερες IP.
+//! Η αποκωδικοποίηση γίνεται από το ffmpeg (μία διεργασία ανά κανάλι).
+
+use eframe::egui::{self, Color32, RichText, Rounding, Stroke};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::Read;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+const MAX_CH: usize = 7;
+
+// ───────────────────────── Θέμα ─────────────────────────
+#[derive(Clone, Copy)]
+struct Pal { bg: Color32, panel: Color32, surface: Color32, hover: Color32, border: Color32, text: Color32, muted: Color32, accent: Color32, dark: bool }
+const THEMES: [(&str, Pal); 3] = [
+    ("Cinematic", Pal { bg: Color32::from_rgb(8, 8, 9), panel: Color32::from_rgb(18, 18, 20), surface: Color32::from_rgb(26, 27, 29),
+        hover: Color32::from_rgb(36, 37, 40), border: Color32::from_rgb(44, 45, 49), text: Color32::from_rgb(243, 244, 248),
+        muted: Color32::from_rgb(139, 144, 166), accent: Color32::from_rgb(139, 124, 255), dark: true }),
+    ("Light", Pal { bg: Color32::from_rgb(244, 245, 251), panel: Color32::from_rgb(255, 255, 255), surface: Color32::from_rgb(240, 241, 248),
+        hover: Color32::from_rgb(231, 233, 243), border: Color32::from_rgb(225, 227, 236), text: Color32::from_rgb(18, 19, 28),
+        muted: Color32::from_rgb(106, 112, 136), accent: Color32::from_rgb(91, 75, 245), dark: false }),
+    ("Green", Pal { bg: Color32::from_rgb(237, 245, 240), panel: Color32::from_rgb(250, 253, 251), surface: Color32::from_rgb(226, 238, 230),
+        hover: Color32::from_rgb(214, 231, 220), border: Color32::from_rgb(200, 220, 207), text: Color32::from_rgb(20, 40, 28),
+        muted: Color32::from_rgb(88, 112, 96), accent: Color32::from_rgb(28, 140, 84), dark: false }),
+];
+static THEME: AtomicU32 = AtomicU32::new(0);
+fn pal() -> Pal { THEMES[(THEME.load(Ordering::Relaxed) as usize).min(THEMES.len() - 1)].1 }
+#[allow(non_snake_case)] fn BG() -> Color32 { pal().bg }
+#[allow(non_snake_case)] fn PANEL() -> Color32 { pal().panel }
+#[allow(non_snake_case)] fn SURFACE() -> Color32 { pal().surface }
+#[allow(non_snake_case)] fn BORDER() -> Color32 { pal().border }
+#[allow(non_snake_case)] fn TEXT() -> Color32 { pal().text }
+#[allow(non_snake_case)] fn MUTED() -> Color32 { pal().muted }
+#[allow(non_snake_case)] fn ACCENT() -> Color32 { pal().accent }
+const OK: Color32 = Color32::from_rgb(62, 240, 166);
+const BAD: Color32 = Color32::from_rgb(255, 92, 122);
+
+fn load_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("geist".into(), egui::FontData::from_static(include_bytes!("../assets/geist_regular.ttf")));
+    fonts.font_data.insert("geist_semibold".into(), egui::FontData::from_static(include_bytes!("../assets/geist_semibold.ttf")));
+    fonts.font_data.insert("geist_mono".into(), egui::FontData::from_static(include_bytes!("../assets/geist_mono.ttf")));
+    fonts.families.entry(egui::FontFamily::Proportional).or_default().insert(0, "geist".into());
+    fonts.families.entry(egui::FontFamily::Monospace).or_default().insert(0, "geist_mono".into());
+    fonts.families.insert(egui::FontFamily::Name("semibold".into()), vec!["geist_semibold".into(), "geist".into()]);
+    // εφεδρική γραμματοσειρά για σύμβολα/emoji που δεν έχει η Geist
+    for path in ["/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans.ttf"] {
+        if let Ok(bytes) = std::fs::read(path) {
+            fonts.font_data.insert("sys".into(), egui::FontData::from_owned(bytes));
+            fonts.families.entry(egui::FontFamily::Proportional).or_default().push("sys".into());
+            break;
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+fn semibold(size: f32) -> egui::FontId { egui::FontId::new(size, egui::FontFamily::Name("semibold".into())) }
+
+/// Φόντο: λεία κάθετη διαβάθμιση μαύρο → ανθρακί γκρι (στα ανοιχτά θέματα: απαλό γκρι).
+fn ambient_glow(ctx: &egui::Context) {
+    let p = pal();
+    let r = ctx.screen_rect();
+    let (top, bottom) = if p.dark {
+        (Color32::from_rgb(8, 8, 9), Color32::from_rgb(28, 29, 32))
+    } else {
+        (p.bg, p.surface)
+    };
+    let mut mesh = egui::Mesh::default();
+    mesh.colored_vertex(r.left_top(), top);
+    mesh.colored_vertex(r.right_top(), top);
+    mesh.colored_vertex(r.left_bottom(), bottom);
+    mesh.colored_vertex(r.right_bottom(), bottom);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(1, 3, 2);
+    ctx.layer_painter(egui::LayerId::background()).add(egui::Shape::mesh(mesh));
+}
+
+fn apply_theme(ctx: &egui::Context, idx: u32) {
+    THEME.store(idx, Ordering::Relaxed);
+    let P = pal();
+    let mut v = if P.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    v.panel_fill = PANEL();
+    v.window_fill = PANEL();
+    v.extreme_bg_color = BG();
+    v.faint_bg_color = SURFACE();
+    v.override_text_color = Some(TEXT());
+    v.window_rounding = Rounding::same(22.0);
+    v.window_stroke = Stroke::new(1.0, BORDER());
+    v.selection.bg_fill = ACCENT().linear_multiply(if P.dark { 0.35 } else { 0.25 });
+    v.selection.stroke = Stroke::new(1.0, ACCENT());
+    v.hyperlink_color = ACCENT();
+    for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
+        w.rounding = Rounding::same(12.0);
+    }
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER());
+    v.widgets.inactive.bg_fill = SURFACE();
+    v.widgets.inactive.weak_bg_fill = SURFACE();
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER());
+    v.widgets.hovered.bg_fill = P.hover;
+    v.widgets.hovered.weak_bg_fill = P.hover;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0, P.border);
+    v.widgets.active.bg_fill = P.hover;
+    v.widgets.active.weak_bg_fill = P.hover;
+    ctx.set_visuals(v);
+
+    ctx.style_mut(|s| {
+        s.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        s.spacing.button_padding = egui::vec2(16.0, 8.0);
+        s.spacing.interact_size.y = 34.0;
+        // γρήγορη, όχι «νωχελική» ανταπόκριση
+        s.animation_time = 0.12;
+        use egui::{FontId, TextStyle::*};
+        s.text_styles.insert(Body, FontId::proportional(14.0));
+        s.text_styles.insert(Button, FontId::proportional(14.0));
+        s.text_styles.insert(Heading, FontId::proportional(20.0));
+        s.text_styles.insert(Small, FontId::proportional(12.0));
+    });
+}
+
+/// «Γυάλινο» γέμισμα καρτών: διάφανο λευκό στο σκοτεινό θέμα, συμπαγές στα ανοιχτά.
+fn glass() -> Color32 { if pal().dark { Color32::from_rgba_unmultiplied(255, 255, 255, 9) } else { PANEL() } }
+fn glass_frame() -> egui::Frame {
+    egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0, BORDER())).rounding(22.0).inner_margin(egui::Margin::same(18.0))
+}
+/// Μικρή κεφαλαία ετικέτα + μεγάλος τίτλος.
+fn screen_title(ui: &mut egui::Ui, eyebrow: &str, title: &str) {
+    ui.label(RichText::new(eyebrow.to_uppercase()).color(MUTED()).size(11.5).extra_letter_spacing(1.6));
+    ui.label(RichText::new(title).font(semibold(32.0)).color(TEXT()).extra_letter_spacing(-1.2));
+}
+
+fn primary(text: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text.to_string()).color(Color32::WHITE).font(semibold(14.0))).fill(ACCENT()).stroke(Stroke::NONE).rounding(999.0)
+}
+fn danger(text: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text.to_string()).color(BAD)).fill(SURFACE())
+}
+
+// ───────────────────────── Ρυθμίσεις / αποθήκευση ─────────────────────────
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+enum Proto { XMeye, Jovision, Hikvision, Dahua, Custom }
+
+impl Proto {
+    const ALL: [Proto; 5] = [Proto::XMeye, Proto::Jovision, Proto::Hikvision, Proto::Dahua, Proto::Custom];
+    fn label(self) -> &'static str {
+        match self {
+            Proto::XMeye => "XMeye / NetSurveillance",
+            Proto::Jovision => "Jovision",
+            Proto::Hikvision => "Hikvision",
+            Proto::Dahua => "Dahua",
+            Proto::Custom => "Generic RTSP (custom path)",
+        }
+    }
+    fn default_port(self) -> u16 {
+        match self { Proto::Jovision => 5544, _ => 554 }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Camera {
+    name: String,
+    host: String,
+    port: u16,
+    proto: Proto,
+    user: String,
+    pass: String,
+    #[serde(default)]
+    main_stream: bool,
+    #[serde(default)]
+    path: String,
+    #[serde(default = "yes")]
+    enabled: bool,
+    #[serde(default = "one")]
+    channel: u32,
+}
+fn yes() -> bool { true }
+fn one() -> u32 { 1 }
+
+impl Default for Camera {
+    fn default() -> Self {
+        Camera { name: String::new(), host: String::new(), port: 554, proto: Proto::XMeye, user: "admin".into(),
+                 pass: String::new(), main_stream: false, path: String::new(), enabled: true, channel: 1 }
+    }
+}
+
+/// Κωδικοποιεί μόνο ό,τι σπάει το URL (@ : / ? # % κενό). Τα υπόλοιπα σύμβολα μένουν όπως είναι,
+/// γιατί πολλές κάμερες/ffmpeg δεν αποκωδικοποιούν %XX στα στοιχεία σύνδεσης.
+fn enc(s: &str) -> String {
+    s.chars().map(|c| match c {
+        '@' | ':' | '/' | '?' | '#' | '%' | ' ' => c.to_string().bytes().map(|b| format!("%{b:02X}")).collect(),
+        _ => c.to_string(),
+    }).collect()
+}
+
+impl Camera {
+    fn url(&self) -> String {
+        let (u, p) = (enc(&self.user), enc(&self.pass));
+        let auth = if self.user.is_empty() { String::new() } else { format!("{u}:{p}@") };
+        let base = format!("rtsp://{auth}{}:{}", self.host, self.port);
+        let m = self.main_stream;
+        let ch = self.channel.max(1);
+        match self.proto {
+            Proto::XMeye => format!("{base}/user={u}&password={p}&channel={ch}&stream={}.sdp?real_stream", if m { 0 } else { 1 }),
+            Proto::Jovision => format!("{base}/live{}.264", if m { 0 } else { 1 }),
+            Proto::Hikvision => format!("{base}/Streaming/Channels/{}", ch * 100 + if m { 1 } else { 2 }),
+            Proto::Dahua => format!("{base}/cam/realmonitor?channel={ch}&subtype={}", if m { 0 } else { 1 }),
+            Proto::Custom => format!("{base}/{}", self.path.trim_start_matches('/')),
+        }
+    }
+    /// URL χωρίς κωδικό, για εμφάνιση στην οθόνη
+    fn safe_url(&self) -> String {
+        let mut c = self.clone();
+        c.pass = if self.pass.is_empty() { String::new() } else { "••••".into() };
+        c.url()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Settings { width: usize, height: usize, fps: u32, #[serde(default)] theme: u32, #[serde(default = "yes")] show_clock: bool, #[serde(default)] layout: u32, #[serde(default)] main_ch: usize }
+impl Default for Settings { fn default() -> Self { Settings { width: 960, height: 540, fps: 12, theme: 0, show_clock: true, layout: 0, main_ch: 0 } } }
+
+#[derive(Serialize, Deserialize, Default)]
+struct Store {
+    #[serde(default)]
+    admin_user: String,
+    #[serde(default)]
+    admin_salt: String,
+    #[serde(default)]
+    admin_hash: String,
+    #[serde(default)]
+    settings: Settings,
+    #[serde(default)]
+    camera: Vec<Camera>,
+}
+
+fn store_path() -> PathBuf { dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("nvrdeck/nvrdeck.toml") }
+
+impl Store {
+    fn load() -> Store {
+        std::fs::read_to_string(store_path()).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default()
+    }
+    fn save(&self) -> anyhow::Result<()> {
+        let p = store_path();
+        std::fs::create_dir_all(p.parent().unwrap())?;
+        let tmp = p.with_extension("tmp");
+        std::fs::write(&tmp, toml::to_string_pretty(self)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(tmp, p)?;
+        Ok(())
+    }
+    fn hash(salt: &str, pass: &str) -> String {
+        let mut h = Sha256::new();
+        h.update(salt.as_bytes());
+        h.update(pass.as_bytes());
+        let mut out = h.finalize();
+        for _ in 0..100_000 {
+            let mut h = Sha256::new();
+            h.update(out);
+            h.update(salt.as_bytes());
+            out = h.finalize();
+        }
+        out.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    fn set_admin(&mut self, user: &str, pass: &str) {
+        let mut salt = [0u8; 16];
+        let _ = getrandom::getrandom(&mut salt);
+        self.admin_salt = salt.iter().map(|b| format!("{b:02x}")).collect();
+        self.admin_user = user.to_string();
+        self.admin_hash = Self::hash(&self.admin_salt, pass);
+    }
+    fn check(&self, user: &str, pass: &str) -> bool {
+        user == self.admin_user && Self::hash(&self.admin_salt, pass) == self.admin_hash
+    }
+}
+
+// ───────────────────────── Ροή βίντεο ─────────────────────────
+#[derive(Default)]
+struct Shared {
+    frame: Option<Vec<u8>>,
+    fresh: bool,
+    status: String,
+    last: Option<Instant>,
+    last_wall: Option<chrono::DateTime<chrono::Local>>,
+}
+
+struct Stream {
+    shared: Arc<Mutex<Shared>>,
+    stop: Arc<AtomicBool>,
+    pid: Arc<AtomicU32>,
+    tex: Option<egui::TextureHandle>,
+}
+
+impl Stream {
+    fn start(url: String, s: Settings, ctx: egui::Context) -> Stream {
+        let shared = Arc::new(Mutex::new(Shared { status: "Connecting…".into(), ..Default::default() }));
+        let stop = Arc::new(AtomicBool::new(false));
+        let pid = Arc::new(AtomicU32::new(0));
+        let (sh, st, pd) = (shared.clone(), stop.clone(), pid.clone());
+        std::thread::spawn(move || worker(url, s, sh, st, pd, ctx));
+        Stream { shared, stop, pid, tex: None }
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        let pid = self.pid.load(Ordering::SeqCst);
+        if pid != 0 {
+            let _ = Command::new("kill").arg(pid.to_string()).stderr(Stdio::null()).status();
+        }
+    }
+}
+
+fn ffmpeg_cmd(url: &str, s: &Settings) -> Command {
+    let (w, h, fps) = (s.width, s.height, s.fps);
+    let mut c = Command::new("ffmpeg");
+    c.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-rtsp_transport", "tcp", "-timeout", "5000000",
+            "-fflags", "nobuffer", "-flags", "low_delay", "-i", url, "-an", "-vf",
+            &format!("fps={fps},scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
+            "-pix_fmt", "rgba", "-f", "rawvideo", "-"])
+        .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    c
+}
+
+fn worker(url: String, s: Settings, sh: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>, pid: Arc<AtomicU32>, ctx: egui::Context) {
+    let size = s.width * s.height * 4;
+    while !stop.load(Ordering::SeqCst) {
+        sh.lock().unwrap().status = "Connecting…".into();
+        ctx.request_repaint();
+        match ffmpeg_cmd(&url, &s).spawn() {
+            Ok(mut child) => {
+                pid.store(child.id(), Ordering::SeqCst);
+                let mut out = child.stdout.take().unwrap();
+                let mut err = child.stderr.take().unwrap();
+                let errbuf = Arc::new(Mutex::new(String::new()));
+                let eb = errbuf.clone();
+                std::thread::spawn(move || { let mut t = String::new(); let _ = err.read_to_string(&mut t); *eb.lock().unwrap() = t; });
+                let mut buf = vec![0u8; size];
+                while !stop.load(Ordering::SeqCst) && out.read_exact(&mut buf).is_ok() {
+                    let mut g = sh.lock().unwrap();
+                    g.frame = Some(std::mem::replace(&mut buf, vec![0u8; size]));
+                    g.fresh = true;
+                    g.status.clear();
+                    g.last = Some(Instant::now());
+                    g.last_wall = Some(chrono::Local::now());
+                    drop(g);
+                    ctx.request_repaint();
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                pid.store(0, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(100));
+                let e = errbuf.lock().unwrap().to_lowercase();
+                sh.lock().unwrap().status = friendly_error(&e).into();
+            }
+            Err(_) => sh.lock().unwrap().status = "ffmpeg not found".into(),
+        }
+        ctx.request_repaint();
+        for _ in 0..30 {
+            if stop.load(Ordering::SeqCst) { return; }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+fn friendly_error(e: &str) -> &'static str {
+    if e.contains("401") || e.contains("unauthorized") { "Wrong username or password" }
+    else if e.contains("404") || e.contains("not found") { "Wrong stream path" }
+    else if e.contains("refused") { "Port is closed" }
+    else if e.contains("timed out") || e.contains("timeout") || e.contains("no route") { "Camera not responding" }
+    else { "No signal – reconnecting" }
+}
+
+/// Γρήγορη δοκιμή σύνδεσης με ffprobe (στο παρασκήνιο)
+fn probe(url: String, out: Arc<Mutex<Option<Result<String, String>>>>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let r = Command::new("ffprobe")
+            .args(["-v", "error", "-rtsp_transport", "tcp", "-timeout", "5000000", "-select_streams", "v:0",
+                   "-show_entries", "stream=codec_name,width,height", "-of", "csv=p=0", &url])
+            .stdin(Stdio::null()).output();
+        let res = match r {
+            Ok(o) if o.status.success() && !o.stdout.is_empty() => {
+                let t = String::from_utf8_lossy(&o.stdout).trim().replace(',', " · ");
+                Ok(format!("OK – {t}"))
+            }
+            Ok(o) => Err(friendly_error(&String::from_utf8_lossy(&o.stderr).to_lowercase()).to_string()),
+            Err(_) => Err("ffprobe not found".into()),
+        };
+        *out.lock().unwrap() = Some(res);
+        ctx.request_repaint();
+    });
+}
+
+
+// ───────────────────────── Σάρωση δικτύου ─────────────────────────
+#[derive(Clone)]
+struct Found { host: String, rtsp_port: u16, proto: Proto, vendor: String, mac: String, onvif: bool }
+
+#[derive(Default)]
+struct ScanState { running: bool, done: usize, total: usize, found: Vec<Found>, subnets: Vec<String> }
+
+fn local_subnets() -> Vec<String> {
+    let out = Command::new("ip").args(["-4", "-o", "addr", "show", "up"]).output();
+    let mut v = vec![];
+    if let Ok(o) = out {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 4 { continue; }
+            let ifc = f[1];
+            if ifc == "lo" || ifc.starts_with("docker") || ifc.starts_with("br-") || ifc.starts_with("veth")
+               || ifc.starts_with("virbr") || ifc.starts_with("tun") || ifc.starts_with("wg") { continue; }
+            if let Some(ip) = f[3].split('/').next() {
+                let o: Vec<&str> = ip.split('.').collect();
+                if o.len() == 4 && o[0] != "169" {
+                    let net = format!("{}.{}.{}", o[0], o[1], o[2]);
+                    if !v.contains(&net) { v.push(net); }
+                }
+            }
+        }
+    }
+    v
+}
+
+fn port_open(host: &str, port: u16, ms: u64) -> Option<std::net::TcpStream> {
+    let addr: std::net::SocketAddr = format!("{host}:{port}").parse().ok()?;
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(ms)).ok()
+}
+
+fn is_rtsp(mut s: std::net::TcpStream, host: &str, port: u16) -> bool {
+    use std::io::Write;
+    let _ = s.set_read_timeout(Some(Duration::from_millis(1500)));
+    let _ = s.set_write_timeout(Some(Duration::from_millis(1000)));
+    if s.write_all(format!("OPTIONS rtsp://{host}:{port}/ RTSP/1.0\r\nCSeq: 1\r\n\r\n").as_bytes()).is_err() { return false; }
+    let mut buf = [0u8; 64];
+    match s.read(&mut buf) { Ok(n) if n > 0 => String::from_utf8_lossy(&buf[..n]).starts_with("RTSP/"), _ => false }
+}
+
+fn arp_mac(host: &str) -> String {
+    std::fs::read_to_string("/proc/net/arp").ok().and_then(|t| t.lines()
+        .find(|l| l.split_whitespace().next() == Some(host))
+        .and_then(|l| l.split_whitespace().nth(3).map(|m| m.to_lowercase())))
+        .filter(|m| m != "00:00:00:00:00:00").unwrap_or_default()
+}
+
+fn onvif_discover() -> Vec<String> {
+    let msg = format!(r#"<?xml version="1.0"?><e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" xmlns:w="http://schemas.xmlsoap.org/ws/2004/08/addressing" xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" xmlns:dn="http://www.onvif.org/ver10/network/wsdl"><e:Header><w:MessageID>uuid:{:x}</w:MessageID><w:To>urn:schemas-xmlsoap-org:ws:2005:04:discovery</w:To><w:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</w:Action></e:Header><e:Body><d:Probe><d:Types>dn:NetworkVideoTransmitter</d:Types></d:Probe></e:Body></e:Envelope>"#,
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0));
+    let mut hosts = vec![];
+    let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") else { return hosts };
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
+    for _ in 0..2 { let _ = sock.send_to(msg.as_bytes(), "239.255.255.250:3702"); }
+    let end = Instant::now() + Duration::from_secs(3);
+    let mut buf = vec![0u8; 65535];
+    while Instant::now() < end {
+        if let Ok((_, from)) = sock.recv_from(&mut buf) {
+            let h = from.ip().to_string();
+            if !hosts.contains(&h) { hosts.push(h); }
+        }
+    }
+    hosts
+}
+
+fn guess(host: &str, rtsp: u16, mac: &str) -> (Proto, String) {
+    let quick = |p| port_open(host, p, 400).is_some();
+    if mac.starts_with("e0:62:90") || rtsp == 5544 { return (Proto::Jovision, "Jovision".into()); }
+    if quick(34567) { return (Proto::XMeye, "XMeye / NetSurveillance".into()); }
+    if quick(37777) { return (Proto::Dahua, "Dahua".into()); }
+    if quick(8000) { return (Proto::Hikvision, "Hikvision".into()); }
+    (Proto::Custom, "Unknown type".into())
+}
+
+fn start_scan(state: Arc<Mutex<ScanState>>, ctx: egui::Context) {
+    const RTSP_PORTS: [u16; 4] = [554, 5544, 8554, 10554];
+    let subnets = local_subnets();
+    let hosts: Vec<String> = subnets.iter().flat_map(|n| (1..=254).map(move |i| format!("{n}.{i}"))).collect();
+    {
+        let mut g = state.lock().unwrap();
+        *g = ScanState { running: true, total: hosts.len(), subnets: subnets.clone(), ..Default::default() };
+    }
+    std::thread::spawn(move || {
+        let onvif = std::thread::spawn(onvif_discover);
+        let queue = Arc::new(Mutex::new(hosts));
+        let mut workers = vec![];
+        for _ in 0..96 {
+            let (q, st, cx) = (queue.clone(), state.clone(), ctx.clone());
+            workers.push(std::thread::spawn(move || loop {
+                let Some(h) = q.lock().unwrap().pop() else { break };
+                for p in RTSP_PORTS {
+                    if let Some(s) = port_open(&h, p, 350) {
+                        if is_rtsp(s, &h, p) {
+                            let mac = arp_mac(&h);
+                            let (proto, vendor) = guess(&h, p, &mac);
+                            st.lock().unwrap().found.push(Found { host: h.clone(), rtsp_port: p, proto, vendor, mac, onvif: false });
+                            cx.request_repaint();
+                            break;
+                        }
+                    }
+                }
+                st.lock().unwrap().done += 1;
+                cx.request_repaint();
+            }));
+        }
+        for w in workers { let _ = w.join(); }
+        let onv = onvif.join().unwrap_or_default();
+        let mut g = state.lock().unwrap();
+        for f in g.found.iter_mut() { if onv.contains(&f.host) { f.onvif = true; } }
+        g.found.sort_by_key(|f| f.host.split('.').map(|o| o.parse::<u32>().unwrap_or(0)).fold(0u64, |a, b| a * 256 + b as u64));
+        g.running = false;
+        drop(g);
+        ctx.request_repaint();
+    });
+}
+
+
+// ───────────────────────── Διατάξεις πλέγματος ─────────────────────────
+const LAYOUTS: [&str; 8] = ["Auto", "1", "2×2", "2×3", "1 + 4", "1 + 5", "3×3", "1 + 7"];
+
+/// Θέσεις κελιών σε κανονικοποιημένες συντεταγμένες (0..1). Το πρώτο κελί είναι το «κύριο».
+fn layout_cells(kind: u32, n: usize) -> Vec<egui::Rect> {
+    let grid = |cols: usize, rows: usize| -> Vec<egui::Rect> {
+        (0..cols * rows).map(|k| egui::Rect::from_min_size(
+            egui::pos2((k % cols) as f32 / cols as f32, (k / cols) as f32 / rows as f32),
+            egui::vec2(1.0 / cols as f32, 1.0 / rows as f32))).collect()
+    };
+    // μεγάλο κελί big×big μέσα σε πλέγμα g×g, τα υπόλοιπα γύρω του
+    let big = |g: usize, b: usize| -> Vec<egui::Rect> {
+        let u = 1.0 / g as f32;
+        let mut v = vec![egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(u * b as f32, u * b as f32))];
+        for r in 0..g { for c in 0..g {
+            if r < b && c < b { continue; }
+            v.push(egui::Rect::from_min_size(egui::pos2(c as f32 * u, r as f32 * u), egui::vec2(u, u)));
+        }}
+        v
+    };
+    match kind {
+        1 => grid(1, 1),
+        2 => grid(2, 2),
+        3 => grid(3, 2), // 2 σειρές × 3 στήλες
+        4 => { // μεγάλη αριστερά, 4 μικρές σε στήλη δεξιά
+            let mut v = vec![egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(0.75, 1.0))];
+            for i in 0..4 { v.push(egui::Rect::from_min_size(egui::pos2(0.75, i as f32 * 0.25), egui::vec2(0.25, 0.25))); }
+            v
+        }
+        5 => big(3, 2),
+        6 => grid(3, 3),
+        7 => big(4, 3),
+        // Auto: γεμίζει όλο το παράθυρο – η τελευταία σειρά απλώνεται, χωρίς κενά κελιά
+        _ => {
+            let n = n.max(1);
+            let cols = (n as f32).sqrt().ceil() as usize;
+            let rows = (n + cols - 1) / cols;
+            let mut v = Vec::with_capacity(n);
+            for r in 0..rows {
+                let in_row = if r == rows - 1 { n - cols * (rows - 1) } else { cols };
+                for c in 0..in_row {
+                    v.push(egui::Rect::from_min_size(
+                        egui::pos2(c as f32 / in_row as f32, r as f32 / rows as f32),
+                        egui::vec2(1.0 / in_row as f32, 1.0 / rows as f32)));
+                }
+            }
+            v
+        }
+    }
+}
+
+// ───────────────────────── Εφαρμογή ─────────────────────────
+#[derive(PartialEq, Clone, Copy)]
+enum Page { Live, Cameras, Settings }
+
+struct Editor {
+    idx: Option<usize>,
+    cam: Camera,
+    show_pass: bool,
+    test: Arc<Mutex<Option<Result<String, String>>>>,
+    testing: bool,
+    err: String,
+}
+
+struct NvrForm {
+    name: String,
+    cam: Camera,
+    first: u32,
+    count: u32,
+    show_pass: bool,
+    test: Arc<Mutex<Option<Result<String, String>>>>,
+    testing: bool,
+    err: String,
+}
+
+struct App {
+    store: Store,
+    logged_in: bool,
+    login_user: String,
+    login_pass: String,
+    login_pass2: String,
+    login_err: String,
+    page: Page,
+    streams: Vec<Option<Stream>>,
+    solo: Option<usize>,
+    editor: Option<Editor>,
+    confirm_delete: Option<usize>,
+    settings_draft: Settings,
+    toast: Option<(String, Instant)>,
+    scan: Arc<Mutex<ScanState>>,
+    scan_open: bool,
+    nvr: Option<NvrForm>,
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext) -> App {
+        load_fonts(&cc.egui_ctx);
+        let store = Store::load();
+        apply_theme(&cc.egui_ctx, store.settings.theme);
+        let settings_draft = store.settings.clone();
+        App { store, logged_in: false, login_user: "admin".into(), login_pass: String::new(), login_pass2: String::new(),
+              login_err: String::new(), page: Page::Live, streams: vec![], solo: None, editor: None,
+              confirm_delete: None, settings_draft, toast: None,
+              scan: Arc::new(Mutex::new(ScanState::default())), scan_open: false, nvr: None }
+    }
+
+    fn restart_streams(&mut self, ctx: &egui::Context) {
+        self.streams.clear(); // Drop σταματά τα παλιά ffmpeg
+        self.streams = self.store.camera.iter().map(|c| {
+            c.enabled.then(|| Stream::start(c.url(), self.store.settings.clone(), ctx.clone()))
+        }).collect();
+        if self.solo.map_or(false, |i| i >= self.streams.len()) { self.solo = None; }
+    }
+
+    fn save(&mut self) {
+        match self.store.save() {
+            Ok(_) => self.toast("Saved"),
+            Err(e) => self.toast(&format!("Save error: {e}")),
+        }
+    }
+    fn toast(&mut self, t: &str) { self.toast = Some((t.into(), Instant::now())); }
+
+    fn logout(&mut self) {
+        self.streams.clear();
+        self.logged_in = false;
+        self.login_pass.clear();
+        self.editor = None;
+    }
+
+    // ── Οθόνη σύνδεσης / πρώτης ρύθμισης ──
+    fn login_ui(&mut self, ctx: &egui::Context) {
+        let first = self.store.admin_hash.is_empty();
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT)).show(ctx, |ui| {
+            let card = egui::Rect::from_center_size(ui.max_rect().center(), egui::vec2(360.0, if first { 360.0 } else { 300.0 }));
+            ui.allocate_ui_at_rect(card, |ui| {
+                egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0, BORDER())).rounding(26.0)
+                    .inner_margin(egui::Margin::same(28.0)).show(ui, |ui| {
+                    ui.set_width(card.width() - 56.0);
+                    ui.label(RichText::new("●  NVR Viewer").size(22.0).strong());
+                    ui.label(RichText::new(if first { "First run – create an admin account" } else { "Sign in to continue" }).color(MUTED()));
+                    ui.add_space(14.0);
+                    ui.label(RichText::new("Username").color(MUTED()).small());
+                    ui.add(egui::TextEdit::singleline(&mut self.login_user).desired_width(f32::INFINITY));
+                    ui.label(RichText::new("Password").color(MUTED()).small());
+                    let r = ui.add(egui::TextEdit::singleline(&mut self.login_pass).password(true).desired_width(f32::INFINITY));
+                    if first {
+                        ui.label(RichText::new("Repeat password").color(MUTED()).small());
+                        ui.add(egui::TextEdit::singleline(&mut self.login_pass2).password(true).desired_width(f32::INFINITY));
+                    }
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if !self.login_err.is_empty() {
+                        ui.label(RichText::new(&self.login_err).color(BAD).small());
+                    }
+                    ui.add_space(6.0);
+                    let go = ui.add_sized([ui.available_width(), 34.0], primary(if first { "Create & sign in" } else { "Sign in" })).clicked();
+                    if go || enter {
+                        if first {
+                            if self.login_user.trim().is_empty() || self.login_pass.len() < 4 {
+                                self.login_err = "Password needs at least 4 characters".into();
+                            } else if self.login_pass != self.login_pass2 {
+                                self.login_err = "Passwords do not match".into();
+                            } else {
+                                let (u, p) = (self.login_user.trim().to_string(), self.login_pass.clone());
+                                self.store.set_admin(&u, &p);
+                                self.save();
+                                self.enter(ctx);
+                            }
+                        } else if self.store.check(self.login_user.trim(), &self.login_pass) {
+                            self.enter(ctx);
+                        } else {
+                            self.login_err = "Wrong username or password".into();
+                            self.login_pass.clear();
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    fn enter(&mut self, ctx: &egui::Context) {
+        self.logged_in = true;
+        self.login_err.clear();
+        self.login_pass.clear();
+        self.login_pass2.clear();
+        self.page = if self.store.camera.is_empty() { Page::Cameras } else { Page::Live };
+        self.restart_streams(ctx);
+    }
+
+    // ── Πάνω μπάρα ──
+    fn top_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("top").exact_height(48.0).frame(
+            egui::Frame::none().fill(if pal().dark { Color32::from_rgba_unmultiplied(14, 14, 16, 215) } else { PANEL() }).inner_margin(egui::Margin::symmetric(16.0, 8.0)).stroke(Stroke::new(1.0, BORDER()))
+        ).show(ctx, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.label(RichText::new("● ").color(BAD));
+                ui.label(RichText::new("NVR").font(semibold(17.0)).extra_letter_spacing(-0.4));
+                ui.add_space(18.0);
+                for (p, t) in [(Page::Live, "Live view"), (Page::Cameras, "Cameras"), (Page::Settings, "Settings")] {
+                    let sel = self.page == p;
+                    let txt = if sel { RichText::new(t).color(Color32::WHITE).font(semibold(13.5)) } else { RichText::new(t).color(MUTED()) };
+                    let b = egui::Button::new(txt).fill(if sel { ACCENT() } else { Color32::TRANSPARENT }).stroke(Stroke::NONE).rounding(999.0);
+                    if ui.add(b).clicked() { self.page = p; }
+                }
+                if self.page == Page::Live {
+                    ui.add_space(10.0);
+                    ui.separator();
+                    let cur = LAYOUTS[(self.store.settings.layout as usize).min(LAYOUTS.len() - 1)];
+                    let mut pick: Option<u32> = None;
+                    ui.menu_button(RichText::new(format!("▦  {cur}  ▾")).color(TEXT()), |ui| {
+                        ui.set_min_width(150.0);
+                        for (k, name) in LAYOUTS.iter().enumerate() {
+                            if ui.selectable_label(self.store.settings.layout == k as u32, *name).clicked() {
+                                pick = Some(k as u32);
+                                ui.close_menu();
+                            }
+                        }
+                        if matches!(self.store.settings.layout, 4 | 5 | 7) {
+                            ui.separator();
+                            ui.label(RichText::new("Click a channel to make it the main one").color(MUTED()).small());
+                        }
+                    });
+                    if let Some(k) = pick {
+                        self.store.settings.layout = k;
+                        self.settings_draft.layout = k;
+                        self.solo = None;
+                        let _ = self.store.save();
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Sign out").clicked() { self.logout(); }
+                    if self.store.settings.show_clock {
+                        ui.label(RichText::new(chrono::Local::now().format("%H:%M:%S").to_string()).monospace().strong());
+                    }
+                    ui.label(RichText::new(format!("👤 {}", self.store.admin_user)).color(MUTED()));
+                    let online = self.streams.iter().flatten()
+                        .filter(|s| s.shared.lock().unwrap().last.map_or(false, |t| t.elapsed() < Duration::from_secs(5))).count();
+                    ui.label(RichText::new(format!("{online}/{} online", self.store.camera.len())).color(MUTED()));
+                });
+            });
+        });
+    }
+
+    // ── Ζωντανή προβολή ──
+    fn live_ui(&mut self, ctx: &egui::Context) {
+        ctx.input(|i| {
+            let keys = [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5, egui::Key::Num6, egui::Key::Num7];
+            for (n, k) in keys.iter().enumerate() {
+                if i.key_pressed(*k) && n < self.streams.len() { self.solo = Some(n); }
+            }
+            if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Num0) { self.solo = None; }
+        });
+        let (w, h) = (self.store.settings.width, self.store.settings.height);
+        for (i, s) in self.streams.iter_mut().enumerate() {
+            let Some(s) = s else { continue };
+            let mut g = s.shared.lock().unwrap();
+            if g.fresh {
+                if let Some(f) = &g.frame {
+                    if f.len() == w * h * 4 {
+                        let img = egui::ColorImage::from_rgba_unmultiplied([w, h], f);
+                        match &mut s.tex {
+                            Some(t) => t.set(img, egui::TextureOptions::LINEAR),
+                            None => s.tex = Some(ctx.load_texture(format!("ch{i}"), img, egui::TextureOptions::LINEAR)),
+                        }
+                    }
+                }
+                g.fresh = false;
+            }
+        }
+
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::same(3.0))).show(ctx, |ui| {
+            if self.store.camera.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new("No cameras yet. Add some from the Cameras page.").color(MUTED()));
+                });
+                return;
+            }
+            let layout = self.store.settings.layout;
+            let area = ui.available_rect_before_wrap();
+            let ncam = self.store.camera.len();
+            let main = self.store.settings.main_ch.min(ncam.saturating_sub(1));
+            let (idx, cells): (Vec<usize>, Vec<egui::Rect>) = match self.solo {
+                Some(i) => (vec![i], layout_cells(1, 1)),
+                None => {
+                    let mut order = vec![main];
+                    order.extend((0..ncam).filter(|&i| i != main));
+                    let cells = layout_cells(layout, ncam);
+                    (order, cells)
+                }
+            };
+            let gap = 3.0;
+            let mut clicked_main: Option<usize> = None;
+            for (k, &i) in idx.iter().enumerate() {
+                let Some(u) = cells.get(k) else { break };
+                let cell = egui::Rect::from_min_max(
+                    area.min + egui::vec2(u.min.x * area.width(), u.min.y * area.height()),
+                    area.min + egui::vec2(u.max.x * area.width(), u.max.y * area.height())).shrink(gap / 2.0);
+                let resp = ui.interact(cell, ui.id().with(("cell", i)), egui::Sense::click());
+                if resp.double_clicked() { self.solo = if self.solo.is_some() { None } else { Some(i) }; }
+                else if resp.clicked() && self.solo.is_none() && matches!(layout, 4 | 5 | 7) { clicked_main = Some(i); }
+                let p = ui.painter_at(cell);
+                p.rect_filled(cell, 14.0, Color32::from_rgb(5, 6, 10));
+                let cam = &self.store.camera[i];
+                let mut stamp: Option<String> = None;
+                let (status, live) = match &self.streams.get(i).and_then(|s| s.as_ref()) {
+                    Some(s) => {
+                        if let Some(t) = &s.tex {
+                            // πλέγμα: ομοιόμορφο γέμισμα κελιού (crop) · πλήρης προβολή: ολόκληρη εικόνα
+                            let ar = w as f32 / h as f32;
+                            let car = cell.width() / cell.height();
+                            if self.solo.is_some() {
+                                let mut sz = cell.size();
+                                if sz.x / sz.y > ar { sz.x = sz.y * ar } else { sz.y = sz.x / ar }
+                                p.image(t.id(), egui::Rect::from_center_size(cell.center(), sz),
+                                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                            } else {
+                                let uv = if car > ar { let v = ar / car; egui::Rect::from_min_max(egui::pos2(0.0, (1.0 - v) / 2.0), egui::pos2(1.0, (1.0 + v) / 2.0)) }
+                                         else { let u = car / ar; egui::Rect::from_min_max(egui::pos2((1.0 - u) / 2.0, 0.0), egui::pos2((1.0 + u) / 2.0, 1.0)) };
+                                let mut rs = egui::epaint::RectShape::filled(cell, 14.0, Color32::WHITE); rs.fill_texture_id = t.id(); rs.uv = uv; p.add(rs);
+                            }
+                        }
+                        let g = s.shared.lock().unwrap();
+                        stamp = g.last_wall.map(|t| t.format("%H:%M:%S").to_string());
+                        (g.status.clone(), g.last.map_or(false, |t| t.elapsed() < Duration::from_secs(5)))
+                    }
+                    None => ("Disabled".into(), false),
+                };
+                if self.store.settings.show_clock {
+                    if let Some(ts) = &stamp {
+                        let txt = if live { format!("LIVE {ts}") } else { format!("FROZEN {ts}") };
+                        let gal = p.layout_no_wrap(txt, egui::FontId::monospace(10.5), if live { Color32::from_white_alpha(230) } else { BAD });
+                        let r = egui::Rect::from_min_size(cell.right_bottom() - gal.size() - egui::vec2(26.0, 14.0), gal.size() + egui::vec2(20.0, 6.0));
+                        p.rect_filled(r, 999.0, Color32::from_black_alpha(140));
+                        p.circle_filled(r.min + egui::vec2(8.0, r.height() / 2.0), 2.5, if live { OK } else { BAD });
+                        p.galley(r.min + egui::vec2(14.0, 3.0), gal, Color32::WHITE);
+                    }
+                }
+                // ετικέτα καναλιού
+                let label = format!("CH{}  {}", i + 1, cam.name);
+                let galley = p.layout_no_wrap(label, egui::FontId::proportional(13.0), TEXT());
+                let pill = egui::Rect::from_min_size(cell.min + egui::vec2(8.0, 8.0), galley.size() + egui::vec2(30.0, 10.0));
+                p.rect_filled(pill, 999.0, Color32::from_black_alpha(170));
+                p.circle_filled(pill.min + egui::vec2(12.0, pill.height() / 2.0), 4.0, if live { OK } else { BAD });
+                p.galley(pill.min + egui::vec2(22.0, 5.0), galley, TEXT());
+                if !status.is_empty() && !live {
+                    p.text(cell.center(), egui::Align2::CENTER_CENTER, status, egui::FontId::proportional(15.0), MUTED());
+                }
+                if resp.hovered() {
+                    p.rect_stroke(cell, 14.0, Stroke::new(1.0, ACCENT().gamma_multiply(0.6)));
+                }
+            }
+            if let Some(m) = clicked_main {
+                if m != self.store.settings.main_ch {
+                    self.store.settings.main_ch = m;
+                    self.settings_draft.main_ch = m;
+                    let _ = self.store.save();
+                }
+            }
+        });
+    }
+
+    // ── Διαχείριση καμερών ──
+    fn cameras_ui(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::same(24.0))).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                screen_title(ui, "Manage", "Cameras");
+                ui.label(RichText::new(format!("{}/{MAX_CH}", self.store.camera.len())).color(MUTED()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let can = self.store.camera.len() < MAX_CH;
+                    let add = ui.add_enabled(can, primary("+ Add camera")).clicked();
+                    if ui.add_enabled(can, egui::Button::new("🗄 Add NVR")).clicked() {
+                        self.nvr = Some(NvrForm { name: "NVR".into(), cam: Camera { port: 554, ..Default::default() }, first: 1,
+                            count: (MAX_CH - self.store.camera.len()) as u32, show_pass: false,
+                            test: Arc::new(Mutex::new(None)), testing: false, err: String::new() });
+                    }
+                    if ui.add_enabled(can, egui::Button::new("🔍 Scan network")).clicked() {
+                        self.scan_open = true;
+                        if !self.scan.lock().unwrap().running { start_scan(self.scan.clone(), ctx.clone()); }
+                    }
+                    if add {
+                        self.editor = Some(Editor { idx: None, cam: Camera::default(), show_pass: false,
+                                                    test: Arc::new(Mutex::new(None)), testing: false, err: String::new() });
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            if self.store.camera.is_empty() {
+                ui.label(RichText::new("No cameras yet. Click Add camera.").color(MUTED()));
+            }
+            let mut action: Option<(usize, &str)> = None;
+            for (i, c) in self.store.camera.iter().enumerate() {
+                let live = self.streams.get(i).and_then(|s| s.as_ref())
+                    .map_or(false, |s| s.shared.lock().unwrap().last.map_or(false, |t| t.elapsed() < Duration::from_secs(5)));
+                egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0, BORDER())).rounding(18.0).inner_margin(egui::Margin::symmetric(16.0, 12.0)).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+                        ui.painter().circle_filled(dot.center(), 4.0, if !c.enabled { MUTED() } else if live { OK } else { BAD });
+                        ui.vertical(|ui| {
+                            ui.label(RichText::new(format!("CH{}  {}", i + 1, c.name)).strong());
+                            ui.label(RichText::new(format!("{} · {}:{}{} · {}", c.proto.label(), c.host, c.port,
+                                if c.channel > 1 || c.name.starts_with("NVR") { format!(" · channel {}", c.channel) } else { String::new() },
+                                if c.main_stream { "main stream" } else { "sub stream" })).color(MUTED()).small());
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.add(danger("Delete")).clicked() { action = Some((i, "del")); }
+                            if ui.button("Edit").clicked() { action = Some((i, "edit")); }
+                            if ui.button(if c.enabled { "Disable" } else { "Enable" }).clicked() { action = Some((i, "toggle")); }
+                        });
+                    });
+                });
+            }
+            match action {
+                Some((i, "edit")) => self.editor = Some(Editor { idx: Some(i), cam: self.store.camera[i].clone(), show_pass: false,
+                                                                  test: Arc::new(Mutex::new(None)), testing: false, err: String::new() }),
+                Some((i, "del")) => self.confirm_delete = Some(i),
+                Some((i, "toggle")) => {
+                    self.store.camera[i].enabled ^= true;
+                    self.save();
+                    self.restart_streams(ctx);
+                }
+                _ => {}
+            }
+        });
+
+        if let Some(i) = self.confirm_delete {
+            let name = self.store.camera.get(i).map(|c| c.name.clone()).unwrap_or_default();
+            let mut close = false;
+            egui::Window::new("Delete camera").collapsible(false).resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+                ui.label(format!("Delete camera \"{name}\"?"));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() { close = true; }
+                    if ui.add(egui::Button::new(RichText::new("Delete").color(Color32::WHITE)).fill(BAD)).clicked() {
+                        self.store.camera.remove(i);
+                        self.save();
+                        self.restart_streams(ctx);
+                        close = true;
+                    }
+                });
+            });
+            if close { self.confirm_delete = None; }
+        }
+
+        self.scan_ui(ctx);
+        self.nvr_ui(ctx);
+        self.editor_ui(ctx);
+    }
+
+
+    fn scan_ui(&mut self, ctx: &egui::Context) {
+        if !self.scan_open || self.editor.is_some() { return; }
+        let mut open = true;
+        let mut add: Option<Found> = None;
+        let mut rescan = false;
+        egui::Window::new("Scan network").open(&mut open).collapsible(false).resizable(false).min_width(560.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+            let g = self.scan.lock().unwrap();
+            ui.label(RichText::new(format!("Subnets: {}", g.subnets.iter().map(|n| format!("{n}.0/24")).collect::<Vec<_>>().join(", "))).color(MUTED()).small());
+            if g.running {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(RichText::new(format!("Scanning… {}/{}", g.done, g.total)).color(MUTED()));
+                });
+                ui.add(egui::ProgressBar::new(if g.total > 0 { g.done as f32 / g.total as f32 } else { 0.0 }).desired_height(4.0));
+            } else {
+                ui.label(RichText::new(format!("Found {} RTSP devices", g.found.len())).color(MUTED()));
+            }
+            ui.add_space(6.0);
+            egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                for f in &g.found {
+                    let added = self.store.camera.iter().any(|c| c.host == f.host);
+                    egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0, BORDER())).rounding(14.0).inner_margin(egui::Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(&f.host).strong().monospace());
+                                let mut meta = format!("{} · RTSP :{}", f.vendor, f.rtsp_port);
+                                if f.onvif { meta.push_str(" · ONVIF"); }
+                                if !f.mac.is_empty() { meta.push_str(&format!(" · {}", f.mac)); }
+                                ui.label(RichText::new(meta).color(MUTED()).small());
+                            });
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if added {
+                                    ui.label(RichText::new("✓ Added").color(OK));
+                                } else if ui.add_enabled(self.store.camera.len() < MAX_CH, primary("Add")).clicked() {
+                                    add = Some(f.clone());
+                                }
+                            });
+                        });
+                    });
+                }
+            });
+            ui.add_space(6.0);
+            ui.label(RichText::new("Note: the NVR itself may also appear if it has RTSP open.").color(MUTED()).small());
+            if !g.running && ui.button("Scan again").clicked() { rescan = true; }
+        });
+        if rescan { start_scan(self.scan.clone(), ctx.clone()); }
+        if let Some(f) = add {
+            let n = self.store.camera.len() + 1;
+            let cam = Camera { name: format!("Camera {n} (.{})", f.host.rsplit('.').next().unwrap_or("")), host: f.host,
+                               port: f.rtsp_port, proto: f.proto, ..Default::default() };
+            self.editor = Some(Editor { idx: None, cam, show_pass: false, test: Arc::new(Mutex::new(None)), testing: false, err: String::new() });
+        }
+        if !open { self.scan_open = false; }
+    }
+
+
+    fn nvr_ui(&mut self, ctx: &egui::Context) {
+        let free = MAX_CH.saturating_sub(self.store.camera.len()) as u32;
+        let Some(f) = &mut self.nvr else { return };
+        let mut close = false;
+        let mut create = false;
+        egui::Window::new("Add NVR").collapsible(false).resizable(false).min_width(440.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+            ui.label(RichText::new("Adds the NVR channels as separate cameras (via the NVR's RTSP).").color(MUTED()).small());
+            ui.add_space(6.0);
+            egui::Grid::new("nvrform").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
+                ui.label(RichText::new("Name").color(MUTED()));
+                ui.add(egui::TextEdit::singleline(&mut f.name).desired_width(240.0));
+                ui.end_row();
+                ui.label(RichText::new("Type").color(MUTED()));
+                egui::ComboBox::from_id_salt("nvrproto").selected_text(f.cam.proto.label()).width(240.0).show_ui(ui, |ui| {
+                    for p in [Proto::XMeye, Proto::Hikvision, Proto::Dahua] { ui.selectable_value(&mut f.cam.proto, p, p.label()); }
+                });
+                ui.end_row();
+                ui.label(RichText::new("IP / Host").color(MUTED()));
+                ui.add(egui::TextEdit::singleline(&mut f.cam.host).hint_text("e.g. 192.168.1.50").desired_width(240.0));
+                ui.end_row();
+                ui.label(RichText::new("RTSP port").color(MUTED()));
+                ui.add(egui::DragValue::new(&mut f.cam.port).range(1..=65535));
+                ui.end_row();
+                ui.label(RichText::new("Username").color(MUTED()));
+                ui.add(egui::TextEdit::singleline(&mut f.cam.user).desired_width(240.0));
+                ui.end_row();
+                ui.label(RichText::new("Password").color(MUTED()));
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut f.cam.pass).password(!f.show_pass).desired_width(194.0));
+                    if ui.small_button(if f.show_pass { "🙈" } else { "👁" }).clicked() { f.show_pass ^= true; }
+                });
+                ui.end_row();
+                ui.label(RichText::new("Channels").color(MUTED()));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("from").color(MUTED()).small());
+                    ui.add(egui::DragValue::new(&mut f.first).range(1..=64));
+                    ui.label(RichText::new("count").color(MUTED()).small());
+                    ui.add(egui::DragValue::new(&mut f.count).range(1..=free.max(1)));
+                });
+                ui.end_row();
+                ui.label(RichText::new("Stream").color(MUTED()));
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut f.cam.main_stream, false, "Sub (light)");
+                    ui.selectable_value(&mut f.cam.main_stream, true, "Main (HD)");
+                });
+                ui.end_row();
+            });
+            f.cam.channel = f.first;
+            ui.label(RichText::new(format!("Free slots: {free}")).color(MUTED()).small());
+            if let Some(r) = f.test.lock().unwrap().clone() {
+                f.testing = false;
+                match r {
+                    Ok(t) => ui.label(RichText::new(format!("✓ Channel {}: {t}", f.first)).color(OK)),
+                    Err(t) => ui.label(RichText::new(format!("✕ Channel {}: {t}", f.first)).color(BAD)),
+                };
+            } else if f.testing {
+                ui.horizontal(|ui| { ui.spinner(); ui.label(RichText::new("Testing connection…").color(MUTED())); });
+            }
+            if !f.err.is_empty() { ui.label(RichText::new(&f.err).color(BAD)); }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!f.testing, egui::Button::new("Test first channel")).clicked() {
+                    if f.cam.host.trim().is_empty() { f.err = "Required: IP / Host".into(); }
+                    else { f.err.clear(); *f.test.lock().unwrap() = None; f.testing = true; probe(f.cam.url(), f.test.clone(), ctx.clone()); }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(primary(&format!("Add {} channels", f.count.min(free)))).clicked() {
+                        if f.cam.host.trim().is_empty() { f.err = "Required: IP / Host".into(); }
+                        else if free == 0 { f.err = format!("You already have {MAX_CH} cameras").into(); }
+                        else { create = true; }
+                    }
+                    if ui.button("Cancel").clicked() { close = true; }
+                });
+            });
+        });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { close = true; }
+        if create {
+            let f = self.nvr.take().unwrap();
+            let name = if f.name.trim().is_empty() { "NVR".to_string() } else { f.name.trim().to_string() };
+            for k in 0..f.count.min(free) {
+                let mut c = f.cam.clone();
+                c.host = c.host.trim().into();
+                c.channel = f.first + k;
+                c.name = format!("{name} CH{}", c.channel);
+                self.store.camera.push(c);
+            }
+            self.save();
+            self.restart_streams(ctx);
+        } else if close {
+            self.nvr = None;
+        }
+    }
+
+    fn editor_ui(&mut self, ctx: &egui::Context) {
+        let Some(ed) = &mut self.editor else { return };
+        let mut close = false;
+        let mut save = false;
+        let title = if ed.idx.is_some() { "Edit camera" } else { "New camera" };
+        egui::Window::new(title).collapsible(false).resizable(false).min_width(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
+            let c = &mut ed.cam;
+            egui::Grid::new("camform").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
+                ui.label(RichText::new("Name").color(MUTED()));
+                ui.add(egui::TextEdit::singleline(&mut c.name).hint_text("e.g. Yard").desired_width(260.0));
+                ui.end_row();
+
+                ui.label(RichText::new("Type").color(MUTED()));
+                let before = c.proto;
+                egui::ComboBox::from_id_salt("proto").selected_text(c.proto.label()).width(260.0).show_ui(ui, |ui| {
+                    for p in Proto::ALL { ui.selectable_value(&mut c.proto, p, p.label()); }
+                });
+                if before != c.proto && c.port == before.default_port() { c.port = c.proto.default_port(); }
+                ui.end_row();
+
+                ui.label(RichText::new("IP / Host").color(MUTED()));
+                ui.add(egui::TextEdit::singleline(&mut c.host).hint_text("e.g. 192.168.1.10").desired_width(260.0));
+                ui.end_row();
+
+                ui.label(RichText::new("RTSP port").color(MUTED()));
+                ui.add(egui::DragValue::new(&mut c.port).range(1..=65535));
+                ui.end_row();
+
+                if c.proto == Proto::Custom {
+                    ui.label(RichText::new("Path").color(MUTED()));
+                    ui.add(egui::TextEdit::singleline(&mut c.path).hint_text("live1.264").desired_width(260.0));
+                    ui.end_row();
+                }
+
+                if matches!(c.proto, Proto::XMeye | Proto::Hikvision | Proto::Dahua) {
+                    ui.label(RichText::new("Channel").color(MUTED()));
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut c.channel).range(1..=64));
+                        ui.label(RichText::new("1 for a camera, or the NVR channel number").color(MUTED()).small());
+                    });
+                    ui.end_row();
+                }
+
+                ui.label(RichText::new("Username").color(MUTED()));
+                ui.add(egui::TextEdit::singleline(&mut c.user).desired_width(260.0));
+                ui.end_row();
+
+                ui.label(RichText::new("Password").color(MUTED()));
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut c.pass).password(!ed.show_pass).desired_width(214.0));
+                    if ui.small_button(if ed.show_pass { "🙈" } else { "👁" }).clicked() { ed.show_pass ^= true; }
+                });
+                ui.end_row();
+
+                ui.label(RichText::new("Stream").color(MUTED()));
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut c.main_stream, false, "Sub (light)");
+                    ui.selectable_value(&mut c.main_stream, true, "Main (HD)");
+                });
+                ui.end_row();
+            });
+            ui.add_space(4.0);
+            ui.label(RichText::new(c.safe_url()).color(MUTED()).small().monospace());
+            ui.add_space(6.0);
+
+            // αποτέλεσμα δοκιμής
+            if let Some(r) = ed.test.lock().unwrap().clone() {
+                ed.testing = false;
+                match r {
+                    Ok(t) => ui.label(RichText::new(format!("✓ {t}")).color(OK)),
+                    Err(t) => ui.label(RichText::new(format!("✕ {t}")).color(BAD)),
+                };
+            } else if ed.testing {
+                ui.horizontal(|ui| { ui.spinner(); ui.label(RichText::new("Testing connection…").color(MUTED())); });
+            }
+
+            ui.add_space(6.0);
+            ui.separator();
+            if !ed.err.is_empty() { ui.label(RichText::new(&ed.err).color(BAD)); }
+            ui.horizontal(|ui| {
+                let missing = |c: &Camera, need_name: bool| -> String {
+                    let mut m = vec![];
+                    if need_name && c.name.trim().is_empty() { m.push("Name"); }
+                    if c.host.trim().is_empty() { m.push("IP / Host"); }
+                    if m.is_empty() { String::new() } else { format!("Required: {}", m.join(", ")) }
+                };
+                if ui.add_enabled(!ed.testing, egui::Button::new("Test connection")).clicked() {
+                    ed.err = missing(c, false);
+                    if ed.err.is_empty() {
+                        *ed.test.lock().unwrap() = None;
+                        ed.testing = true;
+                        probe(c.url(), ed.test.clone(), ctx.clone());
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add(primary("Save")).clicked() {
+                        ed.err = missing(c, true);
+                        if ed.err.is_empty() { save = true; }
+                    }
+                    if ui.button("Cancel").clicked() { close = true; }
+                });
+            });
+        });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) { close = true; }
+        if save {
+            let ed = self.editor.take().unwrap();
+            let mut cam = ed.cam;
+            cam.name = cam.name.trim().into();
+            cam.host = cam.host.trim().into();
+            match ed.idx { Some(i) => self.store.camera[i] = cam, None => self.store.camera.push(cam) }
+            self.save();
+            self.restart_streams(ctx);
+        } else if close {
+            self.editor = None;
+        }
+    }
+
+    // ── Ρυθμίσεις ──
+    fn settings_ui(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().frame(egui::Frame::none().fill(Color32::TRANSPARENT).inner_margin(egui::Margin::same(24.0))).show(ctx, |ui| {
+            screen_title(ui, "Apply", "Settings");
+            ui.add_space(12.0);
+            glass_frame().show(ui, |ui| {
+                ui.label(RichText::new("Theme").strong());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    for (i, (name, p)) in THEMES.iter().enumerate() {
+                        let sel = self.store.settings.theme == i as u32;
+                        let (r, resp) = ui.allocate_exact_size(egui::vec2(120.0, 64.0), egui::Sense::click());
+                        let pt = ui.painter();
+                        pt.rect_filled(r, 8.0, p.bg);
+                        pt.rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 16.0)), egui::Rounding { nw: 8.0, ne: 8.0, sw: 0.0, se: 0.0 }, p.panel);
+                        pt.rect_filled(egui::Rect::from_min_size(r.min + egui::vec2(10.0, 26.0), egui::vec2(40.0, 10.0)), 3.0, p.accent);
+                        pt.text(r.left_bottom() + egui::vec2(10.0, -8.0), egui::Align2::LEFT_BOTTOM, *name, egui::FontId::proportional(13.0), p.text);
+                        pt.rect_stroke(r, 8.0, if sel { Stroke::new(2.0, ACCENT()) } else { Stroke::new(1.0, BORDER()) });
+                        if resp.clicked() && !sel {
+                            self.store.settings.theme = i as u32;
+                            self.settings_draft.theme = i as u32;
+                            apply_theme(ctx, i as u32);
+                            let _ = self.store.save();
+                        }
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            glass_frame().show(ui, |ui| {
+                ui.label(RichText::new("View quality").strong());
+                ui.label(RichText::new("Lower resolution/FPS = less CPU on this computer.").color(MUTED()).small());
+                ui.add_space(6.0);
+                let d = &mut self.settings_draft;
+                ui.horizontal(|ui| {
+                    for (w, h, t) in [(640, 360, "360p"), (960, 540, "540p"), (1280, 720, "720p"), (1920, 1080, "1080p")] {
+                        if ui.selectable_label(d.width == w, t).clicked() { d.width = w; d.height = h; }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("FPS").color(MUTED()));
+                    ui.add(egui::Slider::new(&mut d.fps, 2..=25));
+                });
+                ui.add_space(4.0);
+                if ui.checkbox(&mut self.store.settings.show_clock, "Clock with seconds on the video (LIVE badge)").changed() {
+                    d.show_clock = self.store.settings.show_clock;
+                    let _ = self.store.save();
+                }
+                ui.add_space(6.0);
+                if ui.add(primary("Apply")).clicked() {
+                    self.store.settings = self.settings_draft.clone();
+                    self.save();
+                    self.restart_streams(ctx);
+                }
+            });
+            ui.add_space(12.0);
+            glass_frame().show(ui, |ui| {
+                ui.label(RichText::new("Admin account").strong());
+                ui.label(RichText::new("Change the login password for this app.").color(MUTED()).small());
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.login_pass).password(true).hint_text("New password").desired_width(180.0));
+                    ui.add(egui::TextEdit::singleline(&mut self.login_pass2).password(true).hint_text("Repeat").desired_width(180.0));
+                    if ui.button("Change").clicked() {
+                        if self.login_pass.len() < 4 { self.toast("Password needs at least 4 characters"); }
+                        else if self.login_pass != self.login_pass2 { self.toast("Passwords do not match"); }
+                        else {
+                            let (u, p) = (self.store.admin_user.clone(), self.login_pass.clone());
+                            self.store.set_admin(&u, &p);
+                            self.login_pass.clear();
+                            self.login_pass2.clear();
+                            self.save();
+                        }
+                    }
+                });
+            });
+            ui.add_space(12.0);
+            ui.label(RichText::new(format!("Config file: {}", store_path().display())).color(MUTED()).small());
+            ui.label(RichText::new("Keys: 1–7 full view of a channel · Esc grid · F11 fullscreen · double-click a channel").color(MUTED()).small());
+        });
+    }
+
+    fn toast_ui(&mut self, ctx: &egui::Context) {
+        let Some((t, at)) = &self.toast else { return };
+        let age = at.elapsed().as_secs_f32();
+        if age > 2.5 { self.toast = None; return; }
+        // γρήγορη είσοδος, γρήγορη έξοδος (opacity μόνο)
+        let a = (age / 0.15).min(1.0) * ((2.5 - age) / 0.2).min(1.0);
+        egui::Area::new(egui::Id::new("toast")).anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0)).show(ctx, |ui| {
+            egui::Frame::none().fill(SURFACE().gamma_multiply(a)).stroke(Stroke::new(1.0, BORDER().gamma_multiply(a))).rounding(8.0)
+                .inner_margin(egui::Margin::symmetric(14.0, 8.0)).show(ui, |ui| ui.label(RichText::new(t.as_str()).color(TEXT().gamma_multiply(a))));
+        });
+        ctx.request_repaint();
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
+        ambient_glow(ctx);
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
+        }
+        if !self.logged_in {
+            self.login_ui(ctx);
+        } else {
+            self.top_bar(ctx);
+            match self.page {
+                Page::Live => self.live_ui(ctx),
+                Page::Cameras => self.cameras_ui(ctx),
+                Page::Settings => self.settings_ui(ctx),
+            }
+        }
+        self.toast_ui(ctx);
+        ctx.request_repaint_after(Duration::from_millis(250));
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 780.0]).with_min_inner_size([720.0, 480.0]).with_title("NVRDeck"),
+        ..Default::default()
+    };
+    eframe::run_native("nvrdeck", opts, Box::new(|cc| Ok(Box::new(App::new(cc))))).map_err(|e| anyhow::anyhow!("{e}"))
+}

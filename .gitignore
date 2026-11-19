@@ -1,0 +1,23 @@
+# Rust
+desktop/target/
+
+# Android / Gradle
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+*.iml
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# Local config / secrets (never commit)
+*.toml.bak
+.env
+nvrdeck.toml
+
+# OS / editors
+.DS_Store
+.vscode/

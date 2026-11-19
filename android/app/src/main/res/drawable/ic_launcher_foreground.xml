@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <!-- εξωτερικός δακτύλιος φακού -->
+    <path android:pathData="M54,54m-22,0a22,22 0,1 1,44 0a22,22 0,1 1,-44 0">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="linear" android:startX="34" android:startY="34" android:endX="76" android:endY="76">
+                <item android:offset="0" android:color="#FF9C8FFF"/>
+                <item android:offset="1" android:color="#FF5EE6FF"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- σκούρο εσωτερικό -->
+    <path android:pathData="M54,54m-16.5,0a16.5,16.5 0,1 1,33 0a16.5,16.5 0,1 1,-33 0" android:fillColor="#0D0E15"/>
+    <!-- κόρη φακού -->
+    <path android:pathData="M54,54m-9,0a9,9 0,1 1,18 0a9,9 0,1 1,-18 0">
+        <aapt:attr name="android:fillColor">
+            <gradient android:type="radial" android:centerX="51" android:centerY="51" android:gradientRadius="12">
+                <item android:offset="0" android:color="#FF8B7CFF"/>
+                <item android:offset="1" android:color="#FF1B1D2A"/>
+            </gradient>
+        </aapt:attr>
+    </path>
+    <!-- ανταύγεια -->
+    <path android:pathData="M50,50m-2.6,0a2.6,2.6 0,1 1,5.2 0a2.6,2.6 0,1 1,-5.2 0" android:fillColor="#E6FFFFFF"/>
+    <!-- κουκκίδα REC -->
+    <path android:pathData="M72,36m-4.5,0a4.5,4.5 0,1 1,9 0a4.5,4.5 0,1 1,-9 0" android:fillColor="#FF5C7A"/>
+</vector>

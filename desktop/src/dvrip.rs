@@ -123,7 +123,7 @@ impl Dvr {
         let mut out = vec![];
         let mut from = begin.to_string();
         // το καταγραφικό επιστρέφει έως ~64 αρχεία ανά κλήση· συνεχίζουμε από το τελευταίο
-        for _ in 0..50 {
+        for _ in 0..400 {
             let r = self.call(1440, json!({"Name": "OPFileQuery", "SessionID": sid, "OPFileQuery": {
                 "BeginTime": from, "EndTime": end, "Channel": channel, "DriverTypeMask": "0x0000FFFF",
                 "Event": event, "Type": "h264",
@@ -251,7 +251,7 @@ impl Dvr {
 
 /// Σταδιακή αφαίρεση κεφαλίδων καρέ: δίνουμε κομμάτια, παίρνουμε ολόκληρα καρέ βίντεο (Annex-B).
 #[derive(Default)]
-pub struct FrameParser { buf: Vec<u8>, pub time: String, pub fps: u32, pub hevc: bool, pub width: u32, pub height: u32 }
+pub struct FrameParser { buf: Vec<u8>, pub media: u8, pub time: String, pub fps: u32, pub hevc: bool, pub width: u32, pub height: u32 }
 
 impl FrameParser {
     /// Επιστρέφει (καρέ, είναι I-frame)
@@ -274,7 +274,8 @@ impl FrameParser {
                 let dt = u32::from_le_bytes([b[i + 8], b[i + 9], b[i + 10], b[i + 11]]);
                 self.time = format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", 2000 + (dt >> 26), (dt >> 22) & 15, (dt >> 17) & 31, (dt >> 12) & 31, (dt >> 6) & 63, dt & 63);
                 self.fps = (b[i + 5] as u32).clamp(1, 60);
-                self.hevc = b[i + 4] == 3 || b[i + 4] == 0x12;
+                self.media = b[i + 4];
+                self.hevc = matches!(b[i + 4], 3 | 0x12 | 0x13);
                 self.width = b[i + 6] as u32 * 8;
                 self.height = b[i + 7] as u32 * 8;
             }
@@ -288,7 +289,7 @@ impl FrameParser {
 
 /// (fps, H.265;) από την πρώτη κεφαλίδα I-frame (0x000001FC: byte 4 = τύπος, byte 5 = fps).
 pub fn stream_info(raw: &[u8]) -> (u32, bool) {
-    raw.windows(6).find(|w| w[..4] == [0, 0, 1, 0xFC]).map(|w| (w[5] as u32, w[4] == 3 || w[4] == 0x12)).unwrap_or((15, false))
+    raw.windows(6).find(|w| w[..4] == [0, 0, 1, 0xFC]).map(|w| (w[5] as u32, matches!(w[4], 3 | 0x12 | 0x13))).unwrap_or((15, false))
 }
 
 /// Αφαιρεί τις κεφαλίδες καρέ του XMeye (0x000001FC/FD/FA/F9) ώστε να μείνει καθαρό H.264/H.265 bitstream.

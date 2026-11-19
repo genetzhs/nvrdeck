@@ -784,6 +784,8 @@ struct App {
     qr: Option<QrState>,
     media: Vec<(PathBuf, bool, std::time::SystemTime, u64)>,
     pb: NvrPb,
+    rec_health: Arc<Mutex<Option<RecHealth>>>,
+    rec_health_on: bool,
     det_tx: Option<std::sync::mpsc::Sender<(usize, Vec<u8>)>>,
     det_rx: Option<std::sync::mpsc::Receiver<(usize, Vec<detect::Hit>)>>,
     det_busy: std::collections::HashSet<usize>,
@@ -817,11 +819,39 @@ struct NvrPb {
     mark_in: Option<chrono::NaiveDateTime>,
     mark_out: Option<chrono::NaiveDateTime>,
     export: Arc<Mutex<ExportJob>>,
+    events_open: bool,
+    ev_filter: u8,                       // 0 όλα, 1 άνθρωποι, 2 οχήματα
+    thumbs: Arc<Mutex<ThumbStore>>,
+    thumb_tex: std::collections::HashMap<String, egui::TextureHandle>,
+    indexed_key: String,
+    hover_req: Option<(u32, chrono::NaiveDateTime, Instant)>,
 }
+
+/// Μικρογραφίες + αποτελέσματα αναγνώρισης ανά κλειδί "κανάλι@ώρα".
+#[derive(Default)]
+struct ThumbStore {
+    img: std::collections::HashMap<String, Arc<Vec<u8>>>,   // RGBA TW×TH
+    tags: std::collections::HashMap<String, Vec<(usize, f32)>>, // (κλάση, βαθμός)
+    pending: std::collections::HashSet<String>,
+    queue: std::collections::VecDeque<(String, Camera, dvrip::RecFile, chrono::NaiveDateTime, bool)>, // (κλειδί, κάμερα, αρχείο, στιγμή, αναγνώριση)
+    worker: bool,
+    progress: (usize, usize),
+}
+const TW: usize = 320;
+const TH: usize = 180;
 #[derive(Default)]
 struct ExportJob { busy: bool, msg: String, done: Vec<PathBuf> }
 #[derive(Default)]
 struct DlJob { name: String, bytes: u64, total: u64, busy: bool, done: Option<Result<PathBuf, String>> }
+
+/// Υγεία καταγραφικού (ενημερώνεται κάθε 10 λεπτά στο παρασκήνιο)
+#[derive(Clone, Default)]
+struct RecHealth {
+    disks: usize, total_mb: u64, free_mb: u64,
+    chans: Vec<(u32, String, Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>)>, // (κανάλι, όνομα, παλαιότερη, πιο πρόσφατη)
+    checked: Option<chrono::NaiveDateTime>,
+    err: String,
+}
 
 struct QrState { pass: String, pass2: String, tex: Option<egui::TextureHandle>, err: String, n: usize }
 
@@ -837,7 +867,7 @@ impl App {
               scan: Arc::new(Mutex::new(ScanState::default())), scan_open: false, nvr: None,
               hd: None, zoom: 1.0, zoom_c: egui::pos2(0.5, 0.5), recs: Default::default(),
               inbox: Arc::new(Mutex::new(vec![])), health: vec![], last_tick: Instant::now(),
-              wall: false, chrome: true, login_show: false, qr: None, media: vec![], pb: NvrPb::default(), det_tx: None, det_rx: None, det_busy: Default::default(), det_known: Default::default() }
+              wall: false, chrome: true, login_show: false, qr: None, media: vec![], pb: NvrPb::default(), rec_health: Default::default(), rec_health_on: false, det_tx: None, det_rx: None, det_busy: Default::default(), det_known: Default::default() }
     }
 
     fn restart_streams(&mut self, ctx: &egui::Context) {
@@ -1001,6 +1031,13 @@ impl App {
 
     fn enter(&mut self, ctx: &egui::Context) {
         self.login_show = false;
+        if !self.rec_health_on {
+            if let Some(g) = self.nvr_groups().into_iter().next() {
+                self.rec_health_on = true;
+                let cam = self.store.camera[g[0].0].clone();
+                rec_health_worker(cam, g.iter().map(|x| (x.1, x.2.clone())).collect(), self.rec_health.clone(), self.store.settings.alerts, ctx.clone());
+            }
+        }
         self.logged_in = true;
         self.login_err.clear();
         self.login_pass.clear();
@@ -1949,6 +1986,23 @@ fn nvr_test() -> anyhow::Result<()> {
                                                Ok(None) => {}, Err(e) => { println!("  alarm error {e}"); break } }
                     }
                 }
+                if std::env::var_os("NVRDECK_THUMB").is_some() && ch > 1 {
+                    let day = chrono::Local::now().format("%Y-%m-%d").to_string();
+                    for k in 1..=5u32 {
+                        let mot = d.files(k, &format!("{day} 00:00:00"), &format!("{day} 23:59:59"), "M").unwrap_or_default();
+                        let Some(f) = mot.last() else { println!("  idx{k}: no motion clips"); continue };
+                        let at = parse_t(&f.begin).unwrap() + chrono::Duration::seconds(3);
+                        let t = Instant::now();
+                        match grab_frame(c, f, at) {
+                            Ok(img) => {
+                                let det = detect::Detector::new()?;
+                                let hits = det.run(&img, TW, TH, 0.4)?;
+                                println!("  idx{k}: {} motion clips · frame at {} in {:.1}s · {:?}", mot.len(), at.format("%H:%M:%S"), t.elapsed().as_secs_f32(), hits.iter().map(|h| detect::label(h.class).unwrap()).collect::<Vec<_>>());
+                            }
+                            Err(e) => println!("  idx{k}: grab failed: {e}"),
+                        }
+                    }
+                }
                 if std::env::var_os("NVRDECK_SEEK2").is_some() && ch > 1 {
                     let day = chrono::Local::now().format("%Y-%m-%d").to_string();
                     let want = format!("{day} 12:00:00");
@@ -2388,6 +2442,22 @@ impl App {
         }
         if !self.pb.players.is_empty() { ctx.request_repaint_after(Duration::from_millis(150)); }
         let files = self.pb.day_files.lock().unwrap().clone();
+        // #2/#3: κάθε κλιπ κίνησης → μικρογραφία (+3 s) και αναγνώριση ανθρώπων/οχημάτων, στο παρασκήνιο
+        if let Some(Ok(map)) = &files {
+            let ik = format!("{gi}/{date}");
+            if self.pb.indexed_key != ik {
+                self.pb.indexed_key = ik;
+                { let mut st = self.pb.thumbs.lock().unwrap(); st.queue.clear(); st.progress = (0, 0); }
+                for (ch, (_, mot)) in map {
+                    for f in mot.iter().rev() {
+                        if let Some(a) = parse_t(&f.begin) {
+                            let at = a + chrono::Duration::seconds(3);
+                            thumb_request(&self.pb.thumbs, ctx, format!("{ch}@{at}"), &cam, f, at, true, false);
+                        }
+                    }
+                }
+            }
+        }
 
         // πλήκτρα: διάστημα παύση, ←/→ ±30s
         let (sp, left, right) = ctx.input(|i| (i.key_pressed(egui::Key::Space), i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight)));
@@ -2400,6 +2470,85 @@ impl App {
             if let Some(c) = self.pb.cursor { if left || right { let t = c + chrono::Duration::seconds(if left { -30 } else { 30 }); self.pb_seek(&cam, t, ctx); } }
         }
 
+        // ── αριστερή στήλη: συμβάντα (κίνηση, άνθρωποι, οχήματα) ──
+        let mut ev_seek: Option<chrono::NaiveDateTime> = None;
+        if self.pb.events_open {
+            egui::SidePanel::left("pbev").exact_width(300.0).resizable(false)
+                .frame(egui::Frame::none().fill(if pal().dark { Color32::from_rgba_unmultiplied(14, 14, 16, 200) } else { PANEL() }).inner_margin(egui::Margin::same(14.0)).stroke(Stroke::new(1.0, BORDER())))
+                .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Events").font(semibold(18.0)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { if ui.small_button("✕").clicked() { self.pb.events_open = false; } });
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    for (k, n) in [(0u8, "All motion"), (1, "People"), (2, "Vehicles")] {
+                        let sel = self.pb.ev_filter == k;
+                        if ui.add(egui::Button::new(RichText::new(n).color(if sel { Color32::WHITE } else { TEXT() })).fill(if sel { ACCENT() } else { SURFACE() }).rounding(999.0)).clicked() { self.pb.ev_filter = k; }
+                    }
+                });
+                let (done, total) = self.pb.thumbs.lock().unwrap().progress;
+                if total > 0 && done < total {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| { ui.spinner(); ui.label(RichText::new(format!("Checking clips for people and vehicles… {done}/{total}")).small().color(MUTED())); });
+                    ctx.request_repaint_after(Duration::from_millis(400));
+                }
+                ui.add_space(8.0);
+                let mut evs: Vec<(u32, String, chrono::NaiveDateTime, chrono::NaiveDateTime)> = vec![];
+                if let Some(Ok(map)) = &files {
+                    for (ch, (_, mot)) in map {
+                        if self.pb.hidden.contains(ch) { continue; }
+                        let name = g.iter().find(|x| x.1 == *ch).map(|x| x.2.clone()).unwrap_or_default();
+                        for f in mot { if let (Some(a), Some(b)) = (parse_t(&f.begin), parse_t(&f.end)) { evs.push((*ch, name.clone(), a, b)); } }
+                    }
+                }
+                evs.sort_by(|x, y| y.2.cmp(&x.2));
+                let st = self.pb.thumbs.lock().unwrap();
+                let tags_of = |ch: u32, a: chrono::NaiveDateTime| st.tags.get(&format!("{ch}@{}", a + chrono::Duration::seconds(3))).cloned();
+                let shown: Vec<_> = evs.into_iter().filter(|e| match self.pb.ev_filter {
+                    1 => tags_of(e.0, e.2).map_or(false, |t| t.iter().any(|x| x.0 == 0)),
+                    2 => tags_of(e.0, e.2).map_or(false, |t| t.iter().any(|x| matches!(x.0, 1 | 2 | 3 | 5 | 7))),
+                    _ => true }).collect();
+                let imgs: Vec<Option<Arc<Vec<u8>>>> = shown.iter().map(|e| st.img.get(&format!("{}@{}", e.0, e.2 + chrono::Duration::seconds(3))).cloned()).collect();
+                let tags: Vec<Option<Vec<(usize, f32)>>> = shown.iter().map(|e| tags_of(e.0, e.2)).collect();
+                drop(st);
+                if shown.is_empty() {
+                    ui.label(RichText::new(match (&files, self.pb.ev_filter) { (None, _) => "Loading…", (_, 0) => "No motion on this day.", _ => "Nothing found yet for this filter." }).color(MUTED()));
+                }
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    for (k, (ch, name, a, b)) in shown.iter().enumerate() {
+                        let key = format!("{ch}@{}", *a + chrono::Duration::seconds(3));
+                        let tex = imgs[k].as_ref().map(|im| self.pb.thumb_tex.entry(key.clone()).or_insert_with(|| ctx.load_texture(&key, egui::ColorImage::from_rgba_unmultiplied([TW, TH], im), egui::TextureOptions::LINEAR)).clone());
+                        let r = egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0, BORDER())).rounding(12.0).inner_margin(egui::Margin::same(8.0)).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let (ir, _) = ui.allocate_exact_size(egui::vec2(112.0, 63.0), egui::Sense::hover());
+                                ui.painter().rect_filled(ir, 8.0, Color32::from_rgb(5, 6, 10));
+                                if let Some(t) = &tex { let mut rs = egui::epaint::RectShape::filled(ir, 8.0, Color32::WHITE); rs.fill_texture_id = t.id(); rs.uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)); ui.painter().add(rs); }
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(a.format("%H:%M:%S").to_string()).monospace().strong());
+                                    ui.label(RichText::new(format!("{name} · {} s", (*b - *a).num_seconds())).small().color(MUTED()));
+                                    match &tags[k] {
+                                        Some(t) if !t.is_empty() => {
+                                            let mut seen = vec![];
+                                            let txt: Vec<&str> = t.iter().filter_map(|x| detect::label(x.0)).filter(|l| { let n = !seen.contains(l); if n { seen.push(*l); } n }).collect();
+                                            ui.label(RichText::new(txt.join(" · ")).small().color(Color32::from_rgb(255, 176, 32)));
+                                        }
+                                        Some(_) => { ui.label(RichText::new("motion only").small().color(MUTED())); }
+                                        None => { ui.label(RichText::new("checking…").small().color(MUTED())); }
+                                    }
+                                });
+                            });
+                        }).response;
+                        let r = ui.interact(r.rect, ui.id().with(("ev", k)), egui::Sense::click());
+                        if r.hovered() { ui.painter().rect_stroke(r.rect, 12.0, Stroke::new(1.0, ACCENT().gamma_multiply(0.7))); }
+                        if r.clicked() { ev_seek = Some(*a - chrono::Duration::seconds(2)); self.pb.big = Some(*ch); }
+                        ui.add_space(6.0);
+                    }
+                });
+            });
+        }
+
         // ── δεξιά στήλη: ημερολόγιο, κανάλια, έλεγχοι ──
         let mut seek_to: Option<chrono::NaiveDateTime> = None;
         egui::SidePanel::right("pbside").exact_width(300.0).resizable(false)
@@ -2410,6 +2559,7 @@ impl App {
                 ui.label(RichText::new("Playback").font(semibold(20.0)).extra_letter_spacing(-0.5));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("This computer").clicked() { self.pb.local = true; self.pb.players.clear(); }
+                    if ui.add(egui::Button::new(if self.pb.events_open { "Events ✓" } else { "Events" }).small()).clicked() { self.pb.events_open ^= true; }
                 });
             });
             if groups.len() > 1 {
@@ -2458,6 +2608,12 @@ impl App {
             ui.add_space(14.0);
             ui.separator();
             ui.add_space(8.0);
+            if let Some(h) = self.rec_health.lock().unwrap().clone() {
+                health_card(ui, &h);
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+            }
             ui.label(RichText::new("CHANNELS").small().color(MUTED()).extra_letter_spacing(1.2));
             let mut changed = false;
             for (_, ch, name) in &g {
@@ -2653,6 +2809,37 @@ impl App {
                 }
             }
             let preview = self.pb.drag.or_else(|| resp.hover_pos().map(|h| sec_of(h.x)));
+            // #4: μικρογραφία της στιγμής κάτω από τον κέρσορα (στη σειρά του καναλιού που δείχνει)
+            if let (Some(sv), Some(hp)) = (preview, resp.hover_pos()) {
+                let row = (((hp.y - bar.top()) / (row_h + 3.0)).floor().max(0.0) as usize).min(visible.len().saturating_sub(1));
+                if let (Some((ch, _)), Some(Ok(m))) = (visible.get(row), &files) {
+                    let t = day0 + chrono::Duration::seconds(((sv / 10.0).round() * 10.0) as i64);
+                    if let Some(f) = m.get(ch).and_then(|x| x.0.iter().find(|f| matches!((parse_t(&f.begin), parse_t(&f.end)), (Some(a), Some(b)) if a <= t && t < b))) {
+                        let key = format!("{ch}@{t}");
+                        let ready = self.pb.thumbs.lock().unwrap().img.get(&key).cloned();
+                        match ready {
+                            Some(im) => {
+                                let tex = self.pb.thumb_tex.entry(key.clone()).or_insert_with(|| ctx.load_texture(&key, egui::ColorImage::from_rgba_unmultiplied([TW, TH], &im), egui::TextureOptions::LINEAR)).clone();
+                                let sz = egui::vec2(224.0, 126.0);
+                                let x = hp.x.clamp(bar.left() + sz.x / 2.0, bar.right() - sz.x / 2.0);
+                                let r = egui::Rect::from_min_size(egui::pos2(x - sz.x / 2.0, bar.top() - sz.y - 30.0), sz);
+                                let fp = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Tooltip, egui::Id::new("tlthumb")));
+                                fp.rect_filled(r.expand(3.0), 11.0, Color32::from_black_alpha(200));
+                                let mut rs = egui::epaint::RectShape::filled(r, 9.0, Color32::WHITE); rs.fill_texture_id = tex.id(); rs.uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)); fp.add(rs);
+                            }
+                            None => {
+                                // καθυστέρηση 350 ms ώστε να μη ζητάμε καρέ σε κάθε κίνηση του ποντικιού
+                                let same = self.pb.hover_req.as_ref().map_or(false, |h| h.0 == *ch && h.1 == t);
+                                if !same { self.pb.hover_req = Some((*ch, t, Instant::now())); }
+                                else if self.pb.hover_req.as_ref().map_or(false, |h| h.2.elapsed() > Duration::from_millis(350)) {
+                                    thumb_request(&self.pb.thumbs, ctx, key, &cam, f, t, false, true);
+                                }
+                                ctx.request_repaint_after(Duration::from_millis(120));
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(sv) = preview {
                 let x = x_of(sv);
                 p.line_segment([egui::pos2(x, bar.top() - 4.0), egui::pos2(x, bar.bottom())], Stroke::new(1.0, ACCENT()));
@@ -2667,7 +2854,7 @@ impl App {
                 if let Some(sv) = sv { seek_to = Some(day0 + chrono::Duration::milliseconds((sv * 1000.0) as i64)); }
             }
         });
-        if let Some(t) = seek_to { self.pb_seek(&cam, t, ctx); }
+        if let Some(t) = seek_to.or(ev_seek) { self.pb_seek(&cam, t, ctx); }
     }
 }
 
@@ -2842,4 +3029,141 @@ fn start_export(cam: Camera, chans: Vec<(u32, String)>, map: std::collections::B
         };
         ctx.request_repaint();
     });
+}
+
+/// Ένα καρέ από το NVR στη στιγμή `at` (πρώτο I-frame από εκεί), σε RGBA TW×TH.
+fn grab_frame(cam: &Camera, f: &dvrip::RecFile, at: chrono::NaiveDateTime) -> anyhow::Result<Vec<u8>> {
+    // αν δεν βγει καρέ σε εκείνη τη στιγμή (π.χ. κλιπ που γράφεται ακόμη), δοκιμή από την αρχή του κλιπ
+    grab_frame_at(cam, f, at).or_else(|_| match parse_t(&f.begin) { Some(b) if b != at => grab_frame_at(cam, f, b), _ => anyhow::bail!("no frame") })
+}
+
+fn grab_frame_at(cam: &Camera, f: &dvrip::RecFile, at: chrono::NaiveDateTime) -> anyhow::Result<Vec<u8>> {
+    let mut d = dvrip::Dvr::connect(&cam.host, dvrip::PORT, &cam.user, &cam.pass)?;
+    let mut parser = dvrip::FrameParser::default();
+    let mut key_frame: Option<Vec<u8>> = None;
+    let from = at.format("%Y-%m-%d %H:%M:%S").to_string();
+    let t0 = Instant::now();
+    d.stream_time(&cam.host, dvrip::PORT, f.channel, &from, &f.end, &f.name, 3, |chunk| {
+        for (frame, key) in parser.push(chunk) { if key { key_frame = Some(frame); return false; } }
+        t0.elapsed() < Duration::from_secs(8)
+    })?;
+    let kf = key_frame.ok_or_else(|| anyhow::anyhow!("no frame"))?;
+    if std::env::var_os("NVRDECK_DEBUG").is_some() {
+        let nals: Vec<String> = kf.windows(4).enumerate().filter(|(_, w)| w[..3] == [0, 0, 1]).take(6).map(|(i, _)| format!("{:02X}", kf.get(i + 3).copied().unwrap_or(0))).collect();
+        eprintln!("  media byte {:#04X} · {} bytes · NAL header bytes {:?}", parser.media, kf.len(), nals);
+    }
+    let mut ch = Command::new(tool("ffmpeg")).args(["-v", "error", "-f", if parser.hevc { "hevc" } else { "h264" }, "-i", "-", "-frames:v", "1", "-vf",
+        &format!("scale={TW}:{TH}:force_original_aspect_ratio=increase,crop={TW}:{TH}"), "-pix_fmt", "rgba", "-f", "rawvideo", "-"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    { let mut i = ch.stdin.take().unwrap(); let _ = std::io::Write::write_all(&mut i, &kf); }
+    let mut out = vec![];
+    ch.stdout.take().unwrap().read_to_end(&mut out)?;
+    let _ = ch.wait();
+    anyhow::ensure!(out.len() >= TW * TH * 4, "decode failed");
+    out.truncate(TW * TH * 4);
+    Ok(out)
+}
+
+/// Νήμα που φέρνει μικρογραφίες και (όπου ζητηθεί) τρέχει την αναγνώριση ανθρώπων/οχημάτων.
+fn thumb_worker(store: Arc<Mutex<ThumbStore>>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let det = detect::Detector::new().ok();
+        loop {
+            // οι αιτήσεις «hover» (χωρίς αναγνώριση) προηγούνται
+            let next = { let mut s = store.lock().unwrap();
+                let pos = s.queue.iter().position(|x| !x.4).or(if s.queue.is_empty() { None } else { Some(0) });
+                pos.and_then(|p| s.queue.remove(p)) };
+            let Some((key, cam, f, at, ai)) = next else { store.lock().unwrap().worker = false; return };
+            if let Ok(img) = grab_frame(&cam, &f, at) {
+                let tags = if ai { det.as_ref().and_then(|d| d.run(&img, TW, TH, 0.4).ok()).map(|h| h.iter().map(|x| (x.class, x.score)).collect()).unwrap_or_default() } else { vec![] };
+                let mut s = store.lock().unwrap();
+                s.img.insert(key.clone(), Arc::new(img));
+                if ai { s.tags.insert(key.clone(), tags); s.progress.0 += 1; }
+                s.pending.remove(&key);
+            } else {
+                let mut s = store.lock().unwrap();
+                s.pending.remove(&key);
+                if ai { s.tags.insert(key, vec![]); s.progress.0 += 1; }
+            }
+            ctx.request_repaint();
+        }
+    });
+}
+
+fn thumb_request(store: &Arc<Mutex<ThumbStore>>, ctx: &egui::Context, key: String, cam: &Camera, f: &dvrip::RecFile, at: chrono::NaiveDateTime, ai: bool, front: bool) {
+    let mut s = store.lock().unwrap();
+    if s.img.contains_key(&key) || s.pending.contains(&key) { return; }
+    s.pending.insert(key.clone());
+    let item = (key, cam.clone(), f.clone(), at, ai);
+    if front { s.queue.push_front(item) } else { s.queue.push_back(item) }
+    if ai { s.progress.1 += 1; }
+    if !s.worker { s.worker = true; drop(s); thumb_worker(store.clone(), ctx.clone()); }
+}
+
+/// Παρακολούθηση καταγραφικού: δίσκος, βάθος εγγραφών, κανάλια που σταμάτησαν να γράφουν.
+fn rec_health_worker(cam: Camera, chans: Vec<(u32, String)>, out: Arc<Mutex<Option<RecHealth>>>, alerts: bool, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let mut warned: std::collections::HashSet<u32> = Default::default();
+        loop {
+            let now = chrono::Local::now().naive_local();
+            let fmt = |t: chrono::NaiveDateTime| t.format("%Y-%m-%d %H:%M:%S").to_string();
+            let r = (|| -> anyhow::Result<RecHealth> {
+                let mut d = dvrip::Dvr::connect(&cam.host, dvrip::PORT, &cam.user, &cam.pass)?;
+                let (disks, total_mb, free_mb) = d.storage()?;
+                let mut v = vec![];
+                for (ch, name) in &chans {
+                    let idx = ch.saturating_sub(1);
+                    // παλαιότερη: πρώτη σελίδα από 120 μέρες πίσω · πιο πρόσφατη: τελευταίες 6 ώρες, αλλιώς 3 μέρες
+                    let oldest = d.files(idx, &fmt(now - chrono::Duration::days(120)), &fmt(now), "*").ok().and_then(|v| v.first().and_then(|f| parse_t(&f.begin)));
+                    let mut latest = d.files(idx, &fmt(now - chrono::Duration::hours(6)), &fmt(now), "*").ok().and_then(|v| v.iter().filter_map(|f| parse_t(&f.end)).max());
+                    if latest.is_none() { latest = d.files(idx, &fmt(now - chrono::Duration::days(3)), &fmt(now), "*").ok().and_then(|v| v.iter().filter_map(|f| parse_t(&f.end)).max()); }
+                    v.push((*ch, name.clone(), oldest, latest));
+                }
+                Ok(RecHealth { disks, total_mb, free_mb, chans: v, checked: Some(now), err: String::new() })
+            })();
+            let h = match r { Ok(h) => h, Err(e) => RecHealth { checked: Some(now), err: e.to_string(), ..out.lock().unwrap().clone().unwrap_or_default() } };
+            // ειδοποίηση: κανάλι που έγραφε το τελευταίο 24ωρο αλλά όχι τα τελευταία 30 λεπτά
+            for (ch, name, _, latest) in &h.chans {
+                let stale = latest.map_or(false, |l| now - l > chrono::Duration::minutes(30) && now - l < chrono::Duration::hours(24));
+                if stale && warned.insert(*ch) && alerts { desktop_notify(&format!("{name} stopped recording"), &format!("Last recording at {}.", latest.unwrap().format("%H:%M"))); }
+                if !stale { warned.remove(ch); }
+            }
+            *out.lock().unwrap() = Some(h);
+            ctx.request_repaint();
+            std::thread::sleep(Duration::from_secs(600));
+        }
+    });
+}
+
+fn health_card(ui: &mut egui::Ui, h: &RecHealth) {
+    let now = chrono::Local::now().naive_local();
+    ui.label(RichText::new("RECORDER").small().color(MUTED()).extra_letter_spacing(1.2));
+    ui.add_space(4.0);
+    if h.disks == 0 && h.total_mb == 0 {
+        ui.label(RichText::new(if h.err.is_empty() { "Checking…".to_string() } else { format!("Not reachable: {}", h.err) }).small().color(MUTED()));
+        return;
+    }
+    let used = h.total_mb.saturating_sub(h.free_mb) as f32 / h.total_mb.max(1) as f32;
+    let (r, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
+    ui.painter().rect_filled(r, 4.0, BORDER());
+    ui.painter().rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width() * used, r.height())), 4.0, if used > 0.98 { Color32::from_rgb(255, 176, 32) } else { ACCENT() });
+    ui.add_space(4.0);
+    let oldest = h.chans.iter().filter_map(|c| c.2).min();
+    let days = oldest.map(|o| (now - o).num_days()).unwrap_or(0);
+    ui.label(RichText::new(format!("{:.0} GB disk · {} · {} days of recordings", h.total_mb as f64 / 1024.0,
+        if h.free_mb == 0 { "full, overwriting oldest".to_string() } else { format!("{:.0} GB free", h.free_mb as f64 / 1024.0) }, days)).small().color(MUTED()));
+    ui.add_space(6.0);
+    for (_, name, _, latest) in &h.chans {
+        ui.horizontal(|ui| {
+            let (ok, txt) = match latest {
+                Some(l) if now - *l < chrono::Duration::minutes(30) => (true, "recording".to_string()),
+                Some(l) => (false, format!("stopped {}", if now - *l < chrono::Duration::hours(24) { l.format("%H:%M").to_string() } else { l.format("%d/%m").to_string() })),
+                None => (false, "no recordings".to_string()),
+            };
+            let (d, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+            ui.painter().circle_filled(d.center(), 3.5, if ok { OK } else { BAD });
+            ui.label(RichText::new(name.as_str()).small());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| { ui.label(RichText::new(txt).small().color(if ok { MUTED() } else { BAD })); });
+        });
+    }
 }

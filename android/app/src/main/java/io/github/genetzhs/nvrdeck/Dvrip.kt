@@ -85,7 +85,7 @@ class Dvr private constructor(private val host: String, private val port: Int, p
     fun files(channel: Int, begin: String, end: String, event: String): List<RecFile> {
         val all = mutableListOf<RecFile>()
         var from = begin
-        repeat(50) {
+        repeat(400) {
             val r = call(1440, buildJsonObject {
                 put("Name", "OPFileQuery"); put("SessionID", sid())
                 putJsonObject("OPFileQuery") {
@@ -218,7 +218,7 @@ fun remuxToMp4(src: File, dst: File) {
             }
             val t = h[3].toInt() and 0xFF
             val len: Int = when (t) {
-                0xFC -> { inp.readFully(h, 4, 12); fps = (h[5].toInt() and 0xFF).coerceIn(1, 60); hevc = (h[4].toInt() and 0xFF) == 3 || (h[4].toInt() and 0xFF) == 0x12; le32(h, 12) }
+                0xFC -> { inp.readFully(h, 4, 12); fps = (h[5].toInt() and 0xFF).coerceIn(1, 60); hevc = (h[4].toInt() and 0xFF) in intArrayOf(3, 0x12, 0x13); le32(h, 12) }
                 0xFD -> { inp.readFully(h, 4, 4); le32(h, 4) }
                 else -> { inp.readFully(h, 4, 4); (h[6].toInt() and 0xFF) or ((h[7].toInt() and 0xFF) shl 8) }
             }
@@ -316,7 +316,7 @@ class FrameParser {
             if (t == 0xFC) {
                 fps = (b[i + 5].toInt() and 0xFF).coerceIn(1, 60)
                 val ty = b[i + 4].toInt() and 0xFF
-                hevc = ty == 3 || ty == 0x12
+                hevc = ty == 3 || ty == 0x12 || ty == 0x13
                 width = (b[i + 6].toInt() and 0xFF) * 8; height = (b[i + 7].toInt() and 0xFF) * 8
                 val dt = le32(i + 8).toLong() and 0xFFFFFFFFL
                 base = java.time.LocalDateTime.of((2000 + (dt shr 26)).toInt(), ((dt shr 22) and 15).toInt().coerceIn(1, 12), ((dt shr 17) and 31).toInt().coerceIn(1, 31),

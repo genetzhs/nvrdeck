@@ -935,34 +935,34 @@ impl App {
                     ui.add_space(10.0);
                     ui.separator();
                     let cur = LAYOUTS[(self.store.settings.layout as usize).min(LAYOUTS.len() - 1)];
-                    let mut pick: Option<u32> = None;
-                    ui.menu_button(RichText::new(format!("▦  {cur}  ▾")).color(TEXT()), |ui| {
-                        ui.set_min_width(150.0);
-                        for (k, name) in LAYOUTS.iter().enumerate() {
-                            if ui.selectable_label(self.store.settings.layout == k as u32, *name).clicked() {
-                                pick = Some(k as u32);
-                                ui.close_menu();
-                            }
-                        }
-                        if matches!(self.store.settings.layout, 4 | 5 | 7) {
-                            ui.separator();
-                            ui.label(RichText::new("Click a channel to make it the main one").color(MUTED()).small());
-                        }
-                    });
                     let mut groups: Vec<String> = self.store.camera.iter().map(|c| c.group.trim().to_string()).filter(|g| !g.is_empty()).collect();
                     groups.sort(); groups.dedup();
-                    if !groups.is_empty() {
-                        let cur = if self.store.settings.group.is_empty() { "All cameras".to_string() } else { self.store.settings.group.clone() };
-                        let mut gpick: Option<String> = None;
-                        ui.menu_button(RichText::new(format!("◫  {cur}  ▾")).color(TEXT()), |ui| {
-                            ui.set_min_width(150.0);
-                            if ui.selectable_label(self.store.settings.group.is_empty(), "All cameras").clicked() { gpick = Some(String::new()); ui.close_menu(); }
-                            for g in &groups {
-                                if ui.selectable_label(&self.store.settings.group == g, g).clicked() { gpick = Some(g.clone()); ui.close_menu(); }
+                    let gsel = self.store.settings.group.clone();
+                    let label = if !gsel.is_empty() && groups.contains(&gsel) { format!("▦  {cur} · {gsel}  ▾") } else { format!("▦  {cur}  ▾") };
+                    let mut pick: Option<u32> = None;
+                    let mut gpick: Option<String> = None;
+                    // ένα μενού: διάταξη + ομάδες (όπως στο κινητό)
+                    ui.menu_button(RichText::new(label).color(TEXT()), |ui| {
+                        ui.set_min_width(180.0);
+                        ui.label(RichText::new("LAYOUT").small().color(MUTED()).extra_letter_spacing(1.2));
+                        for (k, name) in LAYOUTS.iter().enumerate() {
+                            let sel = self.store.settings.layout == k as u32;
+                            if ui.selectable_label(sel, if sel { format!("{name}  ✓") } else { name.to_string() }).clicked() { pick = Some(k as u32); ui.close_menu(); }
+                        }
+                        if matches!(self.store.settings.layout, 4 | 5 | 7) {
+                            ui.label(RichText::new("Click a channel to make it the main one").color(MUTED()).small());
+                        }
+                        if !groups.is_empty() {
+                            ui.separator();
+                            ui.label(RichText::new("GROUP").small().color(MUTED()).extra_letter_spacing(1.2));
+                            for g in std::iter::once(String::new()).chain(groups.iter().cloned()) {
+                                let sel = gsel == g;
+                                let n = if g.is_empty() { "All cameras".to_string() } else { g.clone() };
+                                if ui.selectable_label(sel, if sel { format!("{n}  ✓") } else { n }).clicked() { gpick = Some(g); ui.close_menu(); }
                             }
-                        });
-                        if let Some(g) = gpick { self.store.settings.group = g.clone(); self.settings_draft.group = g; self.solo = None; let _ = self.store.save(); }
-                    }
+                        }
+                    });
+                    if let Some(g) = gpick { self.store.settings.group = g.clone(); self.settings_draft.group = g; self.solo = None; let _ = self.store.save(); }
                     if let Some(k) = pick {
                         self.store.settings.layout = k;
                         self.settings_draft.layout = k;

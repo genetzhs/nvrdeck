@@ -80,6 +80,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 }
 
 class MainActivity : FragmentActivity() {
+    private fun handleClip(i: android.content.Intent?) {
+        val ch = i?.getIntExtra("clip_ch", -1) ?: -1; val t = i?.getLongExtra("clip_t", 0L) ?: 0L
+        if (ch > 0 && t > 0) { ClipRequest.flow.value = ch to t; i?.removeExtra("clip_ch") }
+    }
+    override fun onNewIntent(intent: android.content.Intent) { super.onNewIntent(intent); handleClip(intent) }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.setFlags(WindowManager.LayoutParams.FLAG_SECURE, WindowManager.LayoutParams.FLAG_SECURE)
@@ -89,6 +95,7 @@ class MainActivity : FragmentActivity() {
             layoutInDisplayCutoutMode = if (Build.VERSION.SDK_INT >= 30) WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS else WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
         }
         enableEdgeToEdge()
+        handleClip(intent)
         setContent {
             val vm: AppViewModel = viewModel()
             val data by vm.store.data.collectAsStateWithLifecycle()
@@ -255,6 +262,8 @@ fun MainScreen(store: Store, data: StoreData, onLock: () -> Unit) {
     }
     val latest by rememberUpdatedState(data)
     LaunchedEffect(Unit) { if (data.settings.aiAlerts) runCatching { AlertService.start(ctx) } }
+    val clip by ClipRequest.flow.collectAsStateWithLifecycle()
+    LaunchedEffect(clip) { if (clip != null) { solo = null; tab = 3 } }
     // Αυτόματη εύρεση καναλιών NVR που λείπουν: δοκιμάζει τα επόμενα κανάλια κάθε NVR και προσθέτει όσα δίνουν εικόνα
     LaunchedEffect(Unit) {
         kotlinx.coroutines.delay(3000)
@@ -384,6 +393,16 @@ fun LiveScreen(store: Store, data: StoreData, onSolo: (Long) -> Unit) {
         Column(Modifier.padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 10.dp)) {
             ScreenTitle(eyebrow = "${cams.size} cameras", title = "Live", leading = { StatusDot(cams.isNotEmpty(), 6.dp) }, right = {
                 // μενού διάταξης (και ομάδων) δεξιά από τον τίτλο
+                if (s.aiAlerts) {
+                    val armed = s.armed
+                    Row(Modifier.clip(RoundedCornerShape(50)).background(if (armed) c.up.copy(alpha = .16f) else c.glassStrong).border(1.dp, if (armed) c.up.copy(alpha = .4f) else c.glassBorder, RoundedCornerShape(50))
+                        .clickable { store.update { it.copy(settings = it.settings.copy(armed = !armed)) } }.padding(horizontal = 12.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(if (armed) Icons.Outlined.Shield else Icons.Outlined.RemoveModerator, null, tint = if (armed) c.up else c.muted, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(5.dp))
+                        Text(if (armed) "Armed" else "Disarmed", color = c.fg, fontFamily = Geist, fontWeight = FontWeight.Medium, fontSize = 13.sp)
+                    }
+                    Spacer(Modifier.width(8.dp))
+                }
                 var open by remember { mutableStateOf(false) }
                 Box {
                     Row(Modifier.clip(RoundedCornerShape(50)).background(c.glassStrong).border(1.dp, c.glassBorder, RoundedCornerShape(50))

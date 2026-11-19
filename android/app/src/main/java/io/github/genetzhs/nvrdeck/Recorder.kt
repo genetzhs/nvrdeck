@@ -120,6 +120,26 @@ fun RecorderDialog(store: Store, group: List<Camera>, onClose: () -> Unit) {
                     ZoneGrid(e.snap, e.region) { cfg = cfg?.copy(region = it) }
                     Row { TextButton({ cfg = e.copy(region = List(RH) { (1L shl RW) - 1 }) }) { Text("Select all") }; TextButton({ cfg = e.copy(region = List(RH) { 0L }) }) { Text("Clear") } }
                 }
+                if (tab == 0 && e != null) GlassCard(Modifier.fillMaxWidth()) {
+                    val live = store.data.collectAsState().value.cameras.firstOrNull { it.id == cam.id } ?: cam
+                    val z = AiZone.parse(live.aiZone)
+                    fun put(nz: AiZone?) = store.update { d -> d.copy(cameras = d.cameras.map { if (it.id == cam.id) it.copy(aiZone = nz?.enc() ?: "") else it }) }
+                    Eyebrow("Phone alert zone")
+                    Spacer(Modifier.height(6.dp))
+                    Text("Checked by NVRDeck, not the recorder. Area: alert only when a person or vehicle stands inside it. Line: alert only when one crosses it.", color = c.muted, fontSize = 12.5.sp)
+                    Spacer(Modifier.height(8.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(z == null, { put(null) }, { Text("Whole picture") })
+                        FilterChip(z?.line == false, { put(AiZone(false, .25f, .35f, .75f, .95f)) }, { Text("Area") })
+                        FilterChip(z?.line == true, { put(AiZone(true, .1f, .6f, .9f, .6f)) }, { Text("Line") })
+                    }
+                    if (z != null) {
+                        Spacer(Modifier.height(8.dp))
+                        Text("Drag on the picture to draw the ${if (z.line) "line" else "area"}.", color = c.muted, fontSize = 12.5.sp)
+                        Spacer(Modifier.height(6.dp))
+                        ZoneDraw(e.snap, z) { put(it) }
+                    }
+                }
                 if (tab == 1 && e != null) GlassCard(Modifier.fillMaxWidth()) {
                     Text("When this camera records to the recorder's disk", color = c.muted)
                     Spacer(Modifier.height(8.dp))
@@ -231,4 +251,28 @@ private fun RecorderTab(store: Store, cam: Camera, busy: Boolean, setBusy: (Bool
     if (confirm) AlertDialog({ confirm = false }, title = { Text("Restart the recorder?") }, text = { Text("Cameras come back in about a minute.") },
         confirmButton = { TextButton({ confirm = false; io { reboot(); "Restarting…" } }) { Text("Restart", color = c.down) } },
         dismissButton = { TextButton({ confirm = false }) { Text("Cancel") } })
+}
+
+@Composable
+private fun ZoneDraw(snap: android.graphics.Bitmap?, z: AiZone, onChange: (AiZone) -> Unit) {
+    val c = cine
+    val cur by rememberUpdatedState(z)
+    Box(Modifier.fillMaxWidth().aspectRatio(16f / 9f).clip(RoundedCornerShape(12.dp)).background(Color.Black)) {
+        snap?.let { Image(it.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds) }
+        var start by remember { mutableStateOf(Offset.Zero) }
+        Canvas(Modifier.fillMaxSize().pointerInput(Unit) {
+            fun n(o: Offset) = Offset((o.x / size.width).coerceIn(0f, 1f), (o.y / size.height).coerceIn(0f, 1f))
+            detectDragGestures(onDragStart = { start = n(it) }) { ch, _ -> val e = n(ch.position); onChange(cur.copy(a = start.x, b = start.y, c = e.x, d = e.y)) }
+        }) {
+            val p1 = Offset(z.a * size.width, z.b * size.height); val p2 = Offset(z.c * size.width, z.d * size.height)
+            if (z.line) {
+                drawLine(c.down, p1, p2, strokeWidth = 6f)
+                drawCircle(c.down, 9f, p1); drawCircle(c.down, 9f, p2)
+            } else {
+                val tl = Offset(minOf(p1.x, p2.x), minOf(p1.y, p2.y)); val sz = Size(kotlin.math.abs(p2.x - p1.x), kotlin.math.abs(p2.y - p1.y))
+                drawRect(c.down.copy(alpha = .22f), tl, sz)
+                drawRect(c.down, tl, sz, style = androidx.compose.ui.graphics.drawscope.Stroke(4f))
+            }
+        }
+    }
 }

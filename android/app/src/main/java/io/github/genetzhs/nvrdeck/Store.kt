@@ -23,7 +23,9 @@ class Store(context: Context) {
         EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
     )
 
-    private val _data = MutableStateFlow(load())
+    // ένα κοινό στιγμιότυπο δεδομένων για όλη τη διεργασία (εφαρμογή + υπηρεσία ειδοποιήσεων)
+    private val _data = synchronized(Store::class) { shared ?: MutableStateFlow(load()).also { shared = it } }
+    private companion object { var shared: MutableStateFlow<StoreData>? = null }
     val data: StateFlow<StoreData> = _data
 
     private fun load(): StoreData =

@@ -26,6 +26,7 @@ data class Camera(
     val path: String = "",
     val enabled: Boolean = true,
     val group: String = "",
+    val aiZone: String = "",
 ) {
     /** Διεύθυνση RTSP. Τα στοιχεία μπαίνουν στο userinfo (Digest/Basic από το Media3). */
     fun url(): String {
@@ -58,6 +59,7 @@ data class Settings(
     val autoHd: Boolean = true,
     val alerts: Boolean = true,
     val group: String = "",
+    val armed: Boolean = true,
     val widgetId: Long = 0,
     val aiAlerts: Boolean = false,
 )
@@ -73,3 +75,11 @@ data class StoreData(
 const val MAX_CH = 16
 
 val LAYOUTS = listOf("Auto", "1", "2×2", "2×3", "1 + 4", "1 + 5", "3×3")
+
+/** Ζώνη AI του κινητού: "R x0 y0 x1 y1" (περιοχή) ή "L x0 y0 x1 y1" (γραμμή), τιμές 0–1. */
+data class AiZone(val line: Boolean, val a: Float, val b: Float, val c: Float, val d: Float) {
+    fun enc() = "${if (line) "L" else "R"} $a $b $c $d"
+    companion object { fun parse(s: String): AiZone? { val p = s.trim().split(" "); if (p.size != 5) return null
+        val v = p.drop(1).map { it.toFloatOrNull() ?: return null }; return AiZone(p[0] == "L", v[0], v[1], v[2], v[3]) } }
+}
+object ClipRequest { val flow = kotlinx.coroutines.flow.MutableStateFlow<Pair<Int, Long>?>(null) }

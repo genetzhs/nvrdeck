@@ -72,6 +72,12 @@ fun PlaybackScreen(data: StoreData) {
     var big by remember { mutableStateOf<Int?>(null) }
     var seekReq by remember { mutableLongStateOf(0L) }   // αλλάζει → νέα αναπαραγωγή όλων
     var zoom by remember { mutableIntStateOf(0) }        // 0 = 24 ώρες, 1 = 6 ώρες, 2 = 1 ώρα
+    val clip by ClipRequest.flow.collectAsState()
+    var pending by remember { mutableStateOf<Pair<Int, Long>?>(null) }
+    LaunchedEffect(clip) { clip?.let { (ch, t) ->
+        pending = ch to t; ClipRequest.flow.value = null
+        val d = java.time.Instant.ofEpochMilli(t).atZone(ZoneId.systemDefault()).toLocalDate(); if (d != date) date = d
+    } }
     val day0 = date.atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
 
     LaunchedEffect(date, cam.host) {
@@ -97,6 +103,9 @@ fun PlaybackScreen(data: StoreData) {
         return f.all.values.flatten().map { ms(it.begin) }.filter { it > t }.minOrNull() ?: t
     }
     fun seek(t: Long) { val n = normalize(t); cursor = n; seekReq = n + (seekReq % 7) + 1 } // +k ώστε να αλλάζει πάντα
+
+    // από ειδοποίηση: λίγα δευτερόλεπτα πριν το συμβάν, μεγάλο το κανάλι
+    LaunchedEffect(files, pending) { val p = pending; if (files != null && p != null) { pending = null; big = p.first; zoom = 2; seek(p.second - 6_000) } }
 
     val players = remember { mutableStateMapOf<Int, NvrPlayer>() }
     // ρολόι: η πιο πρόσφατη ώρα από τα κανάλια που παίζουν

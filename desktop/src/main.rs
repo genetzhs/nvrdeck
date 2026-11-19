@@ -813,7 +813,13 @@ struct NvrPb {
     drag: Option<f64>,
     month: Option<chrono::NaiveDate>,
     big: Option<u32>,
+    /// εξαγωγή: αρχή/τέλος επιλογής και κατάσταση
+    mark_in: Option<chrono::NaiveDateTime>,
+    mark_out: Option<chrono::NaiveDateTime>,
+    export: Arc<Mutex<ExportJob>>,
 }
+#[derive(Default)]
+struct ExportJob { busy: bool, msg: String, done: Vec<PathBuf> }
 #[derive(Default)]
 struct DlJob { name: String, bytes: u64, total: u64, busy: bool, done: Option<Result<PathBuf, String>> }
 
@@ -2386,6 +2392,10 @@ impl App {
         // πλήκτρα: διάστημα παύση, ←/→ ±30s
         let (sp, left, right) = ctx.input(|i| (i.key_pressed(egui::Key::Space), i.key_pressed(egui::Key::ArrowLeft), i.key_pressed(egui::Key::ArrowRight)));
         if !ctx.wants_keyboard_input() {
+            if ctx.input(|i| i.key_pressed(egui::Key::I)) { self.pb.mark_in = self.pb.cursor; }
+            if ctx.input(|i| i.key_pressed(egui::Key::O)) { self.pb.mark_out = self.pb.cursor; }
+        }
+        if !ctx.wants_keyboard_input() {
             if sp { self.pb.paused ^= true; for (_, p) in &self.pb.players { p.pause.store(self.pb.paused, Ordering::Relaxed); } }
             if let Some(c) = self.pb.cursor { if left || right { let t = c + chrono::Duration::seconds(if left { -30 } else { 30 }); self.pb_seek(&cam, t, ctx); } }
         }
@@ -2464,6 +2474,31 @@ impl App {
             ui.add_space(10.0);
             ui.separator();
             ui.add_space(8.0);
+            ui.label(RichText::new("EXPORT CLIP").small().color(MUTED()).extra_letter_spacing(1.2));
+            ui.add_space(2.0);
+            let fmt = |t: Option<chrono::NaiveDateTime>| t.map(|t| t.format("%H:%M:%S").to_string()).unwrap_or_else(|| "--:--:--".into());
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(self.pb.cursor.is_some(), egui::Button::new(format!("Start  {}", fmt(self.pb.mark_in)))).on_hover_text("Mark the current time as the start (I)").clicked() { self.pb.mark_in = self.pb.cursor; }
+                if ui.add_enabled(self.pb.cursor.is_some(), egui::Button::new(format!("End  {}", fmt(self.pb.mark_out)))).on_hover_text("Mark the current time as the end (O)").clicked() { self.pb.mark_out = self.pb.cursor; }
+            });
+            let job_busy = self.pb.export.lock().unwrap().busy;
+            let range = match (self.pb.mark_in, self.pb.mark_out) { (Some(a), Some(b)) if b > a => Some((a, b)), _ => None };
+            let chans: Vec<(u32, String)> = g.iter().filter(|x| !self.pb.hidden.contains(&x.1)).map(|x| (x.1, x.2.clone())).collect();
+            let label = match range { Some((a, b)) => format!("Export {} min · {} ch", ((b - a).num_seconds() + 59) / 60, chans.len()), None => "Mark start and end first".into() };
+            if ui.add_enabled(range.is_some() && !job_busy && !chans.is_empty(), egui::Button::new(RichText::new(label).color(Color32::WHITE)).fill(ACCENT()).min_size(egui::vec2(ui.available_width(), 34.0))).clicked() {
+                if let (Some((a, b)), Some(Ok(map))) = (range, self.pb.day_files.lock().unwrap().clone()) {
+                    start_export(cam.clone(), chans.clone(), map, a, b, self.pb.export.clone(), ctx.clone());
+                }
+            }
+            {
+                let j = self.pb.export.lock().unwrap();
+                if !j.msg.is_empty() { ui.label(RichText::new(&j.msg).small().color(if j.busy { TEXT() } else { MUTED() })); }
+                if !j.busy && !j.done.is_empty() && ui.small_button("Open exports folder").clicked() { open_path(&media_dir(true).join("Exports")); }
+                if j.busy { ctx.request_repaint_after(Duration::from_millis(300)); }
+            }
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
             ui.label(RichText::new("PLAYBACK").small().color(MUTED()).extra_letter_spacing(1.2));
             ui.horizontal_wrapped(|ui| {
                 let label = if self.pb.paused { "▶  Play" } else { "⏸  Pause" };
@@ -2484,7 +2519,7 @@ impl App {
                 if ui.add_enabled(!self.pb.players.is_empty(), egui::Button::new("■ Stop")).clicked() { self.pb.players.clear(); }
             });
             ui.add_space(6.0);
-            ui.label(RichText::new("Click or drag on the timeline to jump. Scroll on it to zoom. Space pause · ←/→ 30 s · double-click a channel to enlarge.").small().color(MUTED()));
+            ui.label(RichText::new("Click or drag on the timeline to jump. Scroll on it to zoom. Space pause · ←/→ 30 s · I/O mark export start/end · double-click a channel to enlarge.").small().color(MUTED()));
         }); });
 
         // ── κέντρο: κανάλια + χρονολόγιο ──
@@ -2603,6 +2638,13 @@ impl App {
                 }
             }
             if let Some(pp) = resp.interact_pointer_pos() { if resp.dragged() || resp.drag_started() { self.pb.drag = Some(sec_of(pp.x)); } }
+            if let (Some(a), Some(b)) = (self.pb.mark_in, self.pb.mark_out) {
+                if b > a {
+                    let r = egui::Rect::from_min_max(egui::pos2(x_of(secs(a)).max(bar.left()), bar.top() - 2.0), egui::pos2(x_of(secs(b)).min(bar.right()), bar.bottom() + 2.0));
+                    p.rect_filled(r, 3.0, Color32::from_white_alpha(22));
+                    p.rect_stroke(r, 3.0, Stroke::new(1.0, Color32::from_white_alpha(90)));
+                }
+            }
             if let Some(cur) = self.pb.cursor {
                 let x = x_of(secs(cur));
                 if x >= bar.left() && x <= bar.right() {
@@ -2742,4 +2784,62 @@ fn field_box(ui: &mut egui::Ui, key: impl std::hash::Hash, value: &mut String, i
         if resp.clicked() { *show = !*show; r.request_focus(); }
     }
     r
+}
+
+/// Εξαγωγή διαστήματος [a, b] για κάθε κανάλι σε MP4 (χωρίς επανακωδικοποίηση).
+fn start_export(cam: Camera, chans: Vec<(u32, String)>, map: std::collections::BTreeMap<u32, (Vec<dvrip::RecFile>, Vec<dvrip::RecFile>)>,
+                a: chrono::NaiveDateTime, b: chrono::NaiveDateTime, job: Arc<Mutex<ExportJob>>, ctx: egui::Context) {
+    { let mut j = job.lock().unwrap(); j.busy = true; j.done.clear(); j.msg = "Starting export…".into(); }
+    std::thread::spawn(move || {
+        let dir = media_dir(true).join("Exports");
+        let _ = std::fs::create_dir_all(&dir);
+        let mut errors = 0;
+        for (k, (ch, name)) in chans.iter().enumerate() {
+            let files: Vec<&dvrip::RecFile> = map.get(ch).map(|x| x.0.iter().filter(|f| matches!((parse_t(&f.begin), parse_t(&f.end)), (Some(fa), Some(fb)) if fb > a && fa < b)).collect()).unwrap_or_default();
+            if files.is_empty() { continue; }
+            let set = |m: String| { job.lock().unwrap().msg = m; ctx.request_repaint(); };
+            set(format!("Channel {}/{}: {name}…", k + 1, chans.len()));
+            let r = (|| -> anyhow::Result<PathBuf> {
+                let mut d = dvrip::Dvr::connect(&cam.host, dvrip::PORT, &cam.user, &cam.pass)?;
+                let mut es: Vec<u8> = vec![];
+                let mut parser = dvrip::FrameParser::default();
+                let mut started = false;
+                let total = (b - a).num_seconds().max(1) as f64;
+                for f in files {
+                    let from = parse_t(&f.begin).map(|fa| fa.max(a)).unwrap_or(a).format("%Y-%m-%d %H:%M:%S").to_string();
+                    let mut cur: Option<chrono::NaiveDateTime> = None;
+                    d.stream_time(&cam.host, dvrip::PORT, f.channel, &from, &f.end, &f.name, 3, |chunk| {
+                        for (frame, key) in parser.push(chunk) {
+                            if key { cur = parse_t(&parser.time); }
+                            let Some(t) = cur else { continue };
+                            if t > b { return false; }
+                            if !started { if !key || t < a - chrono::Duration::seconds(2) { continue; } started = true; }
+                            es.extend_from_slice(&frame);
+                            if key { job.lock().unwrap().msg = format!("Channel {}/{}: {name} {:.0}%", k + 1, chans.len(), ((t - a).num_seconds() as f64 / total * 100.0).clamp(0.0, 100.0)); ctx.request_repaint(); }
+                        }
+                        true
+                    })?;
+                }
+                anyhow::ensure!(!es.is_empty(), "no video in range");
+                let stem = format!("{}_{}_{}", name, a.format("%Y%m%d_%H%M%S"), b.format("%H%M%S")).chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect::<String>();
+                let tmp = std::env::temp_dir().join(format!("{stem}.es"));
+                std::fs::write(&tmp, &es)?;
+                let out = dir.join(format!("{stem}.mp4"));
+                let st = Command::new(tool("ffmpeg")).args(["-v", "error", "-y", "-f", if parser.hevc { "hevc" } else { "h264" }, "-r", &parser.fps.max(1).to_string(), "-i"])
+                    .arg(&tmp).args(["-c", "copy", "-movflags", "+faststart"]).arg(&out).stdout(Stdio::null()).stderr(Stdio::null()).status()?;
+                let _ = std::fs::remove_file(&tmp);
+                anyhow::ensure!(st.success(), "conversion failed");
+                Ok(out)
+            })();
+            match r { Ok(p) => job.lock().unwrap().done.push(p), Err(_) => errors += 1 }
+        }
+        let mut j = job.lock().unwrap();
+        j.busy = false;
+        j.msg = match (j.done.len(), errors) {
+            (0, 0) => "No recordings in that range.".into(),
+            (n, 0) => format!("Saved {n} clip{} to Videos/NVRDeck/Exports.", if n == 1 { "" } else { "s" }),
+            (n, e) => format!("Saved {n}, {e} failed. Try a shorter range."),
+        };
+        ctx.request_repaint();
+    });
 }

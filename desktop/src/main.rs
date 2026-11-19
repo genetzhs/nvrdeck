@@ -219,8 +219,10 @@ impl Camera {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct Settings { width: usize, height: usize, fps: u32, #[serde(default)] theme: u32, #[serde(default = "yes")] show_clock: bool, #[serde(default)] layout: u32, #[serde(default)] main_ch: usize }
-impl Default for Settings { fn default() -> Self { Settings { width: 960, height: 540, fps: 12, theme: 0, show_clock: true, layout: 0, main_ch: 0 } } }
+struct Settings { width: usize, height: usize, fps: u32, #[serde(default)] theme: u32, #[serde(default = "yes")] show_clock: bool, #[serde(default)] layout: u32, #[serde(default)] main_ch: usize,
+    #[serde(default = "yes")] auto_hd: bool, #[serde(default = "yes")] alerts: bool, #[serde(default = "alert_secs")] alert_after: u64 }
+fn alert_secs() -> u64 { 60 }
+impl Default for Settings { fn default() -> Self { Settings { width: 960, height: 540, fps: 12, theme: 0, show_clock: true, layout: 0, main_ch: 0, auto_hd: true, alerts: true, alert_after: 60 } } }
 
 #[derive(Serialize, Deserialize, Default)]
 struct Store {
@@ -288,6 +290,9 @@ struct Shared {
     status: String,
     last: Option<Instant>,
     last_wall: Option<chrono::DateTime<chrono::Local>>,
+    fps: f32,
+    src_res: String,
+    reconnects: u32,
 }
 
 struct Stream {
@@ -295,16 +300,19 @@ struct Stream {
     stop: Arc<AtomicBool>,
     pid: Arc<AtomicU32>,
     tex: Option<egui::TextureHandle>,
+    w: usize,
+    h: usize,
 }
 
 impl Stream {
     fn start(url: String, s: Settings, ctx: egui::Context) -> Stream {
+        let (w, h) = (s.width, s.height);
         let shared = Arc::new(Mutex::new(Shared { status: "Connecting…".into(), ..Default::default() }));
         let stop = Arc::new(AtomicBool::new(false));
         let pid = Arc::new(AtomicU32::new(0));
         let (sh, st, pd) = (shared.clone(), stop.clone(), pid.clone());
         std::thread::spawn(move || worker(url, s, sh, st, pd, ctx));
-        Stream { shared, stop, pid, tex: None }
+        Stream { shared, stop, pid, tex: None, w, h }
     }
 }
 
@@ -338,7 +346,7 @@ fn tool(name: &str) -> PathBuf {
 fn ffmpeg_cmd(url: &str, s: &Settings) -> Command {
     let (w, h, fps) = (s.width, s.height, s.fps);
     let mut c = Command::new(tool("ffmpeg"));
-    c.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-rtsp_transport", "tcp", "-timeout", "5000000",
+    c.args(["-hide_banner", "-loglevel", "info", "-nostats", "-nostdin", "-rtsp_transport", "tcp", "-timeout", "5000000",
             "-fflags", "nobuffer", "-flags", "low_delay", "-i", url, "-an", "-vf",
             &format!("fps={fps},scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
             "-pix_fmt", "rgba", "-f", "rawvideo", "-"])
@@ -348,20 +356,49 @@ fn ffmpeg_cmd(url: &str, s: &Settings) -> Command {
 
 fn worker(url: String, s: Settings, sh: Arc<Mutex<Shared>>, stop: Arc<AtomicBool>, pid: Arc<AtomicU32>, ctx: egui::Context) {
     let size = s.width * s.height * 4;
+    let mut attempt = 0u32;
     while !stop.load(Ordering::SeqCst) {
-        sh.lock().unwrap().status = "Connecting…".into();
+        {
+            let mut g = sh.lock().unwrap();
+            g.status = "Connecting…".into();
+            if attempt > 0 { g.reconnects += 1; }
+        }
+        attempt += 1;
         ctx.request_repaint();
         match ffmpeg_cmd(&url, &s).spawn() {
             Ok(mut child) => {
                 pid.store(child.id(), Ordering::SeqCst);
                 let mut out = child.stdout.take().unwrap();
-                let mut err = child.stderr.take().unwrap();
+                let err = child.stderr.take().unwrap();
                 let errbuf = Arc::new(Mutex::new(String::new()));
-                let eb = errbuf.clone();
-                std::thread::spawn(move || { let mut t = String::new(); let _ = err.read_to_string(&mut t); *eb.lock().unwrap() = t; });
+                let (eb, sh2) = (errbuf.clone(), sh.clone());
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+                        // π.χ. "Stream #0:0: Video: h264 (High), yuvj420p, 1920x1080, 25 fps"
+                        if line.contains("Video:") && line.contains("Stream #0") {
+                            if let Some(res) = line.split(&[',', ' '][..]).find(|t| {
+                                let mut it = t.split('x');
+                                matches!((it.next(), it.next()), (Some(a), Some(b)) if a.parse::<u32>().is_ok() && b.parse::<u32>().is_ok())
+                            }) {
+                                let codec = line.split("Video:").nth(1).and_then(|v| v.split_whitespace().next()).unwrap_or("").trim_end_matches(',');
+                                sh2.lock().unwrap().src_res = format!("{res} {codec}");
+                            }
+                        }
+                        let mut e = eb.lock().unwrap();
+                        if e.len() < 4000 { e.push_str(&line); e.push('\n'); }
+                    }
+                });
                 let mut buf = vec![0u8; size];
+                let (mut win_start, mut win_frames) = (Instant::now(), 0u32);
                 while !stop.load(Ordering::SeqCst) && out.read_exact(&mut buf).is_ok() {
+                    win_frames += 1;
                     let mut g = sh.lock().unwrap();
+                    if win_start.elapsed() >= Duration::from_secs(2) {
+                        g.fps = win_frames as f32 / win_start.elapsed().as_secs_f32();
+                        win_start = Instant::now();
+                        win_frames = 0;
+                    }
                     g.frame = Some(std::mem::replace(&mut buf, vec![0u8; size]));
                     g.fresh = true;
                     g.status.clear();
@@ -375,7 +412,9 @@ fn worker(url: String, s: Settings, sh: Arc<Mutex<Shared>>, stop: Arc<AtomicBool
                 pid.store(0, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(100));
                 let e = errbuf.lock().unwrap().to_lowercase();
-                sh.lock().unwrap().status = friendly_error(&e).into();
+                let mut g = sh.lock().unwrap();
+                g.status = friendly_error(&e).into();
+                g.fps = 0.0;
             }
             Err(_) => sh.lock().unwrap().status = "ffmpeg not found".into(),
         }
@@ -386,6 +425,83 @@ fn worker(url: String, s: Settings, sh: Arc<Mutex<Shared>>, stop: Arc<AtomicBool
         }
     }
 }
+
+// ───────────────────────── Στιγμιότυπα, εγγραφές, ειδοποιήσεις ─────────────────────────
+fn media_dir(video: bool) -> PathBuf {
+    let base = if video { dirs::video_dir() } else { dirs::picture_dir() };
+    let d = base.or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join("NVRDeck");
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
+
+fn file_stem(cam: &Camera) -> String {
+    let safe: String = cam.name.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
+    format!("{}_{}", safe.trim_matches('_'), chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"))
+}
+
+/// Στιγμιότυπο σε πλήρη ανάλυση από το κύριο stream (στο παρασκήνιο).
+fn snapshot(cam: &Camera, inbox: Arc<Mutex<Vec<String>>>, ctx: egui::Context) {
+    let mut c = cam.clone();
+    c.main_stream = true;
+    let url = c.url();
+    let path = media_dir(false).join(format!("{}.jpg", file_stem(cam)));
+    std::thread::spawn(move || {
+        let ok = Command::new(tool("ffmpeg"))
+            .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-rtsp_transport", "tcp", "-timeout", "8000000", "-i", &url,
+                   "-frames:v", "1", "-q:v", "2", "-y"]).arg(&path)
+            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null())
+            .status().map(|s| s.success()).unwrap_or(false);
+        inbox.lock().unwrap().push(if ok { format!("Snapshot saved: {}", path.display()) } else { "Snapshot failed".into() });
+        ctx.request_repaint();
+    });
+}
+
+/// Εγγραφή MP4 χωρίς επανακωδικοποίηση (stream copy). Fragmented MP4: παίζει ακόμα κι αν διακοπεί απότομα.
+struct Recording { child: std::process::Child, path: PathBuf, started: Instant }
+
+fn start_recording(cam: &Camera) -> Option<Recording> {
+    let mut c = cam.clone();
+    c.main_stream = true;
+    let path = media_dir(true).join(format!("{}.mp4", file_stem(cam)));
+    let child = Command::new(tool("ffmpeg"))
+        .args(["-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp", "-timeout", "8000000", "-i", &c.url(),
+               "-map", "0:v:0", "-map", "0:a?", "-c:v", "copy", "-c:a", "aac", "-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-y"])
+        .arg(&path)
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null())
+        .spawn().ok()?;
+    Some(Recording { child, path, started: Instant::now() })
+}
+
+fn stop_recording(mut r: Recording) -> PathBuf {
+    use std::io::Write;
+    if let Some(stdin) = r.child.stdin.as_mut() { let _ = stdin.write_all(b"q"); }
+    let deadline = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < deadline {
+        if let Ok(Some(_)) = r.child.try_wait() { return r.path; }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let _ = r.child.kill();
+    let _ = r.child.wait();
+    r.path
+}
+
+/// Ειδοποίηση επιφάνειας εργασίας (Linux: notify-send, macOS: osascript).
+fn desktop_notify(title: &str, body: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let esc = |s: &str| s.replace('\\', "").replace('"', "'");
+        let _ = Command::new("osascript").arg("-e")
+            .arg(format!("display notification \"{}\" with title \"{}\"", esc(body), esc(title))).spawn();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = Command::new("notify-send").args(["-a", "NVRDeck", "-i", "camera-web", title, body])
+            .stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    }
+}
+
+#[derive(Default, Clone)]
+struct Health { online: f64, total: f64, down_since: Option<Instant>, alerted: bool }
 
 fn friendly_error(e: &str) -> &'static str {
     if e.contains("401") || e.contains("unauthorized") { "Wrong username or password" }
@@ -628,6 +744,13 @@ struct App {
     scan: Arc<Mutex<ScanState>>,
     scan_open: bool,
     nvr: Option<NvrForm>,
+    hd: Option<(usize, Stream)>,
+    zoom: f32,
+    zoom_c: egui::Pos2,
+    recs: std::collections::HashMap<usize, Recording>,
+    inbox: Arc<Mutex<Vec<String>>>,
+    health: Vec<Health>,
+    last_tick: Instant,
 }
 
 impl App {
@@ -639,7 +762,9 @@ impl App {
         App { store, logged_in: false, login_user: "admin".into(), login_pass: String::new(), login_pass2: String::new(),
               login_err: String::new(), page: Page::Live, streams: vec![], solo: None, editor: None,
               confirm_delete: None, settings_draft, toast: None,
-              scan: Arc::new(Mutex::new(ScanState::default())), scan_open: false, nvr: None }
+              scan: Arc::new(Mutex::new(ScanState::default())), scan_open: false, nvr: None,
+              hd: None, zoom: 1.0, zoom_c: egui::pos2(0.5, 0.5), recs: Default::default(),
+              inbox: Arc::new(Mutex::new(vec![])), health: vec![], last_tick: Instant::now() }
     }
 
     fn restart_streams(&mut self, ctx: &egui::Context) {
@@ -648,6 +773,52 @@ impl App {
             c.enabled.then(|| Stream::start(c.url(), self.store.settings.clone(), ctx.clone()))
         }).collect();
         if self.solo.map_or(false, |i| i >= self.streams.len()) { self.solo = None; }
+        self.hd = None;
+        self.health = vec![Health::default(); self.store.camera.len()];
+    }
+
+    /// Υγεία καναλιών + ειδοποιήσεις όταν κάμερα μείνει εκτός για > N δευτερόλεπτα.
+    fn tick_health(&mut self) {
+        let dt = self.last_tick.elapsed().as_secs_f64();
+        self.last_tick = Instant::now();
+        if self.health.len() != self.streams.len() { self.health = vec![Health::default(); self.streams.len()]; }
+        let after = Duration::from_secs(self.store.settings.alert_after.max(10));
+        let mut notes = vec![];
+        for (i, st) in self.streams.iter().enumerate() {
+            let Some(st) = st else { continue };
+            let live = st.shared.lock().unwrap().last.map_or(false, |t| t.elapsed() < Duration::from_secs(5));
+            let h = &mut self.health[i];
+            h.total += dt;
+            let name = self.store.camera.get(i).map(|c| c.name.clone()).unwrap_or_default();
+            if live {
+                h.online += dt;
+                if h.alerted { notes.push((format!("{name} is back online"), "The camera is streaming again.".to_string())); }
+                h.down_since = None;
+                h.alerted = false;
+            } else {
+                let since = *h.down_since.get_or_insert_with(Instant::now);
+                if !h.alerted && since.elapsed() >= after && h.total > after.as_secs_f64() {
+                    h.alerted = true;
+                    notes.push((format!("{name} is offline"), format!("No video for {} s.", after.as_secs())));
+                }
+            }
+        }
+        if self.store.settings.alerts {
+            for (t, b) in &notes { desktop_notify(t, b); }
+        }
+        if let Some((t, _)) = notes.last() { self.toast(t); }
+    }
+
+    fn toggle_recording(&mut self, i: usize) {
+        if let Some(r) = self.recs.remove(&i) {
+            let path = stop_recording(r);
+            self.toast(&format!("Recording saved: {}", path.display()));
+        } else if let Some(cam) = self.store.camera.get(i) {
+            match start_recording(cam) {
+                Some(r) => { self.recs.insert(i, r); self.toast("Recording started"); }
+                None => self.toast("Could not start recording (ffmpeg?)"),
+            }
+        }
     }
 
     fn save(&mut self) {
@@ -659,6 +830,8 @@ impl App {
     fn toast(&mut self, t: &str) { self.toast = Some((t.into(), Instant::now())); }
 
     fn logout(&mut self) {
+        for (_, r) in self.recs.drain() { stop_recording(r); }
+        self.hd = None;
         self.streams.clear();
         self.logged_in = false;
         self.login_pass.clear();
@@ -787,6 +960,37 @@ impl App {
             }
             if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Num0) { self.solo = None; }
         });
+        // πλήκτρα στην πλήρη προβολή: S στιγμιότυπο, R εγγραφή, Z επαναφορά zoom
+        if let Some(i) = self.solo {
+            let (snap, rec, rz) = ctx.input(|k| (k.key_pressed(egui::Key::S), k.key_pressed(egui::Key::R), k.key_pressed(egui::Key::Z)));
+            if snap { if let Some(c) = self.store.camera.get(i) { snapshot(c, self.inbox.clone(), ctx.clone()); self.toast("Taking snapshot…"); } }
+            if rec { self.toggle_recording(i); }
+            if rz { self.zoom = 1.0; self.zoom_c = egui::pos2(0.5, 0.5); }
+        }
+        // #7: στην πλήρη προβολή ανοίγει το κύριο (HD) stream· στο πλέγμα μένει το ελαφρύ
+        let want_hd = self.solo.filter(|&i| self.store.settings.auto_hd && self.store.camera.get(i).map_or(false, |c| c.enabled && !c.main_stream));
+        if self.hd.as_ref().map(|h| h.0) != want_hd {
+            self.hd = want_hd.map(|i| {
+                let mut c = self.store.camera[i].clone();
+                c.main_stream = true;
+                let mut st = self.store.settings.clone();
+                st.width = 1920; st.height = 1080; st.fps = st.fps.max(15);
+                (i, Stream::start(c.url(), st, ctx.clone()))
+            });
+        }
+        if self.solo.is_none() && (self.zoom != 1.0) { self.zoom = 1.0; self.zoom_c = egui::pos2(0.5, 0.5); }
+        if let Some((_, s)) = &mut self.hd {
+            let mut g = s.shared.lock().unwrap();
+            if g.fresh {
+                if let Some(f) = &g.frame {
+                    if f.len() == s.w * s.h * 4 {
+                        let img = egui::ColorImage::from_rgba_unmultiplied([s.w, s.h], f);
+                        match &mut s.tex { Some(t) => t.set(img, egui::TextureOptions::LINEAR), None => s.tex = Some(ctx.load_texture("hd", img, egui::TextureOptions::LINEAR)) }
+                    }
+                }
+                g.fresh = false;
+            }
+        }
         let (w, h) = (self.store.settings.width, self.store.settings.height);
         for (i, s) in self.streams.iter_mut().enumerate() {
             let Some(s) = s else { continue };
@@ -827,6 +1031,7 @@ impl App {
             };
             let gap = 3.0;
             let mut clicked_main: Option<usize> = None;
+            let mut toggle_rec: Option<usize> = None;
             for (k, &i) in idx.iter().enumerate() {
                 let Some(u) = cells.get(k) else { break };
                 let cell = egui::Rect::from_min_max(
@@ -841,19 +1046,46 @@ impl App {
                 let mut stamp: Option<String> = None;
                 let (status, live) = match &self.streams.get(i).and_then(|s| s.as_ref()) {
                     Some(s) => {
-                        if let Some(t) = &s.tex {
-                            // πλέγμα: ομοιόμορφο γέμισμα κελιού (crop) · πλήρης προβολή: ολόκληρη εικόνα
-                            let ar = w as f32 / h as f32;
+                        // στην πλήρη προβολή προτιμάται η HD ροή μόλις έχει εικόνα
+                        let hd_tex = self.hd.as_ref().filter(|h| h.0 == i && self.solo.is_some()).and_then(|h| h.1.tex.as_ref().map(|t| (t.id(), h.1.w, h.1.h)));
+                        let tex = hd_tex.or_else(|| s.tex.as_ref().map(|t| (t.id(), w, h)));
+                        if let Some((tid, tw, th)) = tex {
+                            // πλέγμα: ομοιόμορφο γέμισμα κελιού (crop) · πλήρης προβολή: ολόκληρη εικόνα + zoom
+                            let ar = tw as f32 / th as f32;
                             let car = cell.width() / cell.height();
                             if self.solo.is_some() {
                                 let mut sz = cell.size();
                                 if sz.x / sz.y > ar { sz.x = sz.y * ar } else { sz.y = sz.x / ar }
-                                p.image(t.id(), egui::Rect::from_center_size(cell.center(), sz),
-                                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                                let img_rect = egui::Rect::from_center_size(cell.center(), sz);
+                                // #5 zoom: ροδέλα γύρω από τον κέρσορα, σύρσιμο για μετακίνηση
+                                let zr = ui.interact(img_rect, ui.id().with("zoom"), egui::Sense::drag());
+                                if zr.hovered() {
+                                    let scroll = ui.input(|k| k.smooth_scroll_delta.y);
+                                    if scroll != 0.0 {
+                                        let nz = (self.zoom * (1.0 + scroll * 0.0025)).clamp(1.0, 8.0);
+                                        if let Some(mp) = zr.hover_pos() {
+                                            let rel = (mp - img_rect.min) / img_rect.size();
+                                            let half = 0.5 / self.zoom;
+                                            let pt = egui::pos2(self.zoom_c.x - half + rel.x / self.zoom, self.zoom_c.y - half + rel.y / self.zoom);
+                                            self.zoom = nz;
+                                            let nh = 0.5 / nz;
+                                            self.zoom_c = egui::pos2(pt.x - rel.x / nz + nh, pt.y - rel.y / nz + nh);
+                                        } else { self.zoom = nz; }
+                                    }
+                                }
+                                if zr.dragged() && self.zoom > 1.0 {
+                                    let d = zr.drag_delta() / img_rect.size() / self.zoom;
+                                    self.zoom_c -= d;
+                                }
+                                let half = 0.5 / self.zoom;
+                                self.zoom_c.x = self.zoom_c.x.clamp(half, 1.0 - half);
+                                self.zoom_c.y = self.zoom_c.y.clamp(half, 1.0 - half);
+                                let uv = egui::Rect::from_min_max(egui::pos2(self.zoom_c.x - half, self.zoom_c.y - half), egui::pos2(self.zoom_c.x + half, self.zoom_c.y + half));
+                                p.image(tid, img_rect, uv, Color32::WHITE);
                             } else {
                                 let uv = if car > ar { let v = ar / car; egui::Rect::from_min_max(egui::pos2(0.0, (1.0 - v) / 2.0), egui::pos2(1.0, (1.0 + v) / 2.0)) }
                                          else { let u = car / ar; egui::Rect::from_min_max(egui::pos2((1.0 - u) / 2.0, 0.0), egui::pos2((1.0 + u) / 2.0, 1.0)) };
-                                let mut rs = egui::epaint::RectShape::filled(cell, 14.0, Color32::WHITE); rs.fill_texture_id = t.id(); rs.uv = uv; p.add(rs);
+                                let mut rs = egui::epaint::RectShape::filled(cell, 14.0, Color32::WHITE); rs.fill_texture_id = tid; rs.uv = uv; p.add(rs);
                             }
                         }
                         let g = s.shared.lock().unwrap();
@@ -882,10 +1114,43 @@ impl App {
                 if !status.is_empty() && !live {
                     p.text(cell.center(), egui::Align2::CENTER_CENTER, status, egui::FontId::proportional(15.0), MUTED());
                 }
-                if resp.hovered() {
+                // ένδειξη εγγραφής
+                if let Some(r) = self.recs.get(&i) {
+                    let secs = r.started.elapsed().as_secs();
+                    let gal = p.layout_no_wrap(format!("REC {:02}:{:02}", secs / 60, secs % 60), egui::FontId::monospace(11.0), Color32::WHITE);
+                    let rr = egui::Rect::from_min_size(egui::pos2(cell.right() - gal.size().x - 34.0, cell.top() + 8.0), gal.size() + egui::vec2(24.0, 8.0));
+                    p.rect_filled(rr, 999.0, BAD.gamma_multiply(0.85));
+                    p.circle_filled(rr.min + egui::vec2(9.0, rr.height() / 2.0), 3.0, Color32::WHITE);
+                    p.galley(rr.min + egui::vec2(16.0, 4.0), gal, Color32::WHITE);
+                }
+                if self.solo == Some(i) {
+                    let hd_on = self.hd.as_ref().map_or(false, |h| h.0 == i && h.1.tex.is_some());
+                    let mut bar = egui::Rect::from_min_size(egui::pos2(cell.center().x - 210.0, cell.bottom() - 52.0), egui::vec2(420.0, 40.0));
+                    if bar.left() < cell.left() { bar = bar.translate(egui::vec2(cell.left() - bar.left(), 0.0)); }
+                    ui.allocate_ui_at_rect(bar, |ui| {
+                        egui::Frame::none().fill(Color32::from_black_alpha(170)).rounding(999.0).inner_margin(egui::Margin::symmetric(10.0, 5.0)).show(ui, |ui| {
+                            ui.horizontal_centered(|ui| {
+                                if ui.add(egui::Button::new("📷  Snapshot").rounding(999.0)).on_hover_text("S").clicked() {
+                                    snapshot(cam, self.inbox.clone(), ctx.clone());
+                                    self.toast = Some(("Taking snapshot…".into(), Instant::now()));
+                                }
+                                let recording = self.recs.contains_key(&i);
+                                let rb = egui::Button::new(RichText::new(if recording { "■  Stop" } else { "⏺  Record" }).color(if recording { Color32::WHITE } else { TEXT() }))
+                                    .fill(if recording { BAD } else { SURFACE() }).rounding(999.0);
+                                if ui.add(rb).on_hover_text("R").clicked() { toggle_rec = Some(i); }
+                                if self.zoom > 1.0 && ui.add(egui::Button::new(format!("{:.1}×  reset", self.zoom)).rounding(999.0)).on_hover_text("Z").clicked() {
+                                    self.zoom = 1.0; self.zoom_c = egui::pos2(0.5, 0.5);
+                                }
+                                ui.label(RichText::new(if hd_on { "HD" } else { "SD" }).monospace().color(if hd_on { OK } else { MUTED() }));
+                            });
+                        });
+                    });
+                }
+                if resp.hovered() && self.solo.is_none() {
                     p.rect_stroke(cell, 14.0, Stroke::new(1.0, ACCENT().gamma_multiply(0.6)));
                 }
             }
+            if let Some(i) = toggle_rec.take() { self.toggle_recording(i); }
             if let Some(m) = clicked_main {
                 if m != self.store.settings.main_ch {
                     self.store.settings.main_ch = m;
@@ -1352,6 +1617,9 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         ambient_glow(ctx);
+        if self.logged_in { self.tick_health(); }
+        let msgs: Vec<String> = std::mem::take(&mut *self.inbox.lock().unwrap());
+        for m in msgs { self.toast(&m); }
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));

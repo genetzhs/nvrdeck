@@ -2,6 +2,7 @@
 //! Η αποκωδικοποίηση γίνεται από το ffmpeg (μία διεργασία ανά κανάλι).
 
 mod share;
+mod dvrip;
 use eframe::egui::{self, Color32, RichText, Rounding, Stroke};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1793,7 +1794,29 @@ impl eframe::App for App {
     }
 }
 
+/// `nvrdeck --nvr-test`: δοκιμή του πρωτοκόλλου DVRIP με τα XMeye κανάλια της ρύθμισης. Δεν τυπώνει στοιχεία σύνδεσης.
+fn nvr_test() -> anyhow::Result<()> {
+    let store = Store::load();
+    let mut seen = std::collections::HashSet::new();
+    for c in store.camera.iter().filter(|c| c.proto == Proto::XMeye) {
+        if !seen.insert(c.host.clone()) { continue; }
+        print!("{} : ", c.name);
+        match dvrip::Dvr::connect(&c.host, dvrip::PORT, &c.user, &c.pass) {
+            Err(e) => println!("no ({e})"),
+            Ok(mut d) => {
+                let ch = d.channels().unwrap_or(0);
+                let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+                let all = d.files(c.channel.saturating_sub(1), &format!("{today} 00:00:00"), &format!("{today} 23:59:59"), "*").map(|v| v.len());
+                let mot = d.files(c.channel.saturating_sub(1), &format!("{today} 00:00:00"), &format!("{today} 23:59:59"), "M").map(|v| v.len());
+                println!("login OK · {ch} channels · today ch{}: {:?} recordings, {:?} motion", c.channel, all.ok(), mot.ok());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
+    if std::env::args().any(|a| a == "--nvr-test") { return nvr_test(); }
     let wall = std::env::args().any(|a| a == "--wall");
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_fullscreen(wall).with_inner_size([1280.0, 780.0]).with_min_inner_size([720.0, 480.0]).with_title("NVRDeck").with_icon(std::sync::Arc::new(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap_or_default())),

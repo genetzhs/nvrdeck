@@ -80,7 +80,7 @@ class AlertService : Service() {
                         if (System.currentTimeMillis() - ka > 20_000) { d.keepAlive(); ka = System.currentTimeMillis() }
                         val a = d.nextAlarm() ?: continue
                         if (!store.data.value.settings.armed) continue
-                        if (!a.start || !a.event.contains("Motion", true)) continue
+                        if (!a.start || !Regex("Motion|Detect|Human|Shape|Intru|Cross", RegexOption.IGNORE_CASE).containsMatchIn(a.event)) continue
                         val ch = a.channel + 1
                         val c = group.firstOrNull { it.channel == ch } ?: continue
                         if (System.currentTimeMillis() - (lastAlert[ch] ?: 0) < 120_000) continue

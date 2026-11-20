@@ -87,7 +87,7 @@ suspend fun probeCamera(ctx: Context, url: String): Result<String> {
 
 @OptIn(UnstableApi::class)
 @Composable
-fun CameraTile(cam: Camera, index: Int, showClock: Boolean, modifier: Modifier = Modifier, fill: Boolean = false, cornerDp: androidx.compose.ui.unit.Dp = 14.dp, hd: Boolean = false, onView: ((PlayerView) -> Unit)? = null, onFrame: ((Int, Int) -> Unit)? = null) {
+fun CameraTile(cam: Camera, index: Int, showClock: Boolean, modifier: Modifier = Modifier, fill: Boolean = false, cornerDp: androidx.compose.ui.unit.Dp = 14.dp, hd: Boolean = false, onView: ((PlayerView) -> Unit)? = null, onFrame: ((Int, Int) -> Unit)? = null, sound: Boolean = false, onAudio: ((Boolean) -> Unit)? = null) {
     val ctx = LocalContext.current
     var status by remember(cam) { mutableStateOf("Connecting…") }
     var live by remember(cam) { mutableStateOf(false) }
@@ -104,6 +104,11 @@ fun CameraTile(cam: Camera, index: Int, showClock: Boolean, modifier: Modifier =
         }
         player.addListener(l)
         onDispose { player.removeListener(l); player.release() }
+    }
+    LaunchedEffect(player, sound) { player.volume = if (sound) 1f else 0f }
+    DisposableEffect(player) {
+        val l = object : Player.Listener { override fun onTracksChanged(t: androidx.media3.common.Tracks) { onAudio?.invoke(t.containsType(androidx.media3.common.C.TRACK_TYPE_AUDIO)) } }
+        player.addListener(l); onDispose { player.removeListener(l) }
     }
     // αυτόματη επανασύνδεση + ρολόι
     LaunchedEffect(player) {

@@ -841,6 +841,8 @@ struct App {
     streams: Vec<Option<Stream>>,
     solo: Option<usize>,
     talk: Option<Arc<AtomicBool>>,
+    listen: Option<(usize, std::process::Child)>,
+    last_alert: Option<(usize, chrono::NaiveDateTime, String, Instant)>,
     talk_msg: Arc<Mutex<String>>,
     editor: Option<Editor>,
     confirm_delete: Option<usize>,
@@ -973,7 +975,7 @@ impl App {
         apply_theme(&cc.egui_ctx, store.settings.theme);
         let settings_draft = store.settings.clone();
         App { store, logged_in: false, login_user: "admin".into(), login_pass: String::new(), login_pass2: String::new(),
-              login_err: String::new(), page: Page::Live, streams: vec![], solo: None, talk: None, talk_msg: Default::default(), editor: None,
+              login_err: String::new(), page: Page::Live, streams: vec![], solo: None, listen: None, last_alert: None, talk: None, talk_msg: Default::default(), editor: None,
               confirm_delete: None, settings_draft, toast: None,
               scan: Arc::new(Mutex::new(ScanState::default())), scan_open: false, nvr: None,
               hd: None, zoom: 1.0, zoom_c: egui::pos2(0.5, 0.5), recs: Default::default(),
@@ -1243,6 +1245,14 @@ impl App {
             if i.key_pressed(egui::Key::Escape) || i.key_pressed(egui::Key::Num0) { self.solo = None; }
         });
         // πλήκτρα στην πλήρη προβολή: S στιγμιότυπο, R εγγραφή, Z επαναφορά zoom
+        if let Some((li, c)) = self.listen.as_mut() {
+            let exited = c.try_wait().ok().flatten().is_some();
+            if self.solo != Some(*li) || exited {
+                let _ = c.kill(); let _ = c.wait();
+                if exited { self.toast = Some(("No sound from this camera".into(), Instant::now())); }
+                self.listen = None;
+            }
+        }
         if let Some(i) = self.solo {
             let (snap, rec, rz) = ctx.input(|k| (k.key_pressed(egui::Key::S), k.key_pressed(egui::Key::R), k.key_pressed(egui::Key::Z)));
             if snap { if let Some(c) = self.store.camera.get(i) { snapshot(c, self.inbox.clone(), ctx.clone()); self.toast("Taking snapshot…"); } }
@@ -1321,6 +1331,7 @@ impl App {
             let name = self.store.camera[i].name.clone();
             if !self.store.settings.armed { continue; }
             if self.store.settings.alerts { notify_clip(&format!("Motion: {name}"), "Movement detected on this camera.", i); }
+            self.last_alert = Some((i, chrono::Local::now().naive_local(), format!("Motion at {name}"), Instant::now()));
             self.toast(&format!("Motion on {name}"));
         }
         // αναγνώριση ανθρώπων/οχημάτων σε ξεχωριστό νήμα
@@ -1357,6 +1368,7 @@ impl App {
                 let name = self.store.camera.get(i).map(|c| c.name.clone()).unwrap_or_default();
                 if let Some(Some(s)) = self.streams.get_mut(i) { s.motion_note = Some(Instant::now()); }
                 if self.store.settings.alerts { notify_clip(&format!("{what} at {name}"), &format!("Detected with {:.0}% confidence.", h.score * 100.0), i); }
+                self.last_alert = Some((i, chrono::Local::now().naive_local(), format!("{what} at {name}"), Instant::now()));
                 self.toast(&format!("{what} at {name}"));
             }
         }
@@ -1502,6 +1514,22 @@ impl App {
                                 if self.zoom > 1.0 && ui.add(egui::Button::new(format!("{:.1}×  reset", self.zoom)).rounding(999.0)).on_hover_text("Z").clicked() {
                                     self.zoom = 1.0; self.zoom_c = egui::pos2(0.5, 0.5);
                                 }
+                                {
+                                    let on = self.listen.as_ref().is_some_and(|l| l.0 == i);
+                                    if ui.add(egui::Button::new(RichText::new(if on { "🔊  Sound" } else { "🔇  Sound" }).color(if on { Color32::WHITE } else { TEXT() }))
+                                        .fill(if on { ACCENT() } else { SURFACE() }).rounding(999.0)).on_hover_text("Hear the camera's microphone").clicked() {
+                                        if let Some((_, mut c)) = self.listen.take() { let _ = c.kill(); let _ = c.wait(); }
+                                        if !on {
+                                            #[cfg(target_os = "macos")] let outp = ["-f", "audiotoolbox", "-"];
+                                            #[cfg(not(target_os = "macos"))] let outp = ["-f", "pulse", "NVRDeck"];
+                                            match Command::new(tool("ffmpeg")).args(["-v", "quiet", "-fflags", "nobuffer", "-rtsp_transport", "tcp", "-i", &cam.url(), "-vn", "-ac", "1"]).args(outp)
+                                                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+                                                Ok(c) => self.listen = Some((i, c)),
+                                                Err(_) => self.toast = Some(("Could not start sound".into(), Instant::now())),
+                                            }
+                                        }
+                                    }
+                                }
                                 if cam.proto == Proto::XMeye {
                                     let on = self.talk.is_some();
                                     let tb = ui.add(egui::Button::new(RichText::new(if on { "🎙  Talking…" } else { "🎙  Hold to talk" }).color(if on { Color32::WHITE } else { TEXT() }))
@@ -1640,6 +1668,25 @@ impl App {
         self.recorder_ui(ctx);
         let _ = UI_CTX.set(ctx.clone());
         if let Some((i, t)) = CLIP_REQ.lock().unwrap().take() { self.open_clip(i, t, ctx); }
+        // πρόσφατη ειδοποίηση μέσα στην εφαρμογή, με «Play clip» (60 s)
+        if let Some((i, t, title, at)) = self.last_alert.clone() {
+            if at.elapsed() > Duration::from_secs(60) { self.last_alert = None; } else {
+                let mut play = false; let mut close = false;
+                egui::Area::new(egui::Id::new("alert_banner")).anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 58.0)).order(egui::Order::Foreground).show(ctx, |ui| {
+                    egui::Frame::none().fill(SURFACE()).stroke(Stroke::new(1.0, BORDER())).rounding(14.0).inner_margin(egui::Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| { ui.label(RichText::new(&title).strong()); ui.label(RichText::new(t.format("%H:%M:%S").to_string()).small().color(MUTED())); });
+                            ui.add_space(10.0);
+                            if ui.add(primary("Play clip")).clicked() { play = true; }
+                            if ui.small_button("✕").clicked() { close = true; }
+                        });
+                    });
+                });
+                if play { self.last_alert = None; self.open_clip(i, t, ctx); }
+                if close { self.last_alert = None; }
+                ctx.request_repaint_after(Duration::from_secs(1));
+            }
+        }
         self.qr_ui(ctx);
         self.nvr_ui(ctx);
         self.editor_ui(ctx);
@@ -2104,6 +2151,41 @@ impl eframe::App for App {
 }
 
 /// `nvrdeck --nvr-test`: δοκιμή του πρωτοκόλλου DVRIP με τα XMeye κανάλια της ρύθμισης. Δεν τυπώνει στοιχεία σύνδεσης.
+/// Δοκιμή: ποιες κάμερες στέλνουν ήχο (εκτυπώνει μόνο όνομα και κωδικοποιητές).
+fn audio_test() -> anyhow::Result<()> {
+    for c in Store::load().camera.iter().filter(|c| c.enabled) {
+        for main in [false, true] {
+            let mut c2 = c.clone(); c2.main_stream = main;
+            let o = Command::new(tool("ffprobe")).args(["-v", "quiet", "-rtsp_transport", "tcp", "-timeout", "6000000", "-show_entries", "stream=codec_type,codec_name,sample_rate", "-of", "csv=p=0", &c2.url()])
+                .stderr(Stdio::null()).output()?;
+            println!("{} [{}]: {}", c.name, if main { "main" } else { "sub" }, String::from_utf8_lossy(&o.stdout).trim().replace('\n', " | "));
+        }
+    }
+    Ok(())
+}
+
+/// Ενεργοποιεί την αποστολή συμβάντων κίνησης (MsgtoNetEnable) σε όλα τα κανάλια των καταγραφικών και επιβεβαιώνει.
+fn enable_events() -> anyhow::Result<()> {
+    let store = Store::load();
+    let mut seen = std::collections::HashSet::new();
+    for c in store.camera.iter().filter(|c| c.proto == Proto::XMeye) {
+        if !seen.insert(c.host.clone()) { continue; }
+        let chans: Vec<u32> = store.camera.iter().filter(|x| x.host == c.host && x.proto == Proto::XMeye).map(|x| x.channel).collect();
+        if chans.len() < 2 { continue; }
+        let mut d = dvrip::Dvr::connect(&c.host, dvrip::PORT, &c.user, &c.pass)?;
+        for ch in chans {
+            let name = format!("Detect.MotionDetect.[{}]", ch - 1);
+            let mut m = d.get_config(&name)?;
+            let before = m["EventHandler"]["MsgtoNetEnable"].as_bool();
+            m["EventHandler"]["MsgtoNetEnable"] = serde_json::json!(true);
+            let r = d.set_config(&name, &m);
+            let after = d.get_config(&name).ok().and_then(|v| v["EventHandler"]["MsgtoNetEnable"].as_bool());
+            println!("channel {ch}: before={before:?} save={:?} after={after:?}", r.map_err(|e| e.to_string()));
+        }
+    }
+    Ok(())
+}
+
 fn nvr_test() -> anyhow::Result<()> {
     let store = Store::load();
     let mut seen = std::collections::HashSet::new();
@@ -2245,6 +2327,8 @@ fn nvr_test() -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--nvr-test") { return nvr_test(); }
+    if std::env::args().any(|a| a == "--audio-test") { return audio_test(); }
+    if std::env::args().any(|a| a == "--enable-events") { return enable_events(); }
     if let Some(i) = std::env::args().position(|a| a == "--detect-test") {
         // αναγνώριση σε εικόνα (raw RGBA 960x540) — μόνο αποτελέσματα
         let path = std::env::args().nth(i + 1).unwrap_or_default();

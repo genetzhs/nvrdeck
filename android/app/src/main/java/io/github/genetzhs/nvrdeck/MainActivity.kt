@@ -815,6 +815,8 @@ fun SoloView(cam: Camera, idx: Int, s: Settings, onClose: () -> Unit) {
     LaunchedEffect(msg) { if (msg.isNotEmpty()) { kotlinx.coroutines.delay(2000); msg = "" } }
     BoxWithConstraints(Modifier.fillMaxSize().background(Color.Black)) {
         val wPx = constraints.maxWidth.toFloat(); val hPx = constraints.maxHeight.toFloat()
+        var sound by remember { mutableStateOf(false) }
+        var hasAudio by remember { mutableStateOf(false) }
         CameraTile(cam, idx, s.showClock,
             Modifier.fillMaxSize()
                 .pointerInput(Unit) {
@@ -831,7 +833,7 @@ fun SoloView(cam: Camera, idx: Int, s: Settings, onClose: () -> Unit) {
                     )
                 }
                 .graphicsLayer { scaleX = scale; scaleY = scale; translationX = off.x; translationY = off.y },
-            cornerDp = 0.dp, fill = true, hd = wantHd, onView = { view = it }, onFrame = { w, h -> res = "${w}×${h}" })
+            cornerDp = 0.dp, fill = true, hd = wantHd, onView = { view = it }, onFrame = { w, h -> res = "${w}×${h}" }, sound = sound, onAudio = { hasAudio = it })
         Row(Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 18.dp)
             .clip(RoundedCornerShape(50)).background(Color.Black.copy(alpha = .6f)).padding(horizontal = 6.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically) {
@@ -842,6 +844,7 @@ fun SoloView(cam: Camera, idx: Int, s: Settings, onClose: () -> Unit) {
             if (scale > 1.01f) TextButton(onClick = { scale = 1f; off = androidx.compose.ui.geometry.Offset.Zero }) {
                 Text("${"%.1f".format(scale)}×  reset", color = Color.White, fontSize = 12.sp)
             }
+            if (hasAudio) IconButton(onClick = { sound = !sound }) { Icon(if (sound) Icons.Outlined.VolumeUp else Icons.Outlined.VolumeOff, "Sound", tint = if (sound) cine.accent else Color.White) }
             if (cam.proto == Proto.XMEYE) {
                 val tctx = LocalContext.current
                 var talking by remember { mutableStateOf<java.util.concurrent.atomic.AtomicBoolean?>(null) }

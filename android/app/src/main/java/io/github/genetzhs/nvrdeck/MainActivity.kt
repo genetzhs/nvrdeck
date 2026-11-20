@@ -741,6 +741,17 @@ fun SettingsScreen(store: Store, data: StoreData, onLock: () -> Unit) {
             SettingSwitch("People & vehicle alerts", "Runs in the background: the recorder's motion events are checked on the phone, and you get a photo only for people or vehicles", s.aiAlerts) { v ->
                 store.update { it.copy(settings = it.settings.copy(aiAlerts = v)) }
                 if (v) AlertService.start(sctx) else AlertService.stop(sctx)
+                // εξαίρεση από την εξοικονόμηση μπαταρίας, αλλιώς το σύστημα σταματά την υπηρεσία
+                val pm = sctx.getSystemService(android.os.PowerManager::class.java)
+                if (v && !pm.isIgnoringBatteryOptimizations(sctx.packageName)) runCatching {
+                    sctx.startActivity(android.content.Intent(android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, android.net.Uri.parse("package:${sctx.packageName}")))
+                }
+            }
+            if (s.aiAlerts) {
+                Spacer(Modifier.height(8.dp))
+                SettingSwitch("Photo in alerts", "On: the phone checks a photo for people/vehicles (~100 KB per event). Off: only the cameras' own people/vehicle events, no photo, almost no data", s.alertPhoto) { v ->
+                    store.update { it.copy(settings = it.settings.copy(alertPhoto = v)) }
+                }
             }
         }
         val recs = remember(data.cameras) { data.cameras.filter { it.proto == Proto.XMEYE }.groupBy { it.host }.values.filter { it.size > 1 }.map { g -> g.sortedBy { it.channel } } }

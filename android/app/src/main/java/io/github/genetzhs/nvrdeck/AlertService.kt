@@ -84,6 +84,14 @@ class AlertService : Service() {
                         val ch = a.channel + 1
                         val c = group.firstOrNull { it.channel == ch } ?: continue
                         if (System.currentTimeMillis() - (lastAlert[ch] ?: 0) < 120_000) continue
+                        // ελαφριά λειτουργία: χωρίς φωτογραφία, μόνο τα συμβάντα ανθρώπων/οχημάτων των ίδιων των καμερών
+                        if (!store.data.value.settings.alertPhoto) {
+                            val what = when { Regex("Human|Person|Body|Face", RegexOption.IGNORE_CASE).containsMatchIn(a.event) -> "Person"
+                                              Regex("Car|Vehicle|Motor", RegexOption.IGNORE_CASE).containsMatchIn(a.event) -> "Vehicle"; else -> null } ?: continue
+                            lastAlert[ch] = System.currentTimeMillis()
+                            post(ch, c, "$what at ${c.name}", "Detected by the camera", null)
+                            continue
+                        }
                         val jpg = runCatching { d.snapshot(a.channel) }.getOrNull() ?: continue
                         val bmp = BitmapFactory.decodeByteArray(jpg, 0, jpg.size) ?: continue
                         val hits = det.run(bmp)
@@ -108,14 +116,7 @@ class AlertService : Service() {
                         } ?: continue
                         lastAlert[ch] = System.currentTimeMillis()
                         val what = Detector.label(new.cls) ?: "Object"
-                        val open = Intent(this, MainActivity::class.java).putExtra("clip_ch", ch).putExtra("clip_t", System.currentTimeMillis()).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
-                        val pi = PendingIntent.getActivity(this, ch, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-                        val dis = PendingIntent.getService(this, 99, Intent(this, AlertService::class.java).setAction("disarm"), PendingIntent.FLAG_IMMUTABLE)
-                        val n: Notification = NotificationCompat.Builder(this, CH_AI).setSmallIcon(R.drawable.ic_stat_cam)
-                            .setContentTitle("$what at ${c.name}").setContentText("Detected with ${(new.score * 100).toInt()}% confidence")
-                            .setLargeIcon(bmp).setStyle(NotificationCompat.BigPictureStyle().bigPicture(bmp).bigLargeIcon(null as android.graphics.Bitmap?))
-                            .addAction(0, "Disarm", dis).setContentIntent(pi).setAutoCancel(true).setPriority(NotificationCompat.PRIORITY_HIGH).build()
-                        runCatching { NotificationManagerCompat.from(this).notify(1000 + ch, n) }
+                        post(ch, c, "$what at ${c.name}", "Detected with ${(new.score * 100).toInt()}% confidence", bmp)
                     }
                 }
             } catch (_: Exception) {
@@ -141,6 +142,16 @@ class AlertService : Service() {
             }
             repeat(600) { if (running) Thread.sleep(1000) }
         }
+    }
+
+    private fun post(ch: Int, c: Camera, title: String, text: String, bmp: android.graphics.Bitmap?) {
+        val open = Intent(this, MainActivity::class.java).putExtra("clip_ch", ch).putExtra("clip_t", System.currentTimeMillis()).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        val pi = PendingIntent.getActivity(this, ch, open, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val dis = PendingIntent.getService(this, 99, Intent(this, AlertService::class.java).setAction("disarm"), PendingIntent.FLAG_IMMUTABLE)
+        val b = NotificationCompat.Builder(this, CH_AI).setSmallIcon(R.drawable.ic_stat_cam).setContentTitle(title).setContentText(text)
+            .addAction(0, "Disarm", dis).setContentIntent(pi).setAutoCancel(true).setPriority(NotificationCompat.PRIORITY_HIGH)
+        if (bmp != null) b.setLargeIcon(bmp).setStyle(NotificationCompat.BigPictureStyle().bigPicture(bmp).bigLargeIcon(null as android.graphics.Bitmap?))
+        runCatching { NotificationManagerCompat.from(this).notify(1000 + ch, b.build()) }
     }
 
     private fun crosses(p: Pair<Float, Float>, q: Pair<Float, Float>, z: AiZone): Boolean {

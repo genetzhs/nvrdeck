@@ -60,6 +60,7 @@ data class Settings(
     val alerts: Boolean = true,
     val group: String = "",
     val armed: Boolean = true,
+    val alertPhoto: Boolean = true,
     val widgetId: Long = 0,
     val aiAlerts: Boolean = false,
 )

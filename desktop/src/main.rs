@@ -39,6 +39,7 @@ fn pal() -> Pal { THEMES[(THEME.load(Ordering::Relaxed) as usize).min(THEMES.len
 #[allow(non_snake_case)] fn TEXT() -> Color32 { pal().text }
 #[allow(non_snake_case)] fn MUTED() -> Color32 { pal().muted }
 #[allow(non_snake_case)] fn ACCENT() -> Color32 { pal().accent }
+const MOTION_C: Color32 = Color32::from_rgb(255, 176, 32);
 const OK: Color32 = Color32::from_rgb(62, 240, 166);
 const BAD: Color32 = Color32::from_rgb(255, 92, 122);
 
@@ -902,6 +903,7 @@ struct NvrPb {
     mark_out: Option<chrono::NaiveDateTime>,
     export: Arc<Mutex<ExportJob>>,
     events_open: bool,
+    motion_only: bool,                   // αναπαραγωγή μόνο των τμημάτων με κίνηση
     ev_filter: u8,                       // 0 όλα, 1 άνθρωποι, 2 οχήματα
     thumbs: Arc<Mutex<ThumbStore>>,
     thumb_tex: std::collections::HashMap<String, egui::TextureHandle>,
@@ -2631,11 +2633,14 @@ impl App {
         let covers = |f: &dvrip::RecFile, t: chrono::NaiveDateTime| matches!((parse_t(&f.begin), parse_t(&f.end)), (Some(a), Some(b)) if a <= t && t < b);
         // αν κανένα κανάλι δεν έχει εγγραφή τη στιγμή t, πάμε στην πρώτη εγγραφή μετά
         let mut t = t;
-        let any = map.iter().any(|(ch, (all, _))| !self.pb.hidden.contains(ch) && all.iter().any(|f| covers(f, t)));
+        let mo = self.pb.motion_only;
+        let pick = |all: &Vec<dvrip::RecFile>, mot: &Vec<dvrip::RecFile>| if mo { mot.clone() } else { all.clone() };
+        let any = map.iter().any(|(ch, (all, mot))| !self.pb.hidden.contains(ch) && pick(all, mot).iter().any(|f| covers(f, t)));
         if !any {
-            if let Some(n) = map.iter().filter(|(ch, _)| !self.pb.hidden.contains(ch)).flat_map(|(_, (all, _))| all.iter().filter_map(|f| parse_t(&f.begin)).filter(|a| *a > t)).min() { t = n; self.pb.cursor = Some(t); }
+            if let Some(n) = map.iter().filter(|(ch, _)| !self.pb.hidden.contains(ch)).flat_map(|(_, (all, mot))| pick(all, mot).iter().filter_map(|f| parse_t(&f.begin)).filter(|a| *a > t).collect::<Vec<_>>()).min() { t = n; self.pb.cursor = Some(t); }
         }
-        for (ch, (all, _)) in &map {
+        for (ch, (all, mot)) in &map {
+            let all = &pick(all, mot);
             if self.pb.hidden.contains(ch) { continue; }
             // μόνο κανάλια με εγγραφή εκείνη τη στιγμή· τα υπόλοιπα ξεκινούν όταν η ώρα φτάσει στην εγγραφή τους
             let hit = all.iter().find(|f| covers(f, t)).map(|f| (f.clone(), t));
@@ -2714,11 +2719,24 @@ impl App {
         }
         // τρέχουσα θέση = η πιο πρόσφατη ώρα από τα κανάλια που παίζουν
         if let Some(t) = self.pb.players.iter().map(|(_, p)| p.now()).max() { self.pb.cursor = Some(t); }
+        // μόνο κίνηση: όταν τελειώσει το τμήμα κίνησης, άλμα στο επόμενο
+        if self.pb.motion_only && !self.pb.paused {
+            let dfm = self.pb.day_files.lock().unwrap().clone();
+            if let (Some(t), Some(Ok(map))) = (self.pb.cursor, dfm) {
+                let vis: Vec<_> = map.iter().filter(|(ch, _)| !self.pb.hidden.contains(ch)).collect();
+                let inside = vis.iter().any(|(_, (_, mot))| mot.iter().any(|f| matches!((parse_t(&f.begin), parse_t(&f.end)), (Some(a), Some(b)) if a - chrono::Duration::seconds(8) <= t && t < b)));
+                if !inside && !self.pb.players.is_empty() {
+                    let next = vis.iter().flat_map(|(_, (_, mot))| mot.iter().filter_map(|f| parse_t(&f.begin))).filter(|a| *a > t + chrono::Duration::seconds(1)).min();
+                    match next { Some(n) => self.pb_seek(&cam, n, ctx), None => { self.pb.players.clear(); self.toast = Some(("No more motion on this day".into(), Instant::now())); } }
+                }
+            }
+        }
         // κανάλια χωρίς αναπαραγωγή ξεκινούν μόλις η ώρα μπει σε εγγραφή τους
         if let (Some(t), false) = (self.pb.cursor, self.pb.players.is_empty()) {
             if let Some(Ok(map)) = self.pb.day_files.lock().unwrap().clone() {
-                for (ch, (all, _)) in &map {
+                for (ch, (all, mot)) in &map {
                     if self.pb.hidden.contains(ch) || self.pb.players.iter().any(|x| x.0 == *ch) { continue; }
+                    let all = if self.pb.motion_only { mot } else { all };
                     if let Some(f) = all.iter().find(|f| matches!((parse_t(&f.begin), parse_t(&f.end)), (Some(a), Some(b)) if a <= t && t + chrono::Duration::seconds(3) < b)) {
                         let p = NvrPlayer::start(&cam, f.clone(), t, ctx.clone());
                         p.pause.store(self.pb.paused, Ordering::Relaxed);
@@ -2944,6 +2962,15 @@ impl App {
             ui.separator();
             ui.add_space(8.0);
             ui.label(RichText::new("PLAYBACK").small().color(MUTED()).extra_letter_spacing(1.2));
+            {
+                let on = self.pb.motion_only;
+                if ui.add(egui::Button::new(RichText::new(if on { "◉  Motion only" } else { "○  Motion only" }).color(if on { Color32::BLACK } else { TEXT() }))
+                    .fill(if on { MOTION_C } else { SURFACE() }).rounding(999.0).min_size(egui::vec2(ui.available_width(), 34.0)))
+                    .on_hover_text("Play only the parts with motion and skip the rest (M)").clicked() || ui.input(|i| i.key_pressed(egui::Key::M) && !i.modifiers.any()) {
+                    self.pb.motion_only ^= true;
+                    seek_to = Some(self.pb.cursor.unwrap_or(day0));
+                }
+            }
             ui.horizontal_wrapped(|ui| {
                 let label = if self.pb.paused { "▶  Play" } else { "⏸  Pause" };
                 if ui.add_enabled(!self.pb.players.is_empty(), egui::Button::new(label).rounding(999.0)).clicked() {
@@ -3046,7 +3073,7 @@ impl App {
                 clip.rect_filled(row, 4.0, BORDER().gamma_multiply(0.35));
                 if let Some(Ok(m)) = &files {
                     if let Some((all, mot)) = m.get(ch) {
-                        for (list, col) in [(all, ACCENT().gamma_multiply(0.8)), (mot, Color32::from_rgb(255, 176, 32))] {
+                        for (list, col) in [(all, ACCENT().gamma_multiply(if self.pb.motion_only { 0.25 } else { 0.8 })), (mot, Color32::from_rgb(255, 176, 32))] {
                             for f in list {
                                 if let (Some(a), Some(b)) = (parse_t(&f.begin), parse_t(&f.end)) {
                                     let (xa, xb) = (x_of(secs(a)), x_of(secs(b)));

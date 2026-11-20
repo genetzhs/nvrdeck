@@ -73,6 +73,7 @@ fun PlaybackScreen(data: StoreData) {
     var speed by remember { mutableIntStateOf(1) }
     var big by remember { mutableStateOf<Int?>(null) }
     var seekReq by remember { mutableLongStateOf(0L) }   // αλλάζει → νέα αναπαραγωγή όλων
+    var motionOnly by remember { mutableStateOf(false) }
     var zoom by remember { mutableIntStateOf(0) }        // 0 = 24 ώρες, 1 = 6 ώρες, 2 = 1 ώρα
     val clip by ClipRequest.flow.collectAsState()
     var pending by remember { mutableStateOf<Pair<Int, Long>?>(null) }
@@ -95,7 +96,9 @@ fun PlaybackScreen(data: StoreData) {
             }
         }
     }
-    val files = day?.getOrNull()
+    val rawFiles = day?.getOrNull()
+    // μόνο κίνηση: τα κανάλια «βλέπουν» μόνο τα τμήματα με κίνηση
+    val files = if (motionOnly && rawFiles != null) Day(rawFiles.motion, rawFiles.motion) else rawFiles
 
     // αν κανένα κανάλι δεν έχει εγγραφή εκείνη τη στιγμή → η πρώτη εγγραφή μετά
     fun normalize(t: Long): Long {
@@ -123,6 +126,20 @@ fun PlaybackScreen(data: StoreData) {
     val players = remember { mutableStateMapOf<Int, NvrPlayer>() }
     // ρολόι: η πιο πρόσφατη ώρα από τα κανάλια που παίζουν
     LaunchedEffect(Unit) { while (true) { delay(250); players.values.maxOfOrNull { it.clock.get() }?.takeIf { it > 0 }?.let { cursor = it } } }
+    // μόνο κίνηση: στο τέλος κάθε τμήματος, άλμα στο επόμενο
+    LaunchedEffect(motionOnly, files) {
+        while (motionOnly) {
+            delay(500)
+            val f = files ?: continue
+            if (paused || players.isEmpty() || cursor == 0L) continue
+            val shown = big?.let { listOf(it) } ?: group.map { it.channel }
+            val segs = shown.flatMap { f.motion[it].orEmpty() }
+            if (segs.none { ms(it.begin) - 8000 <= cursor && cursor < ms(it.end) }) {
+                val next = segs.map { ms(it.begin) }.filter { it > cursor + 1000 }.minOrNull()
+                if (next != null) seek(next) else { players.values.forEach { it.release() }; players.clear(); android.widget.Toast.makeText(ctx, "No more motion on this day", android.widget.Toast.LENGTH_SHORT).show() }
+            }
+        }
+    }
 
     Column(Modifier.fillMaxSize().padding(bottom = 92.dp)) {
         // ── κεφαλίδα: τίτλος + ημερομηνία ──
@@ -172,6 +189,7 @@ fun PlaybackScreen(data: StoreData) {
             IconButton(onClick = { if (cursor > 0) seek(cursor + 30_000) }, enabled = cursor > 0) { Icon(Icons.Outlined.Forward30, "Forward 30 s", tint = c.fg) }
             Spacer(Modifier.width(6.dp))
             listOf(1, 2, 4).forEach { x -> Chip("${x}×", speed == x) { speed = x } }
+            Chip("Motion", motionOnly) { motionOnly = !motionOnly; if (cursor > 0) seek(cursor) else rawFiles?.motion?.values?.flatten()?.minOfOrNull { ms(it.begin) }?.let { seek(it) } }
             Spacer(Modifier.weight(1f))
             Text(if (cursor > 0) hms(cursor) else "--:--:--", style = MonoMeta.copy(fontSize = 15.sp, fontWeight = FontWeight.Medium), color = c.fg)
         }

@@ -288,7 +288,7 @@ fun MainScreen(store: Store, data: StoreData, onLock: () -> Unit) {
     LaunchedEffect(Unit) {
         while (true) {
             kotlinx.coroutines.delay(1000)
-            val notes = HealthBook.tick(latest.cameras.filter { it.enabled }, 60)
+            val notes = HealthBook.tick(latest.cameras.filter { it.enabled }, 1800)
             if (latest.settings.alerts) notes.forEach { (t, b) -> notify(ctx, t, b) }
         }
     }
@@ -735,7 +735,7 @@ fun SettingsScreen(store: Store, data: StoreData, onLock: () -> Unit) {
             Spacer(Modifier.height(6.dp))
             SettingSwitch("HD in full screen", "Grid uses the light stream, full screen the main one", s.autoHd) { v -> store.update { it.copy(settings = it.settings.copy(autoHd = v)) } }
             Spacer(Modifier.height(8.dp))
-            SettingSwitch("Offline alerts", "Notify when a camera has no video for 60 s (while the app is open)", s.alerts) { v -> store.update { it.copy(settings = it.settings.copy(alerts = v)) } }
+            SettingSwitch("Offline alerts", "Notify when a camera has no video for 30 minutes (while the app is open)", s.alerts) { v -> store.update { it.copy(settings = it.settings.copy(alerts = v)) } }
             Spacer(Modifier.height(8.dp))
             val sctx = LocalContext.current
             SettingSwitch("People & vehicle alerts", "Runs in the background: the recorder's motion events are checked on the phone, and you get a photo only for people or vehicles", s.aiAlerts) { v ->

@@ -248,8 +248,8 @@ struct Settings { width: usize, height: usize, fps: u32, #[serde(default)] theme
     #[serde(default = "yes")] auto_hd: bool, #[serde(default = "yes")] alerts: bool, #[serde(default = "alert_secs")] alert_after: u64,
     #[serde(default)] group: String, #[serde(default = "sens")] motion_sens: u32, #[serde(default = "yes")] ai_only: bool, #[serde(default)] wall_autologin: bool, #[serde(default = "yes")] armed: bool }
 fn sens() -> u32 { 30 }
-fn alert_secs() -> u64 { 60 }
-impl Default for Settings { fn default() -> Self { Settings { width: 960, height: 540, fps: 12, theme: 0, show_clock: true, layout: 0, main_ch: 0, auto_hd: true, alerts: true, alert_after: 60, group: String::new(), motion_sens: 30, ai_only: true, wall_autologin: false, armed: true } } }
+fn alert_secs() -> u64 { 1800 }
+impl Default for Settings { fn default() -> Self { Settings { width: 960, height: 540, fps: 12, theme: 0, show_clock: true, layout: 0, main_ch: 0, auto_hd: true, alerts: true, alert_after: 1800, group: String::new(), motion_sens: 30, ai_only: true, wall_autologin: false, armed: true } } }
 
 #[derive(Serialize, Deserialize, Default)]
 struct Store {
@@ -1000,6 +1000,8 @@ impl App {
         let dt = self.last_tick.elapsed().as_secs_f64();
         self.last_tick = Instant::now();
         if self.health.len() != self.streams.len() { self.health = vec![Health::default(); self.streams.len()]; }
+        // παλιά προεπιλογή 60 s → 30 λεπτά
+        if self.store.settings.alert_after == 60 { self.store.settings.alert_after = 1800; self.settings_draft.alert_after = 1800; let _ = self.store.save(); }
         let after = Duration::from_secs(self.store.settings.alert_after.max(10));
         let mut notes = vec![];
         for (i, st) in self.streams.iter().enumerate() {
@@ -2071,7 +2073,7 @@ impl App {
             ui.add_space(6.0);
             egui::Grid::new("alerts").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
                 ui.label(RichText::new("Offline after").color(MUTED()));
-                ch |= ui.add(egui::DragValue::new(&mut st.alert_after).range(10..=3600).suffix(" s")).changed();
+                ch |= ui.add(egui::DragValue::new(&mut st.alert_after).range(10..=7200).suffix(" s")).changed();
                 ui.end_row();
                 ui.label(RichText::new("Motion sensitivity").color(MUTED()));
                 ch |= ui.add(egui::Slider::new(&mut st.motion_sens, 1..=100)).changed();

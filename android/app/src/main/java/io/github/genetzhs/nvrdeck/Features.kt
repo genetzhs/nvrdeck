@@ -83,13 +83,19 @@ fun grab(view: PlayerView?): Bitmap? = (view?.videoSurfaceView as? TextureView)?
 
 fun saveSnapshot(ctx: Context, bmp: Bitmap, cam: Camera): Boolean = runCatching {
     val name = "${cam.name.replace(Regex("[^A-Za-z0-9_-]"), "_")}_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())}.jpg"
-    val v = ContentValues().apply {
-        put(MediaStore.Images.Media.DISPLAY_NAME, name)
-        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-        if (Build.VERSION.SDK_INT >= 29) put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/NVRDeck")
+    if (Build.VERSION.SDK_INT >= 29) {
+        val v = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/NVRDeck")
+        }
+        val uri = ctx.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)!!
+        ctx.contentResolver.openOutputStream(uri)!!.use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
+    } else {
+        // API 26–28: το MediaStore insert απαιτεί WRITE_EXTERNAL_STORAGE — app-specific external dir χωρίς άδεια
+        val dir = java.io.File(ctx.getExternalFilesDir(android.os.Environment.DIRECTORY_PICTURES), "NVRDeck").apply { mkdirs() }
+        java.io.File(dir, name).outputStream().use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
     }
-    val uri = ctx.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v)!!
-    ctx.contentResolver.openOutputStream(uri)!!.use { bmp.compress(Bitmap.CompressFormat.JPEG, 92, it) }
     true
 }.getOrDefault(false)
 

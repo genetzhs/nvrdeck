@@ -16,7 +16,9 @@ import androidx.compose.material.icons.outlined.PhotoCamera
 import androidx.compose.material.icons.outlined.Close
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import android.app.Activity
 import android.app.Application
 import android.content.pm.ActivityInfo
@@ -103,8 +105,9 @@ class MainActivity : FragmentActivity() {
                 Box(Modifier.fillMaxSize()) {
                     AmbientBackground()
                     var unlocked by rememberSaveable { mutableStateOf(false) }
+                    var tab by rememberSaveable { mutableIntStateOf(if (data.cameras.isEmpty()) 1 else 0) }
                     if (!unlocked) LockScreen(vm.store) { unlocked = true }
-                    else MainScreen(vm.store, data) { unlocked = false }
+                    else MainScreen(vm.store, data, tab, { tab = it }) { unlocked = false }
                 }
             }
         }
@@ -252,18 +255,17 @@ private fun PinField(v: String, label: String, on: (String) -> Unit) = OutlinedT
 
 // ───────────── Κύρια οθόνη ─────────────
 @Composable
-fun MainScreen(store: Store, data: StoreData, onLock: () -> Unit) {
-    var tab by rememberSaveable { mutableIntStateOf(if (data.cameras.isEmpty()) 1 else 0) }
+fun MainScreen(store: Store, data: StoreData, tab: Int, onTab: (Int) -> Unit, onLock: () -> Unit) {
     var solo by remember { mutableStateOf<Long?>(null) }
     val ctx = LocalContext.current
     val askNotif = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
     LaunchedEffect(Unit) {
-        if (Build.VERSION.SDK_INT >= 33 && data.settings.alerts) askNotif.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+        if (Build.VERSION.SDK_INT >= 33 && (data.settings.alerts || data.settings.aiAlerts)) askNotif.launch(android.Manifest.permission.POST_NOTIFICATIONS)
     }
     val latest by rememberUpdatedState(data)
     LaunchedEffect(Unit) { if (data.settings.aiAlerts) runCatching { AlertService.start(ctx) } }
     val clip by ClipRequest.flow.collectAsStateWithLifecycle()
-    LaunchedEffect(clip) { if (clip != null) { solo = null; tab = 3 } }
+    LaunchedEffect(clip) { if (clip != null) { solo = null; onTab(3) } }
     // Αυτόματη εύρεση καναλιών NVR που λείπουν: δοκιμάζει τα επόμενα κανάλια κάθε NVR και προσθέτει όσα δίνουν εικόνα
     LaunchedEffect(Unit) {
         kotlinx.coroutines.delay(3000)
@@ -284,13 +286,6 @@ fun MainScreen(store: Store, data: StoreData, onLock: () -> Unit) {
                 } else misses++
                 ch++
             }
-        }
-    }
-    LaunchedEffect(Unit) {
-        while (true) {
-            kotlinx.coroutines.delay(1000)
-            val notes = HealthBook.tick(latest.cameras.filter { it.enabled }, 1800)
-            if (latest.settings.alerts) notes.forEach { (t, b) -> notify(ctx, t, b) }
         }
     }
 
@@ -316,7 +311,7 @@ fun MainScreen(store: Store, data: StoreData, onLock: () -> Unit) {
         // απαλό σβήσιμο του περιεχομένου κάτω από τη μπάρα
         Box(Modifier.align(Alignment.BottomCenter).fillMaxWidth().height(110.dp)
             .background(Brush.verticalGradient(listOf(Color.Transparent, cine.bg.copy(alpha = .92f)))))
-        Dock(tab, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 14.dp)) { tab = it }
+        Dock(tab, Modifier.align(Alignment.BottomCenter).navigationBarsPadding().padding(bottom = 14.dp)) { onTab(it) }
     }
 }
 
@@ -382,11 +377,11 @@ fun LiveScreen(store: Store, data: StoreData, onSolo: (Long) -> Unit) {
     val ctx = LocalContext.current
     val views = remember { mutableMapOf<Long, androidx.media3.ui.PlayerView>() }
     // #10 κάθε λεπτό: μικρογραφία της κύριας κάμερας για το widget
-    LaunchedEffect(cams.map { it.id }) {
+    LaunchedEffect(cams.map { it.id }, s.mainId) {
         kotlinx.coroutines.delay(4000)
         while (true) {
             val m = cams.firstOrNull { it.id == s.mainId } ?: cams.firstOrNull()
-            if (m != null) grab(views[m.id])?.let { updateWidget(ctx, it, m) }
+            if (m != null) grab(views[m.id])?.let { withContext(Dispatchers.IO) { updateWidget(ctx, it, m) } }
             kotlinx.coroutines.delay(60_000)
         }
     }
@@ -449,11 +444,21 @@ fun LiveScreen(store: Store, data: StoreData, onSolo: (Long) -> Unit) {
         val order = listOf(main) + cams.filter { it.id != main.id }
         val cells = layoutCells(s.layout, cams.size)
         val bigLayout = s.layout == 4 || s.layout == 5
+        // ειδοποιήσεις «offline» μόνο για τις κάμερες που αποδίδονται πραγματικά σε αυτό το layout
+        val tickCams by rememberUpdatedState(order.take(cells.size))
+        LaunchedEffect(tickCams.map { it.id }) {
+            while (true) {
+                kotlinx.coroutines.delay(1000)
+                val notes = HealthBook.tick(tickCams, 1800)
+                if (store.data.value.settings.alerts) notes.forEach { (t, b) -> notify(ctx, t, b) }
+            }
+        }
         BoxWithConstraints(Modifier.fillMaxSize().padding(start = 10.dp, end = 10.dp, bottom = 96.dp)) {
             val W = maxWidth; val H = maxHeight
             order.zip(cells).forEach { (cam, cell) ->
                 val idx = data.cameras.indexOfFirst { it.id == cam.id }
                 key(cam.id) {
+                    DisposableEffect(cam.id) { onDispose { views.remove(cam.id) } }
                     CameraTile(
                         cam, idx, s.showClock,
                         Modifier.offset(W * cell.x, H * cell.y).size(W * cell.w, H * cell.h).padding(3.dp)
@@ -629,7 +634,9 @@ fun CameraEditor(initial: Camera, onDismiss: () -> Unit, onSave: (Camera) -> Uni
             TextButton(onClick = onDismiss) { Text("Cancel", color = k.mutedStrong) }
             PrimaryButton("Save") {
                 val miss = listOfNotNull("Name".takeIf { c.name.isBlank() }, "IP / Host".takeIf { c.host.isBlank() })
-                if (miss.isNotEmpty()) err = "Required: ${miss.joinToString()}" else onSave(c.copy(name = c.name.trim()))
+                if (miss.isNotEmpty()) err = "Required: ${miss.joinToString()}"
+                else if (c.port !in 1..65535) err = "RTSP port must be 1–65535"
+                else onSave(c.copy(name = c.name.trim()))
             }
         }
     }
@@ -675,6 +682,7 @@ fun NvrDialog(free: Int, onDismiss: () -> Unit, onAdd: (List<Camera>) -> Unit) {
                 val n = (count.toIntOrNull() ?: 0).coerceAtMost(free)
                 when {
                     c.host.isBlank() -> err = "Required: IP / Host"
+                    c.port !in 1..65535 -> err = "RTSP port must be 1–65535"
                     n <= 0 -> err = "No free slots"
                     else -> onAdd((0 until n).map { j -> c.copy(id = System.nanoTime() + j, channel = f + j, name = "${name.ifBlank { "NVR" }} CH${f + j}") })
                 }
@@ -707,6 +715,7 @@ fun SettingsScreen(store: Store, data: StoreData, onLock: () -> Unit) {
     val s = data.settings
     var newPin by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
+    val askN = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
     Column(
         Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(start = 20.dp, end = 20.dp, top = 14.dp, bottom = 130.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -741,6 +750,7 @@ fun SettingsScreen(store: Store, data: StoreData, onLock: () -> Unit) {
             val sctx = LocalContext.current
             SettingSwitch("People & vehicle alerts", "Runs in the background: the recorder's motion events are checked on the phone, and you get a photo only for people or vehicles", s.aiAlerts) { v ->
                 store.update { it.copy(settings = it.settings.copy(aiAlerts = v)) }
+                if (v && Build.VERSION.SDK_INT >= 33) askN.launch(android.Manifest.permission.POST_NOTIFICATIONS)
                 if (v) AlertService.start(sctx) else AlertService.stop(sctx)
                 // εξαίρεση από την εξοικονόμηση μπαταρίας, αλλιώς το σύστημα σταματά την υπηρεσία
                 val pm = sctx.getSystemService(android.os.PowerManager::class.java)
@@ -869,8 +879,7 @@ fun SoloView(cam: Camera, idx: Int, s: Settings, onClose: () -> Unit) {
                             }
                             val f = java.util.concurrent.atomic.AtomicBoolean(false); talking = f; msg = "Connecting…"
                             Thread { Talk.run(cam, f) { s -> msg = s } }.start()
-                            tryAwaitRelease()
-                            f.set(true); talking = null
+                            try { tryAwaitRelease() } finally { f.set(true); talking = null }
                         })
                     }.padding(12.dp)) { Icon(Icons.Outlined.Mic, "Hold to talk", tint = Color.White) }
             }

@@ -103,18 +103,20 @@ fun exportClip(ctx: Context, cam: Camera, files: List<Dvr.RecFile>, from: Long, 
             tmp.inputStream().use { it.copyTo(all) }; tmp.delete()
         }
     }
-    remuxToMp4(raw, mp4); raw.delete()
-    val name = "${cam.name.replace(Regex("[^A-Za-z0-9_-]+"), "_")}_${Instant.ofEpochMilli(from).atZone(ZoneId.systemDefault()).format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))}.mp4"
-    if (Build.VERSION.SDK_INT >= 29) {
-        val cv = ContentValues().apply { put(MediaStore.Video.Media.DISPLAY_NAME, name); put(MediaStore.Video.Media.MIME_TYPE, "video/mp4"); put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/NVRDeck") }
-        val uri = ctx.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv) ?: error("Could not create the file")
-        ctx.contentResolver.openOutputStream(uri)!!.use { o -> mp4.inputStream().use { it.copyTo(o) } }
-    } else {
-        val dir = File(ctx.getExternalFilesDir(Environment.DIRECTORY_MOVIES), "NVRDeck").apply { mkdirs() }
-        mp4.copyTo(File(dir, name), overwrite = true)
-    }
-    mp4.delete(); progress(1f)
-    return name
+    try {
+        remuxToMp4(raw, mp4); raw.delete()
+        val name = "${cam.name.replace(Regex("[^A-Za-z0-9_-]+"), "_")}_${Instant.ofEpochMilli(from).atZone(ZoneId.systemDefault()).format(java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss"))}.mp4"
+        if (Build.VERSION.SDK_INT >= 29) {
+            val cv = ContentValues().apply { put(MediaStore.Video.Media.DISPLAY_NAME, name); put(MediaStore.Video.Media.MIME_TYPE, "video/mp4"); put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/NVRDeck") }
+            val uri = ctx.contentResolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv) ?: error("Could not create the file")
+            ctx.contentResolver.openOutputStream(uri)!!.use { o -> mp4.inputStream().use { it.copyTo(o) } }
+        } else {
+            val dir = File(ctx.getExternalFilesDir(Environment.DIRECTORY_MOVIES), "NVRDeck").apply { mkdirs() }
+            mp4.copyTo(File(dir, name), overwrite = true)
+        }
+        progress(1f)
+        return name
+    } finally { raw.delete(); mp4.delete() }
 }
 
 // ── Υγεία καταγραφικού ──

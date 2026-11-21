@@ -83,8 +83,10 @@ fun PlaybackScreen(data: StoreData) {
     } }
     val day0 = date.atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
 
+    val players = remember { mutableStateMapOf<Int, NvrPlayer>() }
     LaunchedEffect(date, cam.host) {
         day = null; cursor = 0; seekReq = 0
+        players.values.forEach { it.release() }; players.clear()
         day = withContext(Dispatchers.IO) {
             runCatching {
                 Dvr.connect(cam.host, cam.user, cam.pass).use { d ->
@@ -107,7 +109,7 @@ fun PlaybackScreen(data: StoreData) {
         if (covers) return t
         return f.all.values.flatten().map { ms(it.begin) }.filter { it > t }.minOrNull() ?: t
     }
-    fun seek(t: Long) { val n = normalize(t); cursor = n; seekReq = n + (seekReq % 7) + 1 } // +k ώστε να αλλάζει πάντα
+    fun seek(t: Long) { val n = normalize(t); cursor = n; seekReq++ }
 
     // από ειδοποίηση: λίγα δευτερόλεπτα πριν το συμβάν, μεγάλο το κανάλι
     LaunchedEffect(files, pending) { val p = pending; if (files != null && p != null) { pending = null; big = p.first; zoom = 2; seek(p.second - 6_000) } }
@@ -123,7 +125,6 @@ fun PlaybackScreen(data: StoreData) {
     if (showHealth) HealthSheet(health) { showHealth = false }
     if (showEvents && files != null) EventsSheet(group, files.all, files.motion, onPick = { ch, t -> showEvents = false; big = ch; zoom = 2; seek(t - 2000) }) { showEvents = false }
 
-    val players = remember { mutableStateMapOf<Int, NvrPlayer>() }
     // ρολόι: η πιο πρόσφατη ώρα από τα κανάλια που παίζουν
     LaunchedEffect(Unit) { while (true) { delay(250); players.values.maxOfOrNull { it.clock.get() }?.takeIf { it > 0 }?.let { cursor = it } } }
     // μόνο κίνηση: στο τέλος κάθε τμήματος, άλμα στο επόμενο
@@ -284,9 +285,12 @@ private fun ChannelView(ch: Camera, files: Day?, seekReq: Long, cursor: Long, pa
 private fun Timeline(group: List<Camera>, files: Day?, day: Result<Day>?, day0: Long, cursor: Long, zoom: Int, markIn: Long, markOut: Long, onZoom: () -> Unit, onSeek: (Long) -> Unit) {
     val c = cine
     val span = when (zoom) { 1 -> 6 * 3_600_000L; 2 -> 3_600_000L; else -> 86_400_000L }
-    // ορατό παράθυρο γύρω από την τρέχουσα θέση
-    val vs = if (zoom == 0 || cursor == 0L) day0 else (cursor - span / 2).coerceIn(day0, day0 + 86_400_000L - span)
     var drag by remember { mutableStateOf<Long?>(null) }
+    // ορατό παράθυρο γύρω από την τρέχουσα θέση — παγωμένο όσο κρατάει το drag
+    var dragVs by remember { mutableLongStateOf(0L) }
+    val baseVs = if (zoom == 0 || cursor == 0L) day0 else (cursor - span / 2).coerceIn(day0, day0 + 86_400_000L - span)
+    val vs = if (drag != null && dragVs > 0) dragVs else baseVs
+    val vsCur by rememberUpdatedState(vs)
     GlassCard(Modifier.fillMaxWidth().padding(horizontal = 10.dp), padding = 10.dp, radius = 18.dp) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(when { day == null -> "Loading recordings…"; day.isFailure -> "Recorder not reachable (is the VPN on?)"; cursor == 0L -> "Tap or drag on the bar to play"; else -> "Drag to move in time" },
@@ -300,13 +304,13 @@ private fun Timeline(group: List<Camera>, files: Day?, day: Result<Day>?, day0: 
         val rowH = 13.dp
         val accent = c.accent; val track = c.inset; val fg = c.fg; val muted = c.muted
         Canvas(Modifier.fillMaxWidth().height(rowH * group.size + 4.dp * group.size + 18.dp)
-            .pointerInput(vs, span) {
-                fun t(x: Float) = vs + (x / size.width * span).toLong().coerceIn(0, span - 1)
+            .pointerInput(span) {
+                fun t(x: Float) = vsCur + (x / size.width * span).toLong().coerceIn(0, span - 1)
                 detectTapGestures { onSeek(t(it.x)) }
             }
-            .pointerInput(vs, span) {
-                fun t(x: Float) = vs + (x / size.width * span).toLong().coerceIn(0, span - 1)
-                detectDragGestures(onDragEnd = { drag?.let(onSeek); drag = null }, onDragCancel = { drag = null }) { ch, _ -> drag = t(ch.position.x) }
+            .pointerInput(span) {
+                fun t(x: Float) = vsCur + (x / size.width * span).toLong().coerceIn(0, span - 1)
+                detectDragGestures(onDragStart = { dragVs = vsCur }, onDragEnd = { drag?.let(onSeek); drag = null; dragVs = 0 }, onDragCancel = { drag = null; dragVs = 0 }) { ch, _ -> drag = t(ch.position.x) }
             }) {
             val w = size.width
             fun x(t: Long) = ((t - vs).toFloat() / span * w)

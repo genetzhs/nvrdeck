@@ -23,6 +23,7 @@ class AlertService : Service() {
     @Volatile private var running = true
     private val threads = mutableListOf<Thread>()
     private val store by lazy { Store(this) }
+    private val shownIds = java.util.concurrent.ConcurrentLinkedQueue<Int>()
 
     companion object {
         private const val CH_FG = "service"
@@ -49,26 +50,30 @@ class AlertService : Service() {
         ServiceCompat.startForeground(this, 7, n, if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0)
         if (intent?.action == "disarm") {
             store.update { it.copy(settings = it.settings.copy(armed = false)) }
-            NotificationManagerCompat.from(this).cancelAll()
+            val nm = NotificationManagerCompat.from(this)
+            while (true) { val id = shownIds.poll() ?: break; runCatching { nm.cancel(id) } }
         }
         if (threads.isEmpty()) launch()
         return START_STICKY
     }
 
     private fun launch() {
-        val data = store.data.value
-        val recorders = data.cameras.filter { it.proto == Proto.XMEYE }.groupBy { it.host }.values.filter { it.size > 1 }
-        val detector = runCatching { Detector(this) }.getOrNull() ?: return
-        for (group in recorders) threads += Thread { watch(group, detector) }.apply { isDaemon = true; start() }
-        for (group in recorders) threads += Thread { healthLoop(group.sortedBy { it.channel }) }.apply { isDaemon = true; start() }
+        val hosts = store.data.value.cameras.filter { it.enabled && it.proto == Proto.XMEYE }.map { it.host }.distinct()
+        // οι βρόχοι υγείας δεν χρειάζονται τον ανιχνευτή
+        for (h in hosts) threads += Thread { healthLoop(h) }.apply { isDaemon = true; start() }
+        val detector = runCatching { Detector.shared(this) }.getOrNull() ?: return
+        for (h in hosts) threads += Thread { watch(h, detector) }.apply { isDaemon = true; start() }
     }
 
-    private fun watch(group: List<Camera>, det: Detector) {
-        val cam = group.first()
+    private fun watch(host: String, det: Detector) {
         val known = HashMap<Int, List<Detector.Hit>>()  // ό,τι «στέκεται» σε κάθε κανάλι
         val lastAlert = HashMap<Int, Long>()
         var backoff = 5_000L
         while (running) {
+            // φρέσκα κανάλια κάθε προσπάθεια: ό,τι απενεργοποιήθηκε ή διαγράφηκε δεν ειδοποιεί
+            val group = store.data.value.cameras.filter { it.enabled && it.proto == Proto.XMEYE && it.host == host }
+            if (group.isEmpty()) { Thread.sleep(5_000); continue }
+            val cam = group.first()
             try {
                 Dvr.connect(cam.host, cam.user, cam.pass).use { d ->
                     d.subscribeAlarms()
@@ -127,18 +132,22 @@ class AlertService : Service() {
     }
 
     /** Κάθε 10 λεπτά: ειδοποίηση αν κανάλι σταμάτησε να γράφει (> 30 λεπτά, ενώ έγραφε το τελευταίο 24ωρο). */
-    private fun healthLoop(group: List<Camera>) {
+    private fun healthLoop(host: String) {
         val warned = HashSet<String>()
         while (running) {
-            val h = readHealth(group); val now = System.currentTimeMillis()
-            if (h.err == null) h.chans.forEach { (name, _, last) ->
-                val stale = last != null && now - last > 30 * 60_000 && now - last < 86_400_000
-                if (stale && warned.add(name)) {
-                    val n = NotificationCompat.Builder(this, CH_AI).setSmallIcon(R.drawable.ic_stat_cam).setContentTitle("$name stopped recording")
-                        .setContentText("Last recording at ${hms(last!!).take(5)}.").setPriority(NotificationCompat.PRIORITY_HIGH).setAutoCancel(true).build()
-                    runCatching { NotificationManagerCompat.from(this).notify(name.hashCode(), n) }
+            val group = store.data.value.cameras.filter { it.enabled && it.proto == Proto.XMEYE && it.host == host }.sortedBy { it.channel }
+            if (group.isNotEmpty()) {
+                val h = readHealth(group); val now = System.currentTimeMillis()
+                if (h.err == null) h.chans.forEach { (name, _, last) ->
+                    val stale = last != null && now - last > 30 * 60_000 && now - last < 86_400_000
+                    if (stale && warned.add(name)) {
+                        val n = NotificationCompat.Builder(this, CH_AI).setSmallIcon(R.drawable.ic_stat_cam).setContentTitle("$name stopped recording")
+                            .setContentText("Last recording at ${hms(last!!).take(5)}.").setPriority(NotificationCompat.PRIORITY_HIGH).setAutoCancel(true).build()
+                        shownIds.add(name.hashCode())
+                        runCatching { NotificationManagerCompat.from(this).notify(name.hashCode(), n) }
+                    }
+                    if (!stale) warned.remove(name)
                 }
-                if (!stale) warned.remove(name)
             }
             repeat(600) { if (running) Thread.sleep(1000) }
         }
@@ -151,6 +160,7 @@ class AlertService : Service() {
         val b = NotificationCompat.Builder(this, CH_AI).setSmallIcon(R.drawable.ic_stat_cam).setContentTitle(title).setContentText(text)
             .addAction(0, "Disarm", dis).setContentIntent(pi).setAutoCancel(true).setPriority(NotificationCompat.PRIORITY_HIGH)
         if (bmp != null) b.setLargeIcon(bmp).setStyle(NotificationCompat.BigPictureStyle().bigPicture(bmp).bigLargeIcon(null as android.graphics.Bitmap?))
+        shownIds.add(1000 + ch)
         runCatching { NotificationManagerCompat.from(this).notify(1000 + ch, b.build()) }
     }
 

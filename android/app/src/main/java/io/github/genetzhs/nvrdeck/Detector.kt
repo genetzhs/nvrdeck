@@ -15,7 +15,7 @@ class Detector(ctx: Context) : AutoCloseable {
     data class Hit(val cls: Int, val score: Float, val box: FloatArray)
 
     private val env = OrtEnvironment.getEnvironment()
-    private val session: OrtSession = env.createSession(ctx.assets.open("yolox_nano.onnx").readBytes(), OrtSession.SessionOptions())
+    private val session: OrtSession = env.createSession(ctx.assets.open("yolox_nano.onnx").use { it.readBytes() }, OrtSession.SessionOptions())
     private val input = session.inputNames.first()
 
     companion object {

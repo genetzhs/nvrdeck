@@ -22,6 +22,7 @@ class Dvr private constructor(private val host: String, private val port: Int, p
     private var seq = 0
     private val inp = DataInputStream(BufferedInputStream(s.getInputStream()))
     private val out: OutputStream = s.getOutputStream()
+    private val alarmQueue = java.util.concurrent.ConcurrentLinkedQueue<Alarm>()
 
     data class RecFile(val channel: Int, val begin: String, val end: String, val name: String, val sizeKb: Long)
 
@@ -122,8 +123,8 @@ class Dvr private constructor(private val host: String, private val port: Int, p
         // δεύτερη σύνδεση με το ίδιο session: εκεί έρχονται τα δεδομένα
         val data = Dvr(host, port, open(host, port)).also { it.session = session }
         data.use { dc ->
-            dc.call(1424, pb("Claim"))
-            call(1420, pb("DownloadStart"))
+            ok(dc.call(1424, pb("Claim")), "download claim")
+            ok(call(1420, pb("DownloadStart")), "download start")
             var total = 0L
             dst.outputStream().buffered().use { o ->
                 while (true) {
@@ -154,8 +155,8 @@ class Dvr private constructor(private val host: String, private val port: Int, p
         }
         val data = Dvr(host, port, open(host, port)).also { it.session = session }
         data.use { dc ->
-            dc.call(1424, pb("Claim"))
-            call(1420, pb("DownloadStart"))
+            ok(dc.call(1424, pb("Claim")), "playback claim")
+            ok(call(1420, pb("DownloadStart")), "playback start")
             while (true) {
                 val (m, b) = dc.recv()
                 if (m != 1426) continue
@@ -173,8 +174,13 @@ class Dvr private constructor(private val host: String, private val port: Int, p
 
     /** Επόμενο συμβάν ή null αν δεν ήρθε τίποτα μέσα στο χρονικό όριο. */
     fun nextAlarm(): Alarm? {
+        alarmQueue.poll()?.let { return it }
         val (m, b) = try { recv() } catch (_: java.net.SocketTimeoutException) { return null }
         if (m != 1504) return null
+        return alarmOf(b)
+    }
+
+    private fun alarmOf(b: ByteArray): Alarm? {
         val a = json(b)["AlarmInfo"]?.jsonObject ?: return null
         return Alarm(a["Channel"]?.jsonPrimitive?.intOrNull ?: 0, a["Event"]?.jsonPrimitive?.content ?: "", a["Status"]?.jsonPrimitive?.content == "Start")
     }
@@ -184,6 +190,8 @@ class Dvr private constructor(private val host: String, private val port: Int, p
         send(1560, buildJsonObject { put("Name", "OPSNAP"); put("SessionID", sid()); putJsonObject("OPSNAP") { put("Channel", channel) } })
         repeat(50) {
             val (m, b) = recv()
+            // τυχόν πακέτα συναγερμού που φτάνουν meanwhile: στην ουρά, δεν μετράνε ως απάντηση του snapshot
+            if (m == 1504) { runCatching { alarmOf(b)?.let { alarmQueue.add(it) } }; return@repeat }
             if (m == 1561) {
                 for (i in 0 until b.size - 1) if (b[i] == 0xFF.toByte() && b[i + 1] == 0xD8.toByte()) return b.copyOfRange(i, b.size)
                 throw Exception("Snapshot refused")
@@ -204,7 +212,8 @@ class Dvr private constructor(private val host: String, private val port: Int, p
     fun talkStart(ch: Int?): Dvr {
         ok(call(1430, talkBody("Start", ch)), "talk")
         val d = Dvr(host, port, open(host, port)).also { it.session = session }
-        d.ok(d.call(1434, talkBody("Claim", ch)), "talk claim")
+        try { d.ok(d.call(1434, talkBody("Claim", ch)), "talk claim") }
+        catch (e: Exception) { runCatching { d.close() }; throw e }
         return d
     }
     fun talkStop() = runCatching { send(1430, buildJsonObject { put("Name", "OPTalk"); put("SessionID", sid()); putJsonObject("OPTalk") { put("Action", "Stop") } }) }
@@ -241,7 +250,7 @@ fun remuxToMp4(src: File, dst: File) {
     var fps = 15
     var hevc = false
     var n = 0L
-    val buf = ByteBuffer.allocateDirect(4 shl 20)
+    val buf = ByteBuffer.allocateDirect((8 shl 20) + (1 shl 16))
     fun le32(b: ByteArray, o: Int) = (b[o].toInt() and 0xFF) or ((b[o + 1].toInt() and 0xFF) shl 8) or ((b[o + 2].toInt() and 0xFF) shl 16) or ((b[o + 3].toInt() and 0xFF) shl 24)
     try {
         val h = ByteArray(16)

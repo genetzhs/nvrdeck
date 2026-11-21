@@ -276,6 +276,7 @@ fun MainScreen(store: Store, data: StoreData, onLock: () -> Unit) {
             var ch = base.channel + 1
             while (misses < 2 && ch <= 16 && latest.cameras.size < MAX_CH) {
                 val cand = base.copy(id = System.nanoTime(), channel = ch, name = "$prefix CH$ch", group = base.group)
+                if ("${cand.host}:${cand.port}:$ch" in latest.settings.ignoredCh) { ch++; continue }
                 if (probeCamera(ctx, cand.url()).isSuccess) {
                     if (latest.cameras.none { it.host == cand.host && it.port == cand.port && it.channel == ch })
                         store.update { it.copy(cameras = it.cameras + cand) }
@@ -545,7 +546,7 @@ fun CamerasScreen(store: Store, data: StoreData) {
             onDismissRequest = { deleting = null }, containerColor = c.bgEnd, shape = RoundedCornerShape(22.dp),
             title = { Text("Delete camera", fontFamily = Geist, fontWeight = FontWeight.SemiBold) },
             text = { Text("Delete \"${cam.name}\"?", color = c.mutedStrong) },
-            confirmButton = { TextButton(onClick = { store.update { d -> d.copy(cameras = d.cameras.filter { it.id != cam.id }) }; deleting = null }) { Text("Delete", color = c.down) } },
+            confirmButton = { TextButton(onClick = { store.update { d -> d.copy(cameras = d.cameras.filter { it.id != cam.id }, settings = d.settings.copy(ignoredCh = (d.settings.ignoredCh + "${cam.host}:${cam.port}:${cam.channel}").distinct())) }; deleting = null }) { Text("Delete", color = c.down) } },
             dismissButton = { TextButton(onClick = { deleting = null }) { Text("Cancel", color = c.mutedStrong) } },
         )
     }

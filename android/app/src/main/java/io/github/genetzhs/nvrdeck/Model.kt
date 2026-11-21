@@ -61,6 +61,7 @@ data class Settings(
     val group: String = "",
     val armed: Boolean = true,
     val alertPhoto: Boolean = true,
+    val ignoredCh: List<String> = emptyList(),   // κανάλια NVR που διέγραψε ο χρήστης: η αυτόματη εύρεση δεν τα ξαναπροσθέτει
     val widgetId: Long = 0,
     val aiAlerts: Boolean = false,
 )

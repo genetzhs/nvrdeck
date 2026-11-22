@@ -1100,8 +1100,15 @@ impl App {
 
     fn restart_streams(&mut self, ctx: &egui::Context) {
         self.streams.clear(); // Drop σταματά τα παλιά ffmpeg
+        let auto_hd = self.store.settings.auto_hd;
         self.streams = self.store.camera.iter().map(|c| {
-            c.enabled.then(|| Stream::start(c.url(), self.store.settings.clone(), ctx.clone()))
+            if !c.enabled { return None; }
+            let mut grid = c.clone();
+            // Με Auto HD το πλέγμα χρησιμοποιεί ΠΑΝΤΑ το ελαφρύ sub-stream, ακόμη κι αν η
+            // κάμερα έχει επιλεγμένο Main. Το Main ανοίγει μόνο στην πλήρη προβολή· αλλιώς
+            // επτά 1080p/25 fps decoders μπορούν να καταναλώσουν όλους τους πυρήνες.
+            if auto_hd { grid.main_stream = false; }
+            Some(Stream::start(grid.url(), self.store.settings.clone(), ctx.clone()))
         }).collect();
         if self.solo.map_or(false, |i| i >= self.streams.len()) { self.solo = None; }
         self.hd = None;
@@ -1416,7 +1423,7 @@ impl App {
         }
         if ctx.input(|k| k.key_pressed(egui::Key::W)) && !ctx.wants_keyboard_input() { self.chrome ^= true; }
         // #7: στην πλήρη προβολή ανοίγει το κύριο (HD) stream· στο πλέγμα μένει το ελαφρύ
-        let want_hd = self.solo.filter(|&i| self.store.settings.auto_hd && self.store.camera.get(i).map_or(false, |c| c.enabled && !c.main_stream));
+        let want_hd = self.solo.filter(|&i| self.store.settings.auto_hd && self.store.camera.get(i).map_or(false, |c| c.enabled && c.proto != Proto::Custom));
         if self.hd.as_ref().map(|h| h.0) != want_hd {
             self.hd = want_hd.map(|i| {
                 let mut c = self.store.camera[i].clone();
@@ -2244,7 +2251,7 @@ impl App {
                 ui.add(egui::Slider::new(&mut d.fps, 2..=25));
             });
             ui.add_space(4.0);
-            if switch(ui, &mut self.store.settings.auto_hd, "Full view switches to the HD main stream").changed() {
+            if switch(ui, &mut self.store.settings.auto_hd, "Light sub-streams in grid, HD main stream in full view").changed() {
                 self.settings_draft.auto_hd = self.store.settings.auto_hd;
                 let _ = self.store.save();
             }

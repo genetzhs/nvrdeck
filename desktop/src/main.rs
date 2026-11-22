@@ -20,9 +20,9 @@ const MAX_CH: usize = 7;
 #[derive(Clone, Copy)]
 struct Pal { bg: Color32, panel: Color32, surface: Color32, hover: Color32, border: Color32, text: Color32, muted: Color32, accent: Color32, dark: bool }
 const THEMES: [(&str, Pal); 3] = [
-    ("Cinematic", Pal { bg: Color32::from_rgb(8, 8, 9), panel: Color32::from_rgb(18, 18, 20), surface: Color32::from_rgb(26, 27, 29),
-        hover: Color32::from_rgb(36, 37, 40), border: Color32::from_rgb(44, 45, 49), text: Color32::from_rgb(243, 244, 248),
-        muted: Color32::from_rgb(139, 144, 166), accent: Color32::from_rgb(139, 124, 255), dark: true }),
+    ("Cinematic", Pal { bg: Color32::from_rgb(12, 14, 20), panel: Color32::from_rgb(17, 20, 28), surface: Color32::from_rgb(25, 29, 39),
+        hover: Color32::from_rgb(34, 39, 52), border: Color32::from_rgb(46, 52, 66), text: Color32::from_rgb(240, 243, 250),
+        muted: Color32::from_rgb(148, 156, 178), accent: Color32::from_rgb(139, 124, 255), dark: true }),
     ("Light", Pal { bg: Color32::from_rgb(244, 245, 251), panel: Color32::from_rgb(255, 255, 255), surface: Color32::from_rgb(240, 241, 248),
         hover: Color32::from_rgb(231, 233, 243), border: Color32::from_rgb(225, 227, 236), text: Color32::from_rgb(18, 19, 28),
         muted: Color32::from_rgb(106, 112, 136), accent: Color32::from_rgb(91, 75, 245), dark: false }),
@@ -147,9 +147,6 @@ fn apply_theme(ctx: &egui::Context, idx: u32) {
 
 /// «Γυάλινο» γέμισμα καρτών: διάφανο λευκό στο σκοτεινό θέμα, συμπαγές στα ανοιχτά.
 fn glass() -> Color32 { if pal().dark { Color32::from_rgba_unmultiplied(255, 255, 255, 9) } else { PANEL() } }
-fn glass_frame() -> egui::Frame {
-    egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0_f32, BORDER())).rounding(22.0).inner_margin(egui::Margin::same(18.0))
-}
 /// Μικρή κεφαλαία ετικέτα + μεγάλος τίτλος.
 fn screen_title(ui: &mut egui::Ui, eyebrow: &str, title: &str) {
     ui.label(RichText::new(eyebrow.to_uppercase()).color(MUTED()).size(11.5).extra_letter_spacing(1.6));
@@ -161,6 +158,68 @@ fn primary(text: &str) -> egui::Button<'static> {
 }
 fn danger(text: &str) -> egui::Button<'static> {
     egui::Button::new(RichText::new(text.to_string()).color(BAD)).fill(SURFACE())
+}
+
+/// Δευτερεύον κουμπί — ήπιο γέμισμα με περίγραμμα· τα βασικά actions μένουν στο ACCENT.
+fn secondary(text: &str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(text.to_string()).font(semibold(13.5)).color(TEXT()))
+        .fill(SURFACE()).stroke(Stroke::new(1.0_f32, BORDER())).rounding(999.0)
+}
+
+/// Μικρό «chip» (κυψελίδα με κείμενο) — π.χ. η εγκατεστημένη έκδοση στα Updates.
+fn chip(ui: &mut egui::Ui, text: String) {
+    let gal = ui.painter().layout_no_wrap(text, egui::FontId::proportional(12.5), TEXT());
+    let (r, _) = ui.allocate_exact_size(gal.size() + egui::vec2(16.0, 8.0), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(r, 999.0, if pal().dark { Color32::from_rgba_unmultiplied(255, 255, 255, 14) } else { SURFACE() });
+    p.rect_stroke(r, 999.0, Stroke::new(1.0_f32, BORDER()));
+    p.galley(r.center() - gal.size() / 2.0, gal, TEXT());
+}
+
+/// Μοντέρνος διακόπτης (switch) αντί για checkbox: όλη η σειρά (πίληκας + ετικέτα) είναι
+/// σημείο κλικ, ο κόμπος γλιστράει με σύντομο ease-out. Επιστρέφει changed() όταν αλλάξει.
+fn switch(ui: &mut egui::Ui, on: &mut bool, label: &str) -> egui::Response {
+    let gal = ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(14.0), TEXT());
+    let (r, mut resp) = ui.allocate_exact_size(egui::vec2(54.0 + gal.size().x, gal.size().y.max(24.0)), egui::Sense::click());
+    if resp.clicked() || (resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) { *on = !*on; resp.mark_changed(); }
+    let t = ui.ctx().animate_bool_with_time(egui::Id::new("nvr-switch").with(label), *on, 0.13);
+    let p = ui.painter();
+    let track = egui::Rect::from_min_size(egui::pos2(r.left(), r.center().y - 12.0), egui::vec2(44.0, 24.0));
+    let off = if pal().dark { Color32::from_rgb(52, 58, 74) } else { Color32::from_rgb(213, 217, 228) };
+    let a = ACCENT();
+    let mix = |x: u8, y: u8| (x as f32 + ((y as f32) - (x as f32)) * t) as u8;
+    p.rect_filled(track, 12.0, Color32::from_rgb(mix(off.r(), a.r()), mix(off.g(), a.g()), mix(off.b(), a.b())));
+    let kx = track.left() + 3.0 + (track.width() - 6.0 - 18.0) * t;
+    p.circle_filled(egui::pos2(kx + 9.0, track.center().y + 1.2), 9.2, Color32::from_black_alpha(70));
+    p.circle_filled(egui::pos2(kx + 9.0, track.center().y), 9.0, Color32::WHITE);
+    p.galley(egui::pos2(track.right() + 10.0, r.center().y - gal.size().y / 2.0), gal, TEXT());
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// Επιλογέας τμήματος (segmented control) — π.χ. [360p | 540p | 720p | 1080p].
+/// Επιστρέφει την επιλογή που έγινε κλικ, αν άλλαξε.
+fn segmented(ui: &mut egui::Ui, opts: &[(&str, usize, usize)], cur: usize) -> Option<(usize, usize)> {
+    let gal: Vec<_> = opts.iter().map(|(t, _, _)| ui.painter().layout_no_wrap(t.to_string(), egui::FontId::proportional(13.0), TEXT())).collect();
+    let w = gal.iter().map(|g| g.size().x).sum::<f32>() + 16.0 * opts.len() as f32 + 2.0 * (opts.len() - 1) as f32;
+    let h = 32.0;
+    let (r, resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::click());
+    let p = ui.painter();
+    p.rect_filled(r, 999.0, if pal().dark { Color32::from_rgba_unmultiplied(255, 255, 255, 8) } else { SURFACE() });
+    p.rect_stroke(r, 999.0, Stroke::new(1.0_f32, BORDER()));
+    let mut pick = None;
+    let mut x = r.left() + 2.0;
+    for (i, (t, sw, sh)) in opts.iter().enumerate() {
+        let seg = egui::Rect::from_min_size(egui::pos2(x, r.top() + 2.0), egui::vec2(gal[i].size().x + 16.0, h - 4.0));
+        let sel = cur == *sw;
+        let hov = ui.input(|i| i.pointer.hover_pos().is_some_and(|pp| seg.contains(pp)));
+        if sel { p.rect_filled(seg, 999.0, if pal().dark { Color32::from_rgba_unmultiplied(255, 255, 255, 26) } else { Color32::WHITE }); }
+        let col = if sel || hov { TEXT() } else { MUTED() };
+        let g = p.layout_no_wrap(t.to_string(), egui::FontId::proportional(13.0), col);
+        p.galley(seg.center() - g.size() / 2.0, g, col);
+        if resp.clicked() && resp.interact_pointer_pos().is_some_and(|pp| seg.contains(pp)) { pick = Some((*sw, *sh)); }
+        x = seg.right() + 2.0;
+    }
+    pick
 }
 
 // ───────────────────────── Ρυθμίσεις / αποθήκευση ─────────────────────────
@@ -2139,14 +2198,15 @@ impl App {
     }
 
     fn card(ui: &mut egui::Ui, title: &str, sub: &str, body: impl FnOnce(&mut egui::Ui)) {
-        glass_frame().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).font(semibold(15.0)));
-            if !sub.is_empty() { ui.label(RichText::new(sub).color(MUTED()).small()); }
-            ui.add_space(10.0);
-            body(ui);
-        });
-        ui.add_space(14.0);
+        egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0_f32, BORDER())).rounding(16.0)
+            .inner_margin(egui::Margin::symmetric(20.0, 16.0)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(RichText::new(title).font(semibold(15.0)));
+                if !sub.is_empty() { ui.add_space(2.0); ui.label(RichText::new(sub).color(MUTED()).size(12.0)); }
+                ui.add_space(12.0);
+                body(ui);
+            });
+        ui.add_space(16.0);
     }
 
     fn settings_left(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
@@ -2169,32 +2229,30 @@ impl App {
                     }
                 }
             });
-            ui.add_space(10.0);
-            if ui.checkbox(&mut self.store.settings.show_clock, "Clock with seconds on the video (LIVE badge)").changed() {
+            ui.add_space(12.0);
+            if switch(ui, &mut self.store.settings.show_clock, "Clock with seconds on the video (LIVE badge)").changed() {
                 self.settings_draft.show_clock = self.store.settings.show_clock;
                 let _ = self.store.save();
             }
         });
         Self::card(ui, "Video quality", "Grid resolution and frame rate. Lower = less CPU.", |ui| {
             let d = &mut self.settings_draft;
-            ui.horizontal(|ui| {
-                for (w, h, t) in [(640, 360, "360p"), (960, 540, "540p"), (1280, 720, "720p"), (1920, 1080, "1080p")] {
-                    if ui.selectable_label(d.width == w, t).clicked() { d.width = w; d.height = h; }
-                }
-            });
-            ui.add_space(6.0);
+            if let Some((w, h)) = segmented(ui, &[("360p", 640, 360), ("540p", 960, 540), ("720p", 1280, 720), ("1080p", 1920, 1080)], d.width) { d.width = w; d.height = h; }
+            ui.add_space(10.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("FPS").color(MUTED()));
                 ui.add(egui::Slider::new(&mut d.fps, 2..=25));
             });
-            ui.add_space(6.0);
-            if ui.checkbox(&mut self.store.settings.auto_hd, "Full view switches to the HD main stream").changed() {
+            ui.add_space(4.0);
+            if switch(ui, &mut self.store.settings.auto_hd, "Full view switches to the HD main stream").changed() {
                 self.settings_draft.auto_hd = self.store.settings.auto_hd;
                 let _ = self.store.save();
             }
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             let dirty = self.settings_draft.width != self.store.settings.width || self.settings_draft.fps != self.store.settings.fps;
-            if ui.add_enabled(dirty, primary("Apply")).clicked() {
+            // ανενεργό «Apply»: ήπιο ουδέτερο χάπι αντί για θαμμένο βιολετί
+            let apply = if dirty { primary("Apply") } else { egui::Button::new(RichText::new("Apply").font(semibold(14.0)).color(MUTED())).fill(SURFACE()).stroke(Stroke::new(1.0_f32, BORDER())).rounding(999.0) };
+            if ui.add_enabled(dirty, apply).clicked() {
                 self.store.settings.width = self.settings_draft.width;
                 self.store.settings.height = self.settings_draft.height;
                 self.store.settings.fps = self.settings_draft.fps;
@@ -2203,7 +2261,7 @@ impl App {
             }
         });
         Self::card(ui, "Channels", "How the channel list is kept in sync.", |ui| {
-            if ui.checkbox(&mut self.store.settings.auto_scan, "Add new recorder channels automatically").changed() {
+            if switch(ui, &mut self.store.settings.auto_scan, "Add new recorder channels automatically").changed() {
                 self.settings_draft.auto_scan = self.store.settings.auto_scan;
                 let _ = self.store.save();
             }
@@ -2214,8 +2272,8 @@ impl App {
     fn settings_right(&mut self, ui: &mut egui::Ui) {
         Self::card(ui, "Alerts", "Desktop notifications while NVRDeck is running.", |ui| {
             let st = &mut self.store.settings;
-            let mut ch = ui.checkbox(&mut st.alerts, "Notify when a camera goes offline or detects motion").changed();
-            ui.add_space(6.0);
+            let mut ch = switch(ui, &mut st.alerts, "Notify when a camera goes offline or detects motion").changed();
+            ui.add_space(10.0);
             egui::Grid::new("alerts").num_columns(2).spacing([14.0, 8.0]).show(ui, |ui| {
                 ui.label(RichText::new("Offline after").color(MUTED()));
                 ch |= ui.add(egui::DragValue::new(&mut st.alert_after).range(10..=7200).suffix(" s")).changed();
@@ -2224,14 +2282,14 @@ impl App {
                 ch |= ui.add(egui::Slider::new(&mut st.motion_sens, 1..=100)).changed();
                 ui.end_row();
             });
-            ch |= ui.checkbox(&mut st.ai_only, "Only alert for people and vehicles (on-device recognition)").changed();
+            ch |= switch(ui, &mut st.ai_only, "Only alert for people and vehicles (on-device recognition)").changed();
             ui.label(RichText::new("Turn motion on per camera in Cameras → Edit. Parked cars and other things that stay put are ignored.").color(MUTED()).small());
             if ch { let _ = self.store.save(); }
         });
         Self::card(ui, "Monitor wall", "Fullscreen without menus (W toggles them). Start with --wall.", |ui| {
-            if ui.checkbox(&mut self.store.settings.wall_autologin, "In wall mode, skip the login screen").changed() { let _ = self.store.save(); }
+            if switch(ui, &mut self.store.settings.wall_autologin, "In wall mode, skip the login screen").changed() { let _ = self.store.save(); }
             let mut auto = autostart_enabled();
-            if ui.checkbox(&mut auto, "Open in wall mode when I log in to this computer").changed() {
+            if switch(ui, &mut auto, "Open in wall mode when I log in to this computer").changed() {
                 self.toast = Some((match set_autostart(auto) { Ok(()) => if auto { "Autostart on".into() } else { "Autostart off".into() }, Err(e) => format!("Autostart: {e}") }, Instant::now()));
             }
         });
@@ -2241,7 +2299,7 @@ impl App {
                 input(ui, "adm_p1", &mut self.login_pass, "New password", 190.0, Some(&mut hide)); ui.data_mut(|d| d.insert_temp(sid_hide, hide));
                 let sid_hide2 = egui::Id::new(("show", "adm_p2")); let mut hide2 = ui.data(|d| d.get_temp::<bool>(sid_hide2).unwrap_or(false));
                 input(ui, "adm_p2", &mut self.login_pass2, "Repeat password", 190.0, Some(&mut hide2)); ui.data_mut(|d| d.insert_temp(sid_hide2, hide2));
-                if ui.button("Change").clicked() {
+                if ui.add(secondary("Change")).clicked() {
                     if self.login_pass.len() < 4 { self.toast("Password needs at least 4 characters"); }
                     else if self.login_pass != self.login_pass2 { self.toast("Passwords do not match"); }
                     else {
@@ -2254,37 +2312,45 @@ impl App {
                 }
             });
         });
-        Self::card(ui, "Updates", "Checks GitHub for a newer version of NVRDeck. Nothing else is sent.", |ui| {
-            if ui.checkbox(&mut self.store.settings.update_check, "Check for updates when I sign in").changed() {
+        Self::card(ui, "Updates", "New releases come from GitHub and are SHA256-verified before anything is installed.", |ui| {
+            if switch(ui, &mut self.store.settings.update_check, "Check for updates when I sign in").changed() {
                 self.settings_draft.update_check = self.store.settings.update_check;
                 let _ = self.store.save();
             }
-            ui.add_space(4.0);
+            ui.add_space(10.0);
             let j = self.upd.lock().unwrap();
-            ui.label(RichText::new(format!("Installed {} · {}", env!("CARGO_PKG_VERSION"),
-                match pack() { Pack::AppImage => "AppImage", Pack::Deb => ".deb package", Pack::Dmg => "macOS app" })).small().color(MUTED()));
             let (busy, ready, total) = (j.busy, j.ready, j.total);
             let info = j.info.clone();
             let msg = j.msg.clone();
             // ζωντανή πρόοδος: το αρχείο μεγαλώνει όσο γράφει το curl
             let live = if busy { j.file.as_ref().and_then(|f| std::fs::metadata(f).ok()).map(|m| m.len()) } else { None };
             drop(j);
-            if !busy && ui.button("Check now").clicked() { update_check(self.upd.clone(), ui.ctx().clone()); }
+            // έκδοση + τύπος πακέτου αριστερά, «Check for updates» δεξιά
+            ui.horizontal(|ui| {
+                chip(ui, format!("v{}", env!("CARGO_PKG_VERSION")));
+                ui.label(RichText::new(match pack() { Pack::AppImage => "AppImage", Pack::Deb => ".deb package", Pack::Dmg => "macOS app" }).small().color(MUTED()));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if !busy && !ready && ui.add(secondary("Check for updates")).clicked() { update_check(self.upd.clone(), ui.ctx().clone()); }
+                });
+            });
             if busy {
+                ui.add_space(6.0);
                 if let Some(n) = live {
                     ui.add(egui::ProgressBar::new(if total > 0 { (n as f32 / total as f32).min(1.0) } else { 0.0 })
-                        .text(format!("{:.1} / {:.1} MB", n as f64 / 1e6, total as f64 / 1e6)));
+                        .fill(ACCENT()).text(format!("{:.1} / {:.1} MB", n as f64 / 1e6, total as f64 / 1e6)));
                 } else {
                     ui.horizontal(|ui| { ui.spinner(); ui.label(&msg); });
                 }
                 ui.ctx().request_repaint_after(Duration::from_millis(250));
             } else if ready {
+                ui.add_space(6.0);
                 if ui.add(primary("Restart to finish the update")).clicked() {
                     ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 }
             } else if let Some(info) = &info {
+                ui.add_space(6.0);
                 ui.label(RichText::new(format!("Version {} is available", info.version)).strong().color(ACCENT()));
-                if !info.notes.is_empty() { ui.label(RichText::new(&info.notes).small().color(MUTED())); }
+                if !info.notes.is_empty() { ui.label(RichText::new(info.notes.clone()).small().color(MUTED())); }
                 ui.add_space(4.0);
                 let label = match pack() { Pack::AppImage => "Update & restart", _ => "Download & install" };
                 if ui.add(primary(label)).clicked() { update_install(self.upd.clone(), ui.ctx().clone()); }

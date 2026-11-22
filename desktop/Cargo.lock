@@ -2388,7 +2388,7 @@ dependencies = [
 
 [[package]]
 name = "nvrdeck"
-version = "0.6.3"
+version = "0.6.4"
 dependencies = [
  "aes-gcm",
  "anyhow",

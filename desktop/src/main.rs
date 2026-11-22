@@ -47,10 +47,9 @@ const BAD: Color32 = Color32::from_rgb(255, 92, 122);
 static ALERTS_ON: AtomicBool = AtomicBool::new(true);
 static ARMED_ON: AtomicBool = AtomicBool::new(true);
 static AI_ONLY_ON: AtomicBool = AtomicBool::new(true);
-/// Συμβάν από background νήμα (ακρόαση NVR) → banner + toast στο UI thread
-/// (scaffolding: ο ακροατής συμβάντων NVR — dvrip::Dvr::next_alarm — δεν έχει προστεθεί ακόμα)
-#[allow(dead_code)]
-static NVR_EVENT: Mutex<Option<(usize, chrono::NaiveDateTime, String)>> = Mutex::new(None);
+/// Συμβάντα από τα background νήματα ακρόασης των καταγραφικών → banner + toast + Play clip
+/// στο UI thread. (host, RTSP θύρα, κανάλι 1-based, στιγμή, είδος — "Person"/"Vehicle"/"Motion")
+static NVR_EVENT: Mutex<Vec<(String, u16, u32, chrono::NaiveDateTime, String)>> = Mutex::new(Vec::new());
 
 fn load_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -920,6 +919,7 @@ struct App {
     pb: NvrPb,
     rec_health: Arc<Mutex<Option<RecHealth>>>,
     rec_health_on: bool,
+    nvr_events_on: bool,
     rcfg: Option<RecCfg>,
     det_tx: Option<std::sync::mpsc::Sender<(usize, Vec<u8>, usize, usize)>>,
     det_rx: Option<std::sync::mpsc::Receiver<(usize, Vec<detect::Hit>)>>,
@@ -1041,7 +1041,7 @@ impl App {
               scan: Arc::new(Mutex::new(ScanState::default())), scan_open: false, nvr: None,
               hd: None, zoom: 1.0, zoom_c: egui::pos2(0.5, 0.5), recs: Default::default(),
               inbox: Arc::new(Mutex::new(vec![])), health: vec![], last_tick: Instant::now(),
-              wall: false, chrome: true, login_show: false, qr: None, media: vec![], pb: NvrPb::default(), rec_health: Default::default(), rec_health_on: false, rcfg: None, det_tx: None, det_rx: None, det_busy: Default::default(), det_known: Default::default(), upd: Default::default(), auto_scan_res: Default::default() }
+              wall: false, chrome: true, login_show: false, qr: None, media: vec![], pb: NvrPb::default(), rec_health: Default::default(), rec_health_on: false, nvr_events_on: false, rcfg: None, det_tx: None, det_rx: None, det_busy: Default::default(), det_known: Default::default(), upd: Default::default(), auto_scan_res: Default::default() }
     }
 
     fn restart_streams(&mut self, ctx: &egui::Context) {
@@ -1234,6 +1234,17 @@ impl App {
                 self.rec_health_on = true;
                 let cam = self.store.camera[g[0].0].clone();
                 rec_health_worker(cam, g.iter().map(|x| (x.1, x.2.clone())).collect(), self.rec_health.clone(), ctx.clone());
+            }
+        }
+        // ακρόαση των δικών τους συμβάντων των καταγραφικών (κίνηση/άνθρωποι/οχήματα από το NVR)
+        if !self.nvr_events_on {
+            let cams: Vec<Camera> = self.store.camera.iter().filter(|c| c.proto == Proto::XMeye).cloned().collect();
+            if !cams.is_empty() {
+                self.nvr_events_on = true;
+                let mut hosts: Vec<&str> = vec![];
+                for c in &cams {
+                    if !hosts.contains(&c.host.as_str()) { hosts.push(&c.host); nvr_events_worker(c.clone(), ctx.clone()); }
+                }
             }
         }
         self.logged_in = true;
@@ -2347,6 +2358,19 @@ impl eframe::App for App {
                 self.restart_streams(ctx);
                 self.toast(&format!("Added {n} new channel{} from the recorder", if n == 1 { "" } else { "s" }));
             }
+        }
+        // συμβάντα από τα καταγραφικά (ακρόαση στο παρασκήνιο): ίδια διαδρομή με την AI αναγνώριση —
+        // banner με Play clip, toast και (με το alerts αναμμένο) ειδοποίηση επιφάνειας εργασίας
+        let nvr_events = std::mem::take(&mut *NVR_EVENT.lock().unwrap());
+        for (host, port, ch, t, what) in nvr_events {
+            if !self.logged_in { break; }
+            // η κάμερα εντοπίζεται τη στιγμή της εμφάνισης: ό,τι διαγράφηκε/άλλαξε όσο τρέχαμε, απλώς πέφτει
+            let Some(i) = self.store.camera.iter().position(|c| c.proto == Proto::XMeye && c.host == host && c.port == port && c.channel == ch) else { continue };
+            if !self.store.settings.armed { continue; }
+            let title = format!("{what} at {}", self.store.camera[i].name);
+            if self.store.settings.alerts { notify_clip(&title, "Detected by the recorder.", i); }
+            self.toast(&title);
+            self.last_alert = Some((i, t, title, Instant::now()));
         }
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
@@ -3979,6 +4003,85 @@ fn rec_health_worker(cam: Camera, chans: Vec<(u32, String)>, out: Arc<Mutex<Opti
             std::thread::sleep(Duration::from_secs(600));
         }
     });
+}
+
+/// Ταξινόμηση ενός συμβάντος του καταγραφικού: "Person"/"Vehicle" για τα αντίστοιχα «έξυπνα»
+/// συμβάντα των καμερών, "Motion" για απλή κίνηση — None για ό,τι δεν μας ενδιαφέρει
+/// (VideoLoss, ShelterAlarm κ.λπ.). Με `ai_only` τα γενικά συμβάντα κίνησης αγνοούνται.
+fn nvr_event_kind(event: &str, ai_only: bool) -> Option<&'static str> {
+    let ev = event.to_ascii_lowercase();
+    let has = |p: &[&str]| p.iter().any(|x| ev.contains(x));
+    if !has(&["motion", "movement", "detect", "human", "shape", "intru", "cross"]) { return None; }
+    if has(&["human", "person", "body", "face"]) { return Some("Person"); }
+    if has(&["car", "vehicle", "motor"]) { return Some("Vehicle"); }
+    if ai_only { None } else { Some("Motion") }
+}
+
+/// Ακρόαση των δικών τους συμβάντων του καταγραφικού (κίνηση, άνθρωποι, οχήματα) — το αντίστοιχο
+/// του AlertService στο Android: μία μόνιμη σύνδεση DVRIP ανά καταγραφικό, KeepAlive κάθε ~20 s
+/// (fire-and-forget, ώστε να μην «φαίνεται» απάντησή του από το next_alarm), επανασύνδεση με
+/// backoff. Τα διαθέσιμα toggles διαβάζονται ζωντανά μέσα από το ARMED_ON/AI_ONLY_ON.
+/// Το UI εντοπίζει την κάμερα τη στιγμή της εμφάνισης, οπότε προσθήκες/διαγραφές καναλιών
+/// (π.χ. από το αυτόματο σκαν) δεν σπάνε τη δρομολόγηση του συμβάντος.
+fn nvr_events_worker(cam: Camera, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let mut backoff = Duration::from_secs(5);
+        // throttle ανά κανάλι, όπως το Android: το πολύ ένα ειδοποιητικό συμβάν ανά 2 λεπτά
+        let mut last: std::collections::HashMap<u32, Instant> = Default::default();
+        loop {
+            let r = (|| -> anyhow::Result<()> {
+                let mut d = dvrip::Dvr::connect(&cam.host, dvrip::PORT, &cam.user, &cam.pass)?;
+                d.subscribe_alarms()?;
+                let mut ka = Instant::now();
+                loop {
+                    if let Some(a) = d.next_alarm()? {
+                        // μόνο τα Start (το Stop απλώς κλείνει το συμβάν) και μόνο όσο είμαστε οπλισμένοι
+                        if !a.start || !ARMED_ON.load(Ordering::Relaxed) { continue; }
+                        let Some(what) = nvr_event_kind(&a.event, AI_ONLY_ON.load(Ordering::Relaxed)) else { continue };
+                        let ch = a.channel + 1; // το AlarmInfo μετράει τα κανάλια από το 0
+                        if last.get(&ch).map_or(false, |t| t.elapsed() < Duration::from_secs(120)) { continue; }
+                        last.insert(ch, Instant::now());
+                        // ώρα από το ρολόι του καταγραφικού (για το Play clip), με εφεδρικό το τοπικό
+                        let t = parse_t(&a.time).unwrap_or_else(|| chrono::Local::now().naive_local());
+                        NVR_EVENT.lock().unwrap().push((cam.host.clone(), cam.port, ch, t, what.to_string()));
+                        ctx.request_repaint();
+                    }
+                    if ka.elapsed() > Duration::from_secs(20) {
+                        let _ = d.send_raw(1006, &serde_json::json!({"Name": "KeepAlive", "SessionID": d.session_id()}));
+                        ka = Instant::now();
+                    }
+                }
+            })();
+            // κλειστό/offline καταγραφικό (π.χ. χαμένο VPN): νέα προσπάθεια με ήπιο backoff
+            if r.is_err() {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(120));
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod t {
+    use super::nvr_event_kind;
+    #[test]
+    fn nvr_events() {
+        assert_eq!(nvr_event_kind("AlarmMotion", false), Some("Motion"));
+        assert_eq!(nvr_event_kind("VideoMotion", false), Some("Motion"));
+        assert_eq!(nvr_event_kind("Videomovement", false), Some("Motion"));
+        assert_eq!(nvr_event_kind("CrossRegionDetection", false), Some("Motion"));
+        assert_eq!(nvr_event_kind("HumanDetect", true), Some("Person"));
+        assert_eq!(nvr_event_kind("FaceDetection", true), Some("Person"));
+        assert_eq!(nvr_event_kind("CarDetect", true), Some("Vehicle"));
+        assert_eq!(nvr_event_kind("VehicleShapeAlarm", true), Some("Vehicle"));
+        // «μόνο άνθρωποι/οχήματα»: η απλή κίνηση δεν ειδοποιεί — όπως το Android σε ελαφριά λειτουργία
+        assert_eq!(nvr_event_kind("AlarmMotion", true), None);
+        assert_eq!(nvr_event_kind("VideoMotion", true), None);
+        // ό,τι δεν είναι κίνηση/ανίχνευση αγνοείται πάντα
+        assert_eq!(nvr_event_kind("VideoLoss", false), None);
+        assert_eq!(nvr_event_kind("ShelterAlarm", false), None);
+        assert_eq!(nvr_event_kind("", false), None);
+    }
 }
 
 fn health_card(ui: &mut egui::Ui, h: &RecHealth) {

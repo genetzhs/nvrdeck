@@ -226,6 +226,13 @@ class Dvr private constructor(private val host: String, private val port: Int, p
     fun changePassword(user: String, old: String, new: String) { ok(call(1488, buildJsonObject { put("EncryptType", "MD5"); put("NewPassWord", sofiaHash(new)); put("PassWord", sofiaHash(old)); put("SessionID", sid()); put("UserName", user) }), "password") }
     fun reboot() = send(1450, buildJsonObject { put("Name", "OPMachine"); put("SessionID", sid()); putJsonObject("OPMachine") { put("Action", "Reboot") } })
 
+    /** Αριθμός καναλιών βίντεο του καταγραφικού (SystemInfo) — το χρησιμοποιεί το αυτόματο σκαν. */
+    fun channels(): Int {
+        val r = call(1020, buildJsonObject { put("Name", "SystemInfo"); put("SessionID", sid()) })
+        fun n(k: String) = r[k]?.jsonPrimitive?.intOrNull ?: 0
+        return maxOf(n("VideoInChannel"), n("DigChannel"))
+    }
+
     /** Δίσκοι: (πλήθος, σύνολο MB, ελεύθερα MB). */
     fun storage(): Triple<Int, Long, Long> {
         val r = call(1020, buildJsonObject { put("Name", "StorageInfo"); put("SessionID", sid()) })

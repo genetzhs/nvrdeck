@@ -266,17 +266,23 @@ fun MainScreen(store: Store, data: StoreData, tab: Int, onTab: (Int) -> Unit, on
     LaunchedEffect(Unit) { if (data.settings.aiAlerts) runCatching { AlertService.start(ctx) } }
     val clip by ClipRequest.flow.collectAsStateWithLifecycle()
     LaunchedEffect(clip) { if (clip != null) { solo = null; onTab(3) } }
-    // Αυτόματη εύρεση καναλιών NVR που λείπουν: δοκιμάζει τα επόμενα κανάλια κάθε NVR και προσθέτει όσα δίνουν εικόνα
+    // Αυτόματη εύρεση καναλιών NVR που λείπουν: ρωτάει το ίδιο το καταγραφικό (DVRIP) πόσα
+    // κανάλια έχει και προσθέτει όσα δίνουν εικόνα — δουλεύει και με ένα μόνο κανάλι στη λίστα
     LaunchedEffect(Unit) {
         kotlinx.coroutines.delay(3000)
         val nvrs = latest.cameras.filter { it.proto in listOf(Proto.XMEYE, Proto.HIKVISION, Proto.DAHUA) }
-            .groupBy { Triple(it.host, it.port, it.proto) }.filter { it.value.size >= 2 }
+            .groupBy { Triple(it.host, it.port, it.proto) }
         for ((_, chans) in nvrs) {
             val base = chans.maxBy { it.channel }
             val prefix = base.name.substringBeforeLast(" CH", base.name)
+            // πόσους δοκιμάζουμε: όσα λέει το ίδιο το NVR (XMeye/DVRIP)· χωρίς απάντηση, πέρας στα 16
+            val nvrCount = if (base.proto == Proto.XMEYE) withContext(Dispatchers.IO) {
+                runCatching { Dvr.connect(base.host, base.user, base.pass).use { it.channels() } }.getOrDefault(0)
+            } else 0
             var misses = 0
             var ch = base.channel + 1
             while (misses < 2 && ch <= 16 && latest.cameras.size < MAX_CH) {
+                if (nvrCount > 0 && ch > nvrCount) break // το καταγραφικό δεν έχει άλλα κανάλια
                 val cand = base.copy(id = System.nanoTime(), channel = ch, name = "$prefix CH$ch", group = base.group)
                 if ("${cand.host}:${cand.port}:$ch" in latest.settings.ignoredCh) { ch++; continue }
                 if (probeCamera(ctx, cand.url()).isSuccess) {

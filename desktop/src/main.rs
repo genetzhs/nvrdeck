@@ -7,10 +7,10 @@ mod detect;
 use eframe::egui::{self, Color32, RichText, Rounding, Stroke};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,15 @@ fn pal() -> Pal { THEMES[(THEME.load(Ordering::Relaxed) as usize).min(THEMES.len
 const MOTION_C: Color32 = Color32::from_rgb(255, 176, 32);
 const OK: Color32 = Color32::from_rgb(62, 240, 166);
 const BAD: Color32 = Color32::from_rgb(255, 92, 122);
+/// Τα ειδοπούμενα threads (υγεία καταγραφικού, ακρόαση συμβάντων NVR) διαβάζουν αυτά ζωντανά,
+/// ώστε τα toggles των ρυθμίσεων να ισχύουν και για αυτά.
+static ALERTS_ON: AtomicBool = AtomicBool::new(true);
+static ARMED_ON: AtomicBool = AtomicBool::new(true);
+static AI_ONLY_ON: AtomicBool = AtomicBool::new(true);
+/// Συμβάν από background νήμα (ακρόαση NVR) → banner + toast στο UI thread
+/// (scaffolding: ο ακροατής συμβάντων NVR — dvrip::Dvr::next_alarm — δεν έχει προστεθεί ακόμα)
+#[allow(dead_code)]
+static NVR_EVENT: Mutex<Option<(usize, chrono::NaiveDateTime, String)>> = Mutex::new(None);
 
 fn load_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
@@ -225,10 +234,13 @@ impl Camera {
         let (u, p) = (enc(&self.user), enc(&self.pass));
         let auth = if self.user.is_empty() { String::new() } else { format!("{u}:{p}@") };
         let base = format!("rtsp://{auth}{}:{}", self.host, self.port);
-        let m = self.main_stream;
         let ch = self.channel.max(1);
+        // στο query του XMeye οι λέξεις-κλειδιά χωρίζουν με & και = — κωδικοποιούνται ώστε
+        // κωδικός με αυτά τα σύμβολα να μην κόβει τις παραμέτρους
+        let q = |s: &str| enc(s).replace('&', "%26").replace('=', "%3D");
+        let m = self.main_stream;
         match self.proto {
-            Proto::XMeye => format!("{base}/user={u}&password={p}&channel={ch}&stream={}.sdp?real_stream", if m { 0 } else { 1 }),
+            Proto::XMeye => format!("{base}/user={}&password={}&channel={ch}&stream={}.sdp?real_stream", q(&self.user), q(&self.pass), if m { 0 } else { 1 }),
             Proto::Jovision => format!("{base}/live{}.264", if m { 0 } else { 1 }),
             Proto::Hikvision => format!("{base}/Streaming/Channels/{}", ch * 100 + if m { 1 } else { 2 }),
             Proto::Dahua => format!("{base}/cam/realmonitor?channel={ch}&subtype={}", if m { 0 } else { 1 }),
@@ -246,12 +258,15 @@ impl Camera {
 #[derive(Serialize, Deserialize, Clone)]
 struct Settings { width: usize, height: usize, fps: u32, #[serde(default)] theme: u32, #[serde(default = "yes")] show_clock: bool, #[serde(default)] layout: u32, #[serde(default)] main_ch: usize,
     #[serde(default = "yes")] auto_hd: bool, #[serde(default = "yes")] alerts: bool, #[serde(default = "alert_secs")] alert_after: u64,
-    #[serde(default)] group: String, #[serde(default = "sens")] motion_sens: u32, #[serde(default = "yes")] ai_only: bool, #[serde(default)] wall_autologin: bool, #[serde(default = "yes")] armed: bool }
+    #[serde(default)] group: String, #[serde(default = "sens")] motion_sens: u32, #[serde(default = "yes")] ai_only: bool, #[serde(default)] wall_autologin: bool, #[serde(default = "yes")] armed: bool,
+    #[serde(default = "yes")] update_check: bool, #[serde(default = "yes")] auto_scan: bool,
+    /// κανάλια που διέγραψε ο χρήστης (host:rtsp_port:channel) — δεν τα ξαναπροσθέτει το αυτόματο σκαν
+    #[serde(default)] ignored_ch: Vec<String> }
 fn sens() -> u32 { 30 }
 fn alert_secs() -> u64 { 1800 }
-impl Default for Settings { fn default() -> Self { Settings { width: 960, height: 540, fps: 12, theme: 0, show_clock: true, layout: 0, main_ch: 0, auto_hd: true, alerts: true, alert_after: 1800, group: String::new(), motion_sens: 30, ai_only: true, wall_autologin: false, armed: true } } }
+impl Default for Settings { fn default() -> Self { Settings { width: 960, height: 540, fps: 12, theme: 0, show_clock: true, layout: 0, main_ch: 0, auto_hd: true, alerts: true, alert_after: 1800, group: String::new(), motion_sens: 30, ai_only: true, wall_autologin: false, armed: true, update_check: true, auto_scan: true, ignored_ch: vec![] } } }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 struct Store {
     #[serde(default)]
     admin_user: String,
@@ -269,7 +284,20 @@ fn store_path() -> PathBuf { dirs::config_dir().unwrap_or_else(|| PathBuf::from(
 
 impl Store {
     fn load() -> Store {
-        std::fs::read_to_string(store_path()).ok().and_then(|t| toml::from_str(&t).ok()).unwrap_or_default()
+        let p = store_path();
+        let Ok(t) = std::fs::read_to_string(&p) else { return Store::default() };
+        match toml::from_str(&t) {
+            Ok(s) => s,
+            Err(_) => {
+                // κατεστραμμένο/αγνώριστο αρχείο: κρατάμε αντίγραφο πριν το αντικαταστήσει
+                // η επόμενη αποθήκευση (αλλιώς χάνονται οι κάμερες και οι κωδικοί)
+                let bad = p.with_extension(format!("bad-{}", chrono::Local::now().format("%Y%m%d-%H%M%S")));
+                if std::fs::rename(&p, &bad).is_ok() {
+                    eprintln!("NVRDeck: unreadable config saved as {}", bad.display());
+                }
+                Store::default()
+            }
+        }
     }
     fn save(&self) -> anyhow::Result<()> {
         let p = store_path();
@@ -332,6 +360,8 @@ struct Stream {
     prev: Vec<u8>,
     motion_at: Option<Instant>,
     motion_note: Option<Instant>,
+    /// τελευταία στιγμή που στείλθηκε καρέ στον αναγνωριστή AI (throttle σε επίμονη κίνηση)
+    ai_note: Option<Instant>,
     motion_run: u32,
 }
 
@@ -343,7 +373,7 @@ impl Stream {
         let pid = Arc::new(AtomicU32::new(0));
         let (sh, st, pd) = (shared.clone(), stop.clone(), pid.clone());
         std::thread::spawn(move || worker(url, s, sh, st, pd, ctx));
-        Stream { shared, stop, pid, tex: None, w, h, prev: vec![], motion_at: None, motion_note: None, motion_run: 0 }
+        Stream { shared, stop, pid, tex: None, w, h, prev: vec![], motion_at: None, motion_note: None, ai_note: None, motion_run: 0 }
     }
 }
 
@@ -403,7 +433,7 @@ fn worker(url: String, s: Settings, sh: Arc<Mutex<Shared>>, stop: Arc<AtomicBool
                 let err = child.stderr.take().unwrap();
                 let errbuf = Arc::new(Mutex::new(String::new()));
                 let (eb, sh2) = (errbuf.clone(), sh.clone());
-                std::thread::spawn(move || {
+                let reader = std::thread::spawn(move || {
                     use std::io::BufRead;
                     for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
                         // π.χ. "Stream #0:0: Video: h264 (High), yuvj420p, 1920x1080, 25 fps"
@@ -441,6 +471,9 @@ fn worker(url: String, s: Settings, sh: Arc<Mutex<Shared>>, stop: Arc<AtomicBool
                 let _ = child.kill();
                 let _ = child.wait();
                 pid.store(0, Ordering::SeqCst);
+                // περιμένουμε τον αναγνώστη stderr να φτάσει στο EOF πριν διαβάσουμε το buffer,
+                // αλλιώς το status μπορεί να μην έχει ακόμα το πραγματικό μήνυμα λάθους
+                let _ = reader.join();
                 std::thread::sleep(Duration::from_millis(100));
                 let e = errbuf.lock().unwrap().to_lowercase();
                 let mut g = sh.lock().unwrap();
@@ -467,7 +500,8 @@ fn media_dir(video: bool) -> PathBuf {
 
 fn file_stem(cam: &Camera) -> String {
     let safe: String = cam.name.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
-    format!("{}_{}", safe.trim_matches('_'), chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"))
+    // χιλιοστά του δευτερολέπτου: δύο ενέργειες στην ίδια δευτερόλεπτη δεν αντικαθίστανται
+    format!("{}_{}", safe.trim_matches('_'), chrono::Local::now().format("%Y-%m-%d_%H-%M-%S_%3f"))
 }
 
 /// Στιγμιότυπο σε πλήρη ανάλυση από το κύριο stream (στο παρασκήνιο).
@@ -506,10 +540,13 @@ fn start_recording(cam: &Camera) -> Option<Recording> {
 fn stop_recording(mut r: Recording) -> PathBuf {
     use std::io::Write;
     if let Some(stdin) = r.child.stdin.as_mut() { let _ = stdin.write_all(b"q"); }
-    let deadline = Instant::now() + Duration::from_secs(4);
+    // το stdin δεν είναι tty, οπότε το ffmpeg δεν διαβάζει την εντολή «q» —
+    // ευγενικός τερματισμός με SIGINT (τελειώνει το αρχείο), με εφεδρικό SIGKILL
+    let _ = Command::new("kill").args(["-INT", &r.child.id().to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         if let Ok(Some(_)) = r.child.try_wait() { return r.path; }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(50));
     }
     let _ = r.child.kill();
     let _ = r.child.wait();
@@ -656,6 +693,22 @@ fn local_subnets() -> Vec<String> {
             if let Some(ip) = f[3].split('/').next() {
                 let o: Vec<&str> = ip.split('.').collect();
                 if o.len() == 4 && o[0] != "169" {
+                    let net = format!("{}.{}.{}", o[0], o[1], o[2]);
+                    if !v.contains(&net) { v.push(net); }
+                }
+            }
+        }
+    }
+    // macOS: δεν υπάρχει «ip» — fallback στο ifconfig
+    if v.is_empty() {
+        if let Ok(o) = Command::new("ifconfig").output() {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() < 2 || f[0] != "inet" { continue; }
+                let ip = f[1];
+                if ip.starts_with("127.") || ip.starts_with("169.254.") { continue; }
+                let o: Vec<&str> = ip.split('.').collect();
+                if o.len() == 4 {
                     let net = format!("{}.{}.{}", o[0], o[1], o[2]);
                     if !v.contains(&net) { v.push(net); }
                 }
@@ -841,7 +894,7 @@ struct App {
     page: Page,
     streams: Vec<Option<Stream>>,
     solo: Option<usize>,
-    talk: Option<Arc<AtomicBool>>,
+    talk: Option<(usize, Arc<AtomicBool>)>,
     listen: Option<(usize, std::process::Child)>,
     last_alert: Option<(usize, chrono::NaiveDateTime, String, Instant)>,
     talk_msg: Arc<Mutex<String>>,
@@ -868,10 +921,13 @@ struct App {
     rec_health: Arc<Mutex<Option<RecHealth>>>,
     rec_health_on: bool,
     rcfg: Option<RecCfg>,
-    det_tx: Option<std::sync::mpsc::Sender<(usize, Vec<u8>)>>,
+    det_tx: Option<std::sync::mpsc::Sender<(usize, Vec<u8>, usize, usize)>>,
     det_rx: Option<std::sync::mpsc::Receiver<(usize, Vec<detect::Hit>)>>,
     det_busy: std::collections::HashSet<usize>,
-    det_known: std::collections::HashMap<usize, Vec<detect::Hit>>,
+    det_known: std::collections::HashMap<usize, (Vec<detect::Hit>, Instant)>,
+    upd: Arc<Mutex<UpdateJob>>,
+    /// κανάλια που βρήκε το αυτόματο σκαν στο παρασκήνιο (περιμένουν να μπουν στη λίστα)
+    auto_scan_res: Arc<Mutex<Vec<Camera>>>,
 }
 
 /// Αναπαραγωγή από το καταγραφικό
@@ -884,6 +940,7 @@ struct NvrPb {
     pending: Option<chrono::NaiveDateTime>,
     motion: bool,
     key: String,       // τι φορτώθηκε τελευταία
+    files_gen: Arc<AtomicU64>,  // η γενιά του worker που φορτώνει αρχεία (αγνοούνται τα αργά/outdated)
     files: Arc<Mutex<Option<Result<Vec<dvrip::RecFile>, String>>>>,
     dl: Arc<Mutex<DlJob>>,
     player: Option<NvrPlayer>,
@@ -917,6 +974,7 @@ struct ThumbStore {
     img: std::collections::HashMap<String, Arc<Vec<u8>>>,   // RGBA TW×TH
     tags: std::collections::HashMap<String, Vec<(usize, f32)>>, // (κλάση, βαθμός)
     pending: std::collections::HashSet<String>,
+    failed: std::collections::HashMap<String, Instant>,    // αρνητική μνήμη: αποτυχημένα key (TTL)
     queue: std::collections::VecDeque<(String, Camera, dvrip::RecFile, chrono::NaiveDateTime, bool)>, // (κλειδί, κάμερα, αρχείο, στιγμή, αναγνώριση)
     worker: bool,
     progress: (usize, usize),
@@ -950,6 +1008,7 @@ struct RecCfg {
     busy: Arc<AtomicBool>,
     time: Arc<Mutex<String>>,
     pw_old: String, pw_new: String, pw_new2: String,
+    pw_done: Arc<Mutex<Option<String>>>,   // ο νέος κωδικός μετά από επιτυχημένη αλλαγή στο παρασκήνιο
     confirm_reboot: bool,
     paint: Option<bool>,
 }
@@ -982,7 +1041,7 @@ impl App {
               scan: Arc::new(Mutex::new(ScanState::default())), scan_open: false, nvr: None,
               hd: None, zoom: 1.0, zoom_c: egui::pos2(0.5, 0.5), recs: Default::default(),
               inbox: Arc::new(Mutex::new(vec![])), health: vec![], last_tick: Instant::now(),
-              wall: false, chrome: true, login_show: false, qr: None, media: vec![], pb: NvrPb::default(), rec_health: Default::default(), rec_health_on: false, rcfg: None, det_tx: None, det_rx: None, det_busy: Default::default(), det_known: Default::default() }
+              wall: false, chrome: true, login_show: false, qr: None, media: vec![], pb: NvrPb::default(), rec_health: Default::default(), rec_health_on: false, rcfg: None, det_tx: None, det_rx: None, det_busy: Default::default(), det_known: Default::default(), upd: Default::default(), auto_scan_res: Default::default() }
     }
 
     fn restart_streams(&mut self, ctx: &egui::Context) {
@@ -1050,9 +1109,18 @@ impl App {
     fn toast(&mut self, t: &str) { self.toast = Some((t.into(), Instant::now())); }
 
     fn logout(&mut self) {
-        for (_, r) in self.recs.drain() { stop_recording(r); }
+        for (_, r) in self.recs.drain() { let _ = stop_recording(r); }
+        // ό,τι ακούγεται/μεταδίδεται πρέπει να σταματήσει στο sign-out
+        if let Some((_, f)) = self.talk.take() { f.store(true, Ordering::Relaxed); }
+        if let Some((_, mut c)) = self.listen.take() { let _ = c.kill(); let _ = c.wait(); }
+        self.pb.players.clear();
         self.hd = None;
         self.streams.clear();
+        self.solo = None;
+        self.zoom = 1.0;
+        self.zoom_c = egui::pos2(0.5, 0.5);
+        self.det_busy.clear();
+        self.det_known.clear();
         self.logged_in = false;
         self.login_pass.clear();
         self.editor = None;
@@ -1148,11 +1216,24 @@ impl App {
 
     fn enter(&mut self, ctx: &egui::Context) {
         self.login_show = false;
+        // έλεγχος για νέα έκδοση (μία φορά ανά session, αν το επιτρέπει η ρύθμιση)
+        {
+            let mut j = self.upd.lock().unwrap();
+            if self.store.settings.update_check && !j.checked && !j.busy {
+                j.checked = true;
+                drop(j);
+                update_check(self.upd.clone(), ctx.clone());
+            }
+        }
+        // αυτόματο σκαν καναλιών: ρωτάμε το ίδιο το NVR (DVRIP) για κανάλια που λείπουν
+        if self.store.settings.auto_scan && self.store.camera.iter().any(|c| c.proto == Proto::XMeye) {
+            auto_scan(self.store.clone(), self.auto_scan_res.clone(), ctx.clone());
+        }
         if !self.rec_health_on {
             if let Some(g) = self.nvr_groups().into_iter().next() {
                 self.rec_health_on = true;
                 let cam = self.store.camera[g[0].0].clone();
-                rec_health_worker(cam, g.iter().map(|x| (x.1, x.2.clone())).collect(), self.rec_health.clone(), self.store.settings.alerts, ctx.clone());
+                rec_health_worker(cam, g.iter().map(|x| (x.1, x.2.clone())).collect(), self.rec_health.clone(), ctx.clone());
             }
         }
         self.logged_in = true;
@@ -1257,6 +1338,11 @@ impl App {
                 self.listen = None;
             }
         }
+        // η ομιλία ξεκινά μόνο μέσα στην πλήρη προβολή — αν κλείσει/αλλάξει το κανάλι, σταματά
+        // (αλλιώς το μικρόφωνο θα συνέχιζε να μεταδίδεται στην κάμερα χωρίς εμφανές κουμπί)
+        if self.talk.as_ref().map_or(false, |(ti, _)| self.solo != Some(*ti)) {
+            if let Some((_, f)) = self.talk.take() { f.store(true, Ordering::Relaxed); }
+        }
         if let Some(i) = self.solo {
             let (snap, rec, rz) = ctx.input(|k| (k.key_pressed(egui::Key::S), k.key_pressed(egui::Key::R), k.key_pressed(egui::Key::Z)));
             if snap { if let Some(c) = self.store.camera.get(i) { snapshot(c, self.inbox.clone(), ctx.clone()); self.toast("Taking snapshot…"); } }
@@ -1313,7 +1399,14 @@ impl App {
                                 if s.motion_run >= 4 {
                                     s.motion_at = Some(Instant::now());
                                     if s.motion_note.map_or(true, |t| t.elapsed() > Duration::from_secs(300)) {
-                                        if ai { if !busy.contains(&i) { ai_frames.push((i, f.clone())); } }
+                                        if ai {
+                                            // επανεξέταση σκηνής το πολύ κάθε 2 s (όχι κάθε καρέ)·
+                                            // το motion_note μπαίνει μόνο όταν βγει ειδοποίηση
+                                            if s.ai_note.map_or(true, |t| t.elapsed() > Duration::from_secs(2)) && !busy.contains(&i) {
+                                                s.ai_note = Some(Instant::now());
+                                                ai_frames.push((i, f.clone()));
+                                            }
+                                        }
                                         else { s.motion_note = Some(Instant::now()); motion_events.push(i); }
                                     }
                                 }
@@ -1338,24 +1431,40 @@ impl App {
             self.last_alert = Some((i, chrono::Local::now().naive_local(), format!("Motion at {name}"), Instant::now()));
             self.toast(&format!("Motion on {name}"));
         }
-        // αναγνώριση ανθρώπων/οχημάτων σε ξεχωριστό νήμα
+        // αναγνώριση ανθρώπων/οχημάτων σε ξεχωριστό νήμα. Οι διαστάσεις ταξιδεύουν με κάθε καρέ:
+        // αν αλλάξει η ανάλυση των ροών, ο αναγνώστης δεν «παγώνει» σε παλιό μέγεθος (εκτός ορίων → panic)
         if !ai_frames.is_empty() && self.det_tx.is_none() {
-            let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<u8>)>();
+            let (tx, rx) = std::sync::mpsc::channel::<(usize, Vec<u8>, usize, usize)>();
             let (rtx, rrx) = std::sync::mpsc::channel();
-            let (w, h, ctx2) = (self.store.settings.width, self.store.settings.height, ctx.clone());
+            let ctx2 = ctx.clone();
             std::thread::spawn(move || {
                 let Ok(d) = detect::Detector::new() else { return };
-                for (i, img) in rx { let hits = d.run(&img, w, h, 0.45).unwrap_or_default(); let _ = rtx.send((i, hits)); ctx2.request_repaint(); }
+                for (i, img, w, h) in rx { let hits = d.run(&img, w, h, 0.45).unwrap_or_default(); let _ = rtx.send((i, hits)); ctx2.request_repaint(); }
             });
             self.det_tx = Some(tx); self.det_rx = Some(rrx);
         }
-        for (i, img) in ai_frames { if let Some(tx) = &self.det_tx { if tx.send((i, img)).is_ok() { self.det_busy.insert(i); } } }
+        for (i, img) in ai_frames {
+            match &self.det_tx {
+                Some(tx) if tx.send((i, img, w, h)).is_ok() => { self.det_busy.insert(i); }
+                // νεκρό κανάλι (ο αναγνώστης δεν φορτώθηκε/πέθανε): καθάρισμα ώστε να ξαναρχίσει
+                _ => { self.det_tx = None; self.det_rx = None; self.det_busy.clear(); }
+            }
+        }
         let results: Vec<(usize, Vec<detect::Hit>)> = self.det_rx.as_ref().map(|r| r.try_iter().collect()).unwrap_or_default();
         for (i, hits) in results {
             self.det_busy.remove(&i);
-            // ό,τι βρίσκεται στην ίδια θέση με την προηγούμενη φορά (π.χ. παρκαρισμένο αυτοκίνητο) αγνοείται
-            let known = self.det_known.insert(i, hits.clone());
-            let Some(known) = known else { continue }; // πρώτη φορά: μόνο καταγραφή της σκηνής
+            // ό,τι βρίσκεται στην ίδια θέση με την τελευταία εξέταση (π.χ. παρκαρισμένο αυτοκίνητο) αγνοείται.
+            // Μετά από 3' χωρίς εξέταση η «γνωστή» σκηνή ξεχνιέται: κάτι που επανεμφανίζεται στην ίδια
+            // θέση (π.χ. ταχυδρόμος που γύρισε) ξαναειδοποιεί, ενώ ό,τι βλέπεται συνεχώς παραμένει καταπιεσμένο.
+            let known: Vec<detect::Hit> = match self.det_known.entry(i) {
+                std::collections::hash_map::Entry::Occupied(mut o) => {
+                    let (kh, kt) = o.get_mut();
+                    let stale = kt.elapsed() > Duration::from_secs(180);
+                    *kt = Instant::now();
+                    if stale { vec![] } else { std::mem::replace(kh, hits.clone()) }
+                }
+                std::collections::hash_map::Entry::Vacant(v) => { v.insert((hits.clone(), Instant::now())); continue } // πρώτη φορά: μόνο καταγραφή της σκηνής
+            };
             if !self.store.settings.armed { continue; }
             let zone = self.store.camera.get(i).and_then(|c| AiZone::parse(&c.ai_zone));
             let foot = |h: &detect::Hit| ((h.bx[0] + h.bx[2]) / 2.0, h.bx[3]);
@@ -1398,6 +1507,11 @@ impl App {
                     (order, cells)
                 }
             };
+            if idx.is_empty() {
+                let gal = ui.painter().layout_no_wrap(format!("No cameras in the group \u{201C}{}\u{201D}. Switch group above.", self.store.settings.group), egui::FontId::proportional(14.0), MUTED());
+                ui.painter().galley(area.center() - gal.size() / 2.0, gal, TEXT());
+                return;
+            }
             let gap = 3.0;
             let mut clicked_main: Option<usize> = None;
             let mut toggle_rec: Option<usize> = None;
@@ -1539,8 +1653,8 @@ impl App {
                                     let tb = ui.add(egui::Button::new(RichText::new(if on { "🎙  Talking…" } else { "🎙  Hold to talk" }).color(if on { Color32::WHITE } else { TEXT() }))
                                         .fill(if on { ACCENT() } else { SURFACE() }).rounding(999.0).sense(egui::Sense::drag()))
                                         .on_hover_text("Hold to speak through the camera's speaker");
-                                    if tb.drag_started() && self.talk.is_none() { self.talk = Some(start_talk(cam.clone(), self.talk_msg.clone(), ctx.clone())); }
-                                    if (tb.drag_stopped() || !ui.input(|i| i.pointer.primary_down())) && self.talk.is_some() { if let Some(f) = self.talk.take() { f.store(true, Ordering::Relaxed); } }
+                                    if tb.drag_started() && self.talk.is_none() { self.talk = Some((i, start_talk(cam.clone(), self.talk_msg.clone(), ctx.clone()))); }
+                                    if (tb.drag_stopped() || !ui.input(|i| i.pointer.primary_down())) && self.talk.is_some() { if let Some((_, f)) = self.talk.take() { f.store(true, Ordering::Relaxed); } }
                                     let m = self.talk_msg.lock().unwrap().clone();
                                     if !m.is_empty() { ui.label(RichText::new(m).small().color(MUTED())); }
                                 }
@@ -1582,7 +1696,8 @@ impl App {
                         if ui.button("Recorder settings").clicked() {
                             let ch = g[0].1;
                             self.rcfg = Some(RecCfg { group: g, tab: 0, ch, loaded_ch: 0, data: Default::default(), edit: None, snap_tex: None, msg: Default::default(),
-                                busy: Default::default(), time: Default::default(), pw_old: String::new(), pw_new: String::new(), pw_new2: String::new(), confirm_reboot: false, paint: None });
+                                busy: Default::default(), time: Default::default(), pw_old: String::new(), pw_new: String::new(), pw_new2: String::new(),
+                                pw_done: Default::default(), confirm_reboot: false, paint: None });
                         }
                     }
                     if ui.add_enabled(!self.store.camera.is_empty(), egui::Button::new("📱 Send to phone")).on_hover_text("Encrypted QR code for the NVRDeck Android app").clicked() {
@@ -1658,7 +1773,20 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui.button("Cancel").clicked() { close = true; }
                     if ui.add(egui::Button::new(RichText::new("Delete").color(Color32::WHITE)).fill(BAD)).clicked() {
+                        // τυχόν εγγραφή του καναλιού σταματά· οι ενεργές εγγραφές των άλλων
+                        // μετατοπίζονται στο νέο τους index ώστε το REC badge να μείνει σωστό
+                        if let Some(r) = self.recs.remove(&i) { let _ = stop_recording(r); }
+                        let mut nr = std::collections::HashMap::new();
+                        for (k, v) in self.recs.drain() { nr.insert(if k > i { k - 1 } else { k }, v); }
+                        self.recs = nr;
+                        // το κανάλι δεν ξαναμπαίνει αυτόματα από το σκαν του καταγραφικού
+                        let key = self.store.camera.get(i).map(|c| format!("{}:{}:{}", c.host, c.port, c.channel));
                         self.store.camera.remove(i);
+                        if let Some(k) = key {
+                            if !self.store.settings.ignored_ch.contains(&k) { self.store.settings.ignored_ch.push(k); }
+                        }
+                        self.last_alert = None;
+                        self.editor = None;
                         self.save();
                         self.restart_streams(ctx);
                         close = true;
@@ -1670,8 +1798,6 @@ impl App {
 
         self.scan_ui(ctx);
         self.recorder_ui(ctx);
-        let _ = UI_CTX.set(ctx.clone());
-        if let Some((i, t)) = CLIP_REQ.lock().unwrap().take() { self.open_clip(i, t, ctx); }
         // πρόσφατη ειδοποίηση μέσα στην εφαρμογή, με «Play clip» (60 s)
         if let Some((i, t, title, at)) = self.last_alert.clone() {
             if at.elapsed() > Duration::from_secs(60) { self.last_alert = None; } else {
@@ -1960,7 +2086,13 @@ impl App {
             let mut cam = ed.cam;
             cam.name = cam.name.trim().into();
             cam.host = cam.host.trim().into();
-            match ed.idx { Some(i) => self.store.camera[i] = cam, None => self.store.camera.push(cam) }
+            // η λίστα μπορεί να άλλαξε (π.χ. διαγραφή κάμερας) όσο το παράθυρο ήταν ανοιχτό —
+            // με το παλιό index γράφουμε πλέον μόνο αν είναι ακόμα έγκυρο
+            match ed.idx {
+                Some(i) if i < self.store.camera.len() => self.store.camera[i] = cam,
+                Some(_) => { self.toast("The camera list changed – nothing saved. Edit the camera again."); return; }
+                None => self.store.camera.push(cam),
+            }
             self.save();
             self.restart_streams(ctx);
         } else if close {
@@ -2064,6 +2196,13 @@ impl App {
                 self.restart_streams(ctx);
             }
         });
+        Self::card(ui, "Channels", "How the channel list is kept in sync.", |ui| {
+            if ui.checkbox(&mut self.store.settings.auto_scan, "Add new recorder channels automatically").changed() {
+                self.settings_draft.auto_scan = self.store.settings.auto_scan;
+                let _ = self.store.save();
+            }
+            ui.label(RichText::new("On sign-in, NVRDeck signs in to the recorder (port 34567), asks how many channels it has and adds the ones missing. Channels you deleted stay deleted.").small().color(MUTED()));
+        });
     }
 
     fn settings_right(&mut self, ui: &mut egui::Ui) {
@@ -2109,6 +2248,43 @@ impl App {
                 }
             });
         });
+        Self::card(ui, "Updates", "Checks GitHub for a newer version of NVRDeck. Nothing else is sent.", |ui| {
+            if ui.checkbox(&mut self.store.settings.update_check, "Check for updates when I sign in").changed() {
+                self.settings_draft.update_check = self.store.settings.update_check;
+                let _ = self.store.save();
+            }
+            ui.add_space(4.0);
+            let j = self.upd.lock().unwrap();
+            ui.label(RichText::new(format!("Installed {} · {}", env!("CARGO_PKG_VERSION"),
+                match pack() { Pack::AppImage => "AppImage", Pack::Deb => ".deb package", Pack::Dmg => "macOS app" })).small().color(MUTED()));
+            let (busy, ready, total) = (j.busy, j.ready, j.total);
+            let info = j.info.clone();
+            let msg = j.msg.clone();
+            // ζωντανή πρόοδος: το αρχείο μεγαλώνει όσο γράφει το curl
+            let live = if busy { j.file.as_ref().and_then(|f| std::fs::metadata(f).ok()).map(|m| m.len()) } else { None };
+            drop(j);
+            if !busy && ui.button("Check now").clicked() { update_check(self.upd.clone(), ui.ctx().clone()); }
+            if busy {
+                if let Some(n) = live {
+                    ui.add(egui::ProgressBar::new(if total > 0 { (n as f32 / total as f32).min(1.0) } else { 0.0 })
+                        .text(format!("{:.1} / {:.1} MB", n as f64 / 1e6, total as f64 / 1e6)));
+                } else {
+                    ui.horizontal(|ui| { ui.spinner(); ui.label(&msg); });
+                }
+                ui.ctx().request_repaint_after(Duration::from_millis(250));
+            } else if ready {
+                if ui.add(primary("Restart to finish the update")).clicked() {
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            } else if let Some(info) = &info {
+                ui.label(RichText::new(format!("Version {} is available", info.version)).strong().color(ACCENT()));
+                if !info.notes.is_empty() { ui.label(RichText::new(&info.notes).small().color(MUTED())); }
+                ui.add_space(4.0);
+                let label = match pack() { Pack::AppImage => "Update & restart", _ => "Download & install" };
+                if ui.add(primary(label)).clicked() { update_install(self.upd.clone(), ui.ctx().clone()); }
+            }
+            if !msg.is_empty() { ui.label(RichText::new(msg).small().color(MUTED())); }
+        });
     }
 
     fn toast_ui(&mut self, ctx: &egui::Context) {
@@ -2125,12 +2301,53 @@ impl App {
     }
 }
 
+impl Drop for App {
+    /// Στο κλείσιμο του παραθύρου: σταματούν εγγραφές, ομιλία, ακρόαση και αναπαραγωγές.
+    /// Χωρίς αυτό, ffmpeg και talk threads επιβιώνουν της εφαρμογής και συνεχίζουν στο παρασκήνιο
+    /// (π.χ. το μικρόφωνο θα συνέχιζε να στέλνει ήχο στην κάμερα).
+    fn drop(&mut self) {
+        for (_, r) in self.recs.drain() { let _ = stop_recording(r); }
+        if let Some((_, f)) = self.talk.take() { f.store(true, Ordering::Relaxed); }
+        if let Some((_, mut c)) = self.listen.take() { let _ = c.kill(); let _ = c.wait(); }
+        self.pb.players.clear();
+    }
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         ambient_glow(ctx);
+        ALERTS_ON.store(self.store.settings.alerts, Ordering::Relaxed);
+        ARMED_ON.store(self.store.settings.armed, Ordering::Relaxed);
+        AI_ONLY_ON.store(self.store.settings.ai_only, Ordering::Relaxed);
         if self.logged_in { self.tick_health(); }
         let msgs: Vec<String> = std::mem::take(&mut *self.inbox.lock().unwrap());
         for m in msgs { self.toast(&m); }
+        // το toast για διαθέσιμη νέα έκδοση εμφανίζεται μία φορά
+        let upd_note: Option<String> = {
+            let mut j = self.upd.lock().unwrap();
+            (!j.notified && j.info.is_some()).then(|| {
+                j.notified = true;
+                j.info.as_ref().map(|i| i.version.clone()).unwrap_or_default()
+            })
+        };
+        if let Some(v) = upd_note { self.toast(&format!("NVRDeck {v} is available – Updates in Settings")); }
+        // κανάλια που βρήκε το αυτόματο σκαν του καταγραφικού (.background thread)
+        let found = std::mem::take(&mut *self.auto_scan_res.lock().unwrap());
+        if !found.is_empty() {
+            let mut n = 0;
+            for c in found {
+                if self.store.camera.len() >= MAX_CH { break; }
+                if !self.store.camera.iter().any(|x| x.host == c.host && x.port == c.port && x.channel == c.channel) {
+                    self.store.camera.push(c);
+                    n += 1;
+                }
+            }
+            if n > 0 {
+                self.save();
+                self.restart_streams(ctx);
+                self.toast(&format!("Added {n} new channel{} from the recorder", if n == 1 { "" } else { "s" }));
+            }
+        }
         if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
             let fs = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fs));
@@ -2141,6 +2358,9 @@ impl eframe::App for App {
         if !self.logged_in {
             self.login_ui(ctx);
         } else {
+            // το «Play clip» της ειδοποίησης λειτουργεί από κάθε σελίδα — παλιά διαβαζόταν μόνο στη Cameras
+            let _ = UI_CTX.set(ctx.clone());
+            if let Some((i, t)) = CLIP_REQ.lock().unwrap().take() { self.open_clip(i, t, ctx); }
             if self.chrome || self.page != Page::Live { self.top_bar(ctx); }
             match self.page {
                 Page::Live => self.live_ui(ctx),
@@ -2329,6 +2549,202 @@ fn nvr_test() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ───────────────────────── Ενημέρωση εφαρμογής (GitHub Releases) ─────────────────────────
+/// Τύπος εγκατάστασης που τρέχουμε — καθορίζει πώς μπορεί να γίνει το update.
+#[derive(Clone, Copy, PartialEq)]
+enum Pack { AppImage, Deb, #[cfg_attr(not(target_os = "macos"), allow(dead_code))] Dmg }
+
+fn pack() -> Pack {
+    if std::env::var_os("APPIMAGE").is_some() { return Pack::AppImage; }
+    #[cfg(target_os = "macos")]
+    { Pack::Dmg }
+    #[cfg(not(target_os = "macos"))]
+    { Pack::Deb }
+}
+
+#[derive(Clone)]
+struct UpdateInfo { version: String, notes: String, assets: Vec<(String, String, u64)> } // (όνομα, url, μέγεθος)
+
+#[derive(Default, Clone)]
+struct UpdateJob {
+    info: Option<UpdateInfo>,
+    checked: bool,          // έγινε ο αυτόματος έλεγχος αυτό το session
+    notified: bool,          // εμφανίστηκε το toast για διαθέσιμη έκδοση
+    busy: bool,
+    total: u64,
+    file: Option<PathBuf>,   // αρχείο που κατεβαίνει (για ένδειξη προόδου)
+    /// το πακέτο εγκαταστάθηκε και περιμένει επανεκκίνηση (AppImage)
+    ready: bool,
+    msg: String,
+}
+
+/// Συγκρίσης εκδόσεων "0.7.0" vs "0.6.2" αριθμητικά (σουφixες σαν "-beta" αγνοούνται).
+fn newer(a: &str, b: &str) -> bool {
+    let n = |s: &str| s.trim_start_matches('v').split('.').map(|x| x.split(|c: char| !c.is_ascii_digit()).next().unwrap_or("").parse::<u64>().unwrap_or(0)).collect::<Vec<u64>>();
+    let (va, vb) = (n(a), n(b));
+    for i in 0..va.len().max(vb.len()) {
+        let (x, y) = (va.get(i).copied().unwrap_or(0), vb.get(i).copied().unwrap_or(0));
+        if x != y { return x > y; }
+    }
+    false
+}
+
+fn fetch_text(url: &str) -> Option<String> {
+    let o = Command::new("curl").args(["-sSfL", "--max-time", "60"]).arg(url).stdin(Stdio::null()).output().ok()?;
+    o.status.success().then(|| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+fn sha256_file(p: &std::path::Path) -> anyhow::Result<String> {
+    let mut f = std::fs::File::open(p)?;
+    let mut buf = vec![0u8; 1 << 16];
+    let mut h = Sha256::new();
+    loop { let n = f.read(&mut buf)?; if n == 0 { break; } h.update(&buf[..n]); }
+    Ok(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Ρωτά το GitHub για την τελευταία έκδοση (μία ανώνυμη κλήση API — δεν στέλνονται άλλα δεδομένα).
+fn update_check(job: Arc<Mutex<UpdateJob>>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let r = (|| -> anyhow::Result<UpdateInfo> {
+            let api = env!("CARGO_PKG_REPOSITORY").trim_end_matches('/')
+                .replacen("https://github.com/", "https://api.github.com/repos/", 1);
+            let o = Command::new("curl").args(["-sSf", "--max-time", "20", "-H", "Accept: application/vnd.github+json"])
+                .arg(format!("{api}/releases/latest")).stdin(Stdio::null()).output()?;
+            anyhow::ensure!(o.status.success(), "curl exited with {}", o.status);
+            let v: serde_json::Value = serde_json::from_slice(&o.stdout)?;
+            let version = v["tag_name"].as_str().unwrap_or("").trim_start_matches('v').to_string();
+            anyhow::ensure!(!version.is_empty(), "no tag in the latest release");
+            let assets = v["assets"].as_array().cloned().unwrap_or_default().iter().filter_map(|a|
+                Some((a["name"].as_str()?.to_string(), a["browser_download_url"].as_str()?.to_string(), a["size"].as_u64()?))).collect();
+            let notes = v["body"].as_str().unwrap_or("").lines().take(5).collect::<Vec<_>>().join("\n");
+            Ok(UpdateInfo { version, notes, assets })
+        })();
+        let mut j = job.lock().unwrap();
+        j.checked = true;
+        match r {
+            Ok(info) if newer(&info.version, env!("CARGO_PKG_VERSION")) => {
+                j.msg = format!("Version {} is available.", info.version);
+                j.info = Some(info);
+            }
+            Ok(_) => { j.msg = format!("You are up to date ({}).", env!("CARGO_PKG_VERSION")); }
+            Err(e) => { j.msg = format!("Update check failed: {e}"); }
+        }
+        let prep = pack() == Pack::AppImage && j.info.is_some();
+        drop(j);
+        ctx.request_repaint();
+        // στο AppImage το πακέτο κατεβαίνει αμέσως στο παρασκήνιο: η ενημέρωση είναι έτοιμη,
+        // μένει μόνο η επανεκκίνηση όταν το πει ο χρήστης
+        if prep { update_install(job, ctx); }
+    });
+}
+
+/// Κατεβάζει το πακέτο της νέας έκδοσης, επαληθεύει SHA256 και (AppImage) αντικαθιστά τον εαυτό του.
+fn update_install(job: Arc<Mutex<UpdateJob>>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        let mut j = job.lock().unwrap();
+        if j.busy || j.ready { return; }
+        let Some(info) = j.info.clone() else { return; };
+        let pk = pack();
+        let suffix = match pk { Pack::AppImage => ".AppImage", Pack::Deb => ".deb", Pack::Dmg => ".dmg" };
+        let Some((name, url, size)) = info.assets.iter().find(|(n, _, _)| n.ends_with(suffix)) else {
+            j.msg = "The release has no matching package.".into(); return;
+        };
+        let (name, url, size) = (name.clone(), url.clone(), *size);
+        let dst = match pk {
+            Pack::AppImage => std::env::temp_dir().join(format!("nvrdeck-{}.AppImage", info.version)),
+            Pack::Deb | Pack::Dmg => dirs::download_dir().or_else(dirs::home_dir).unwrap_or_else(|| PathBuf::from(".")).join(&name),
+        };
+        j.busy = true; j.total = size; j.file = Some(dst.clone());
+        j.msg = format!("Downloading {name}…");
+        drop(j);
+        let r = (|| -> anyhow::Result<bool> {
+            let st = Command::new("curl").args(["-sSfL", "--max-time", "3600", "-o"]).arg(&dst).arg(&url)
+                .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status()?;
+            anyhow::ensure!(st.success(), "download failed");
+            // επαλήθευση SHA256 από το SHA256SUMS.txt της ίδιας έκδοσης — χωρίς αυτό δεν εγκαθίσταται τίποτα αυτόματα
+            let sums = info.assets.iter().find(|(n, _, _)| n == "SHA256SUMS.txt").and_then(|(_, u, _)| fetch_text(u))
+                .ok_or_else(|| anyhow::anyhow!("the release has no SHA256SUMS.txt — refusing to update automatically"))?;
+            let want = sums.lines().find_map(|l| { let mut it = l.split_whitespace(); let h = it.next()?; (it.next() == Some(name.as_str())).then_some(h) })
+                .ok_or_else(|| anyhow::anyhow!("checksum for {name} not found"))?;
+            anyhow::ensure!(want.eq_ignore_ascii_case(&sha256_file(&dst)?), "checksum mismatch — file corrupted");
+            match pk {
+                Pack::AppImage => {
+                    use std::os::unix::fs::PermissionsExt;
+                    let target = PathBuf::from(std::env::var_os("APPIMAGE").expect("AppImage path"));
+                    std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755))?;
+                    // παλιό → .old (backup), νέο στη θέση του παλιού: το τρέχον AppImage συνεχίζει
+                    // να τρέχει από τον παλιό inode· στην επόμενη εκκίνηση φορτώνεται το νέο
+                    let bak = target.with_extension("AppImage.old");
+                    let _ = std::fs::remove_file(&bak);
+                    std::fs::rename(&target, &bak)?;
+                    std::fs::rename(&dst, &target)?;
+                    // σημείο επανεκκίνησης: το main() θα ξανανοίξει το νέο AppImage όταν κλείσουμε
+                    let _ = std::fs::write(store_path().with_extension("restart"), target.display().to_string());
+                    Ok(true)
+                }
+                Pack::Deb | Pack::Dmg => { open_path(&dst); Ok(false) }
+            }
+        })();
+        let mut j = job.lock().unwrap();
+        j.busy = false;
+        j.file = None;
+        match r {
+            Ok(true) => { j.ready = true; j.msg = format!("Version {} installed – restart NVRDeck to finish.", j.info.as_ref().map(|i| i.version.clone()).unwrap_or_default()); }
+            Ok(false) => { j.msg = "Downloaded and verified – finish the install (your password may be needed).".into(); }
+            Err(e) => { j.msg = format!("Update failed: {e}"); let _ = std::fs::remove_file(&dst); }
+        }
+        ctx.request_repaint();
+    });
+}
+
+// ───────────────────────── Αυτόματο σκαν καναλιών καταγραφικού ─────────────────────────
+/// Επιστρέφει true αν η ροή δίνει εικόνα (χρησιμοποιείται από background νήματα).
+fn stream_ok(url: &str) -> bool {
+    Command::new(tool("ffprobe")).args(["-v", "error", "-rtsp_transport", "tcp", "-timeout", "5000000", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name", "-of", "csv=p=0", url])
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Ρωτά το ίδιο το καταγραφικό (DVRIP, θύρα 34567) πόσα κανάλια έχει και εντοπίζει όσα λείπουν
+/// από τη λίστα μας. Κάθε νέο κανάλι επιβεβαιώνεται ότι δίνει εικόνα πριν προστεθεί.
+/// Παλιότερα κάτι τέτοιο υπήρχε μόνο στο κινητό (και με δοκιμές ροών καμερών) — τώρα και εδώ.
+fn auto_scan(store: Store, found: Arc<Mutex<Vec<Camera>>>, ctx: egui::Context) {
+    std::thread::spawn(move || {
+        // ομαδοποίηση των XMeye καναλιών ανά καταγραφικό (host + RTSP θύρα)
+        let mut groups: Vec<(String, u16, Vec<usize>)> = vec![];
+        for (i, c) in store.camera.iter().enumerate().filter(|(_, c)| c.proto == Proto::XMeye) {
+            match groups.iter_mut().find(|(h, p, _)| *h == c.host && *p == c.port) {
+                Some((_, _, v)) => v.push(i),
+                None => groups.push((c.host.clone(), c.port, vec![i])),
+            }
+        }
+        let mut added: Vec<Camera> = vec![];
+        for (host, _port, idxs) in &groups {
+            let base_idx = idxs.iter().copied().max_by_key(|&i| store.camera[i].channel).unwrap();
+            let base = store.camera[base_idx].clone();
+            let have: Vec<u32> = idxs.iter().copied().map(|i| store.camera[i].channel).collect();
+            let prefix = base.name.rsplit_once(" CH").map(|(p, _)| p.to_string()).unwrap_or_else(|| base.name.clone());
+            let nvr_n = match dvrip::Dvr::connect(&base.host, dvrip::PORT, &base.user, &base.pass) {
+                Ok(mut d) => d.channels().unwrap_or(0),
+                Err(_) => continue, // δεν μιλάει DVRIP με αυτά τα στοιχεία — τίποτα δεν αλλάζει
+            };
+            if nvr_n <= base.channel { continue; }
+            for ch in (base.channel + 1)..=nvr_n.min(64) {
+                if store.camera.len() + added.len() >= MAX_CH { break; }
+                if have.contains(&ch) || added.iter().any(|c| c.host == base.host && c.port == base.port && c.channel == ch) { continue; }
+                if store.settings.ignored_ch.iter().any(|k| k == &format!("{}:{}:{}", host, base.port, ch)) { continue; }
+                let mut cand = base.clone();
+                cand.channel = ch;
+                cand.name = format!("{prefix} CH{ch}");
+                // επιβεβαίωση ότι το κανάλι δίνει εικόνα (π.χ. χωρίς συνδεδεμένη κάμερα)
+                if stream_ok(&cand.url()) { added.push(cand); }
+            }
+        }
+        *found.lock().unwrap() = added;
+        ctx.request_repaint();
+    });
+}
+
 fn main() -> anyhow::Result<()> {
     if std::env::args().any(|a| a == "--nvr-test") { return nvr_test(); }
     if std::env::args().any(|a| a == "--audio-test") { return audio_test(); }
@@ -2356,7 +2772,16 @@ fn main() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default().with_fullscreen(wall).with_inner_size([1280.0, 780.0]).with_min_inner_size([720.0, 480.0]).with_title("NVRDeck").with_icon(std::sync::Arc::new(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap_or_default())),
         ..Default::default()
     };
-    eframe::run_native("nvrdeck", opts, Box::new(move |cc| { let mut a = App::new(cc); a.wall = wall; a.chrome = !wall; Ok(Box::new(a)) })).map_err(|e| anyhow::anyhow!("{e}"))
+    let r = eframe::run_native("nvrdeck", opts, Box::new(move |cc| { let mut a = App::new(cc); a.wall = wall; a.chrome = !wall; Ok(Box::new(a)) })).map_err(|e| anyhow::anyhow!("{e}"));
+    // ενημέρωση AppImage: μόλις κλείσει το παράθυρο (και ελευθερωθεί το single-instance lock)
+    // ξανανοίγει η νέα έκδοση που έβαλε στη θέση μας ο updater
+    let marker = store_path().with_extension("restart");
+    if let Ok(p) = std::fs::read_to_string(&marker) {
+        let _ = std::fs::remove_file(&marker);
+        drop(lock);
+        let _ = Command::new(p.trim()).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    }
+    r
 }
 
 impl App {
@@ -2657,6 +3082,8 @@ impl App {
 
     fn nvr_playback_ui(&mut self, ctx: &egui::Context, groups: Vec<Vec<(usize, u32, String)>>) {
         let gi = self.pb.nvr.min(groups.len() - 1);
+        // όριο στην GPU μνήμη των υφών μικρογραφιών (καθένα ~230 KB)
+        if self.pb.thumb_tex.len() > 220 { self.pb.thumb_tex.clear(); }
         let g = groups[gi].clone();
         let today = chrono::Local::now().date_naive();
         let date = (chrono::Local::now() + chrono::Duration::days(self.pb.day)).date_naive();
@@ -2669,8 +3096,12 @@ impl App {
             self.pb.key = key;
             self.pb.players.clear();
             self.pb.cursor = None;
+            // αιτήματα μικρογραφιών/αναγνώρισης της προηγούμενης ημέρας εγκαταλείπονται:
+            // το `pending` έμενε και κοχλούσε για πάντα τα αντίστοιχα κλειδιά
+            { let mut st = self.pb.thumbs.lock().unwrap(); st.queue.clear(); st.pending.clear(); st.failed.clear(); }
             *self.pb.day_files.lock().unwrap() = None;
-            let (out, c2, ctx2, chans) = (self.pb.day_files.clone(), cam.clone(), ctx.clone(), g.iter().map(|x| x.1).collect::<Vec<_>>());
+            let gen = self.pb.files_gen.fetch_add(1, Ordering::Relaxed) + 1;
+            let (out, c2, ctx2, chans, gen_now) = (self.pb.day_files.clone(), cam.clone(), ctx.clone(), g.iter().map(|x| x.1).collect::<Vec<_>>(), self.pb.files_gen.clone());
             std::thread::spawn(move || {
                 let r = (|| -> anyhow::Result<_> {
                     let mut d = dvrip::Dvr::connect(&c2.host, dvrip::PORT, &c2.user, &c2.pass)?;
@@ -2685,7 +3116,11 @@ impl App {
                     }
                     Ok(m)
                 })();
-                *out.lock().unwrap() = Some(r.map_err(|e| e.to_string()));
+                // γρήγορες εναλλαγές ημέρας: γράφει μόνο η νεότερη «γενιά» —
+                // ο πιο αργός worker μιας παλιάς ημέρας δεν μπορεί πια να κερδίσει
+                if gen_now.load(Ordering::Relaxed) == gen {
+                    *out.lock().unwrap() = Some(r.map_err(|e| e.to_string()));
+                }
                 ctx2.request_repaint();
             });
         }
@@ -2707,16 +3142,34 @@ impl App {
             if pl.ended() { if let Some(e) = parse_t(&pl.file.end) { next.push((*ch, e)); } }
         }
         if !next.is_empty() {
-            if let Some(Ok(map)) = self.pb.day_files.lock().unwrap().clone() {
+            let dfm = self.pb.day_files.lock().unwrap().clone();
+            if let Some(Ok(map)) = &dfm {
+                let mut jump_after: Option<chrono::NaiveDateTime> = None;
                 for (ch, e) in next {
-                    let nf = map.get(&ch).and_then(|(all, _)| all.iter().filter_map(|f| parse_t(&f.begin).filter(|a| *a >= e - chrono::Duration::seconds(5) && *a <= e + chrono::Duration::seconds(10)).map(|a| (f.clone(), a))).min_by_key(|x| x.1));
+                    // σε λειτουργία «μόνο κίνηση» συνεχίζουμε αποκλειστικά μέσα στη λίστα κίνησης
+                    let list = map.get(&ch).map(|(all, mot)| if self.pb.motion_only { mot } else { all });
+                    let nf = list.and_then(|l| l.iter()
+                        .filter_map(|f| parse_t(&f.begin).filter(|a| *a >= e - chrono::Duration::seconds(5) && *a <= e + chrono::Duration::seconds(10)).map(|a| (f.clone(), a)))
+                        .min_by_key(|x| x.1));
                     self.pb.players.retain(|(c, _)| *c != ch);
                     if let Some((f, a)) = nf {
                         let p = NvrPlayer::start(&cam, f, a, ctx.clone());
-                        p.speed.store(self.pb.speed, Ordering::Relaxed);
+                        p.pause.store(self.pb.paused, Ordering::Relaxed);
+                        p.speed.store(self.pb.speed.max(1), Ordering::Relaxed);
                         self.pb.players.push((ch, p));
+                    } else if self.pb.motion_only {
+                        // κενό >10 s μεταξύ τμημάτων κίνησης: άλμα στο επόμενο τμήμα οποιουδήποτε
+                        // ορατού καναλιού (παλιά εδώ κόλλαγε οριστικά η «μόνο κίνηση» αναπαραγωγή)
+                        let nx = map.iter().filter(|(c, _)| !self.pb.hidden.contains(c))
+                            .flat_map(|(_, (_, mot))| mot.iter().filter_map(|f| parse_t(&f.begin)))
+                            .filter(|a| *a > e).min();
+                        match nx {
+                            Some(n) => jump_after = Some(n),
+                            None => { self.pb.players.clear(); self.toast = Some(("No more motion on this day".into(), Instant::now())); }
+                        }
                     }
                 }
+                if let Some(n) = jump_after { self.pb_seek(&cam, n, ctx); }
             }
         }
         // τρέχουσα θέση = η πιο πρόσφατη ώρα από τα κανάλια που παίζουν
@@ -2755,7 +3208,7 @@ impl App {
             let ik = format!("{gi}/{date}");
             if self.pb.indexed_key != ik {
                 self.pb.indexed_key = ik;
-                { let mut st = self.pb.thumbs.lock().unwrap(); st.queue.clear(); st.progress = (0, 0); }
+                { let mut st = self.pb.thumbs.lock().unwrap(); st.queue.clear(); st.progress = (0, 0); st.img.clear(); st.tags.clear(); st.failed.clear(); }
                 for (ch, (_, mot)) in map {
                     for f in mot.iter().rev() {
                         if let Some(a) = parse_t(&f.begin) {
@@ -2959,6 +3412,58 @@ impl App {
                 if !j.msg.is_empty() { ui.label(RichText::new(&j.msg).small().color(if j.busy { TEXT() } else { MUTED() })); }
                 if !j.busy && !j.done.is_empty() && ui.small_button("Open exports folder").clicked() { open_path(&media_dir(true).join("Exports")); }
                 if j.busy { ctx.request_repaint_after(Duration::from_millis(300)); }
+            }
+            ui.add_space(4.0);
+            // ── λήψη ολόκληρης εγγραφής σε MP4 ──
+            {
+                let mut start: Option<(dvrip::RecFile, String)> = None;
+                let done: Option<Result<PathBuf, String>> = {
+                    let mut j = self.pb.dl.lock().unwrap();
+                    let d = (!j.busy).then(|| j.done.take()).flatten();
+                    d
+                };
+                if let Some(r) = done {
+                    match r { Ok(p) => self.toast(&format!("Recording saved: {}", p.display())), Err(e) => self.toast(&format!("Download failed: {e}")) }
+                }
+                let busy = self.pb.dl.lock().unwrap().busy;
+                if busy {
+                    let (b, t) = { let j = self.pb.dl.lock().unwrap(); (j.bytes, j.total) };
+                    ui.label(RichText::new(format!("Downloading recording… {:.0}/{:.0} MB", b as f64 / 1e6, t as f64 / 1e6)).small().color(MUTED()));
+                    ctx.request_repaint_after(Duration::from_millis(250));
+                } else {
+                    // το αρχείο που περιέχει τον δείκτη: το κανάλι του big, αλλιώς όποιο ορατό καλύπτει
+                    let target = (|| {
+                        let Ok(files) = files.as_ref()? else { return None };
+                        let cur = self.pb.cursor?;
+                        let chs: Vec<u32> = match self.pb.big { Some(b) => vec![b], None => g.iter().filter(|x| !self.pb.hidden.contains(&x.1)).map(|x| x.1).collect() };
+                        for ch in chs {
+                            if let Some((all, _)) = files.get(&ch) {
+                                if let Some(f) = all.iter().find(|f| matches!((parse_t(&f.begin), parse_t(&f.end)), (Some(a), Some(e)) if a <= cur && cur < e)) {
+                                    let name = g.iter().find(|x| x.1 == ch).map(|x| x.2.clone()).unwrap_or_default();
+                                    return Some((f.clone(), name));
+                                }
+                            }
+                        }
+                        None
+                    })();
+                    let can = target.is_some();
+                    if ui.add_enabled(can, egui::Button::new("⬇ Download whole recording")).on_hover_text("The whole recording around the cursor, saved as MP4 (Videos/NVRDeck/Recorder)").clicked() {
+                        if let Some((f, name)) = target { start = Some((f, name)); }
+                    }
+                }
+                if let Some((f, name)) = start {
+                    let (job, c2) = (self.pb.dl.clone(), cam.clone());
+                    {
+                        let mut j = self.pb.dl.lock().unwrap();
+                        j.busy = true; j.done = None; j.bytes = 0; j.total = f.size_kb.saturating_mul(1024); j.name = f.name.clone();
+                    }
+                    std::thread::spawn(move || {
+                        let r = fetch_recording(&c2, &f, &name, &job);
+                        let mut j = job.lock().unwrap();
+                        j.busy = false;
+                        j.done = Some(r.map_err(|e| e.to_string()));
+                    });
+                }
             }
             ui.add_space(10.0);
             ui.separator();
@@ -3175,24 +3680,38 @@ impl App {
     }
 }
 
-/// Κατεβάζει μια εγγραφή του NVR και τη μετατρέπει σε MP4 (χωρίς επανακωδικοποίηση).
+/// Κατεβάζει μια ολόκληρη εγγραφή του NVR και τη μετατρέπει σε MP4 (χωρίς επανακωδικοποίηση).
+/// Το raw ρεύμα γράφεται απευθείας σε αρχεία — δεν ανεβαίνει ποτέ ολόκληρο στη μνήμη.
 fn fetch_recording(cam: &Camera, f: &dvrip::RecFile, name: &str, job: &Arc<Mutex<DlJob>>) -> anyhow::Result<PathBuf> {
     let dir = media_dir(true).join("Recorder");
     std::fs::create_dir_all(&dir)?;
     let stem = format!("{}_{}", name, f.begin).chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect::<String>();
     let out = dir.join(format!("{stem}.mp4"));
     if out.exists() { return Ok(out); }
+    // 1. λήψη του ακατέργαστου ρεύματος XMeye στο δίσκο (με σήμα προόδου)
     let raw = std::env::temp_dir().join(format!("{stem}.raw"));
-    let mut d = dvrip::Dvr::connect(&cam.host, dvrip::PORT, &cam.user, &cam.pass)?;
-    let j2 = job.clone();
-    d.download(&cam.host, dvrip::PORT, f, &raw, u64::MAX, move |b| { j2.lock().unwrap().bytes = b; })?;
-    let bytes = std::fs::read(&raw)?;
-    let _ = std::fs::remove_file(&raw);
-    let (fps, hevc) = dvrip::stream_info(&bytes);
-    let es = dvrip::strip_frames(&bytes);
-    anyhow::ensure!(!es.is_empty(), "no video in recording");
+    {
+        let mut d = dvrip::Dvr::connect(&cam.host, dvrip::PORT, &cam.user, &cam.pass)?;
+        let j2 = job.clone();
+        d.download(&cam.host, dvrip::PORT, f, &raw, u64::MAX, move |b| { j2.lock().unwrap().bytes = b; })?;
+    }
+    // 2. αφαίρεση των κεφαλίδων XMeye (0x000001FC/FD) σταδιακά, καρέ-καρέ
     let tmp = std::env::temp_dir().join(format!("{stem}.es"));
-    std::fs::write(&tmp, &es)?;
+    let (fps, hevc) = {
+        let mut inp = std::fs::File::open(&raw)?;
+        let mut es = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        let mut parser = dvrip::FrameParser::default();
+        let mut buf = vec![0u8; 1 << 16];
+        loop {
+            let n = inp.read(&mut buf)?;
+            if n == 0 { break; }
+            for (frame, _key) in parser.push(&buf[..n]) { es.write_all(&frame)?; }
+        }
+        (parser.fps, parser.hevc)
+    };
+    let _ = std::fs::remove_file(&raw);
+    anyhow::ensure!(std::fs::metadata(&tmp).map(|m| m.len() > 0).unwrap_or(false), "no video in recording");
+    // 3. συσκευασία σε MP4
     let st = Command::new(tool("ffmpeg")).args(["-v", "error", "-y", "-f", if hevc { "hevc" } else { "h264" }, "-r", &fps.max(1).to_string(), "-i"])
         .arg(&tmp).args(["-c", "copy", "-movflags", "+faststart"]).arg(&out).stdout(Stdio::null()).stderr(Stdio::null()).status()?;
     let _ = std::fs::remove_file(&tmp);
@@ -3291,6 +3810,8 @@ fn field_box(ui: &mut egui::Ui, key: impl std::hash::Hash, value: &mut String, i
 }
 
 /// Εξαγωγή διαστήματος [a, b] για κάθε κανάλι σε MP4 (χωρίς επανακωδικοποίηση).
+/// Το elementary stream γράφεται σταδιακά σε αρχείο — παλιά μαζευόταν όλο στη μνήμη
+/// (εξαγωγή 1h από πλήρες bitrate ⇒ ~2 GB RAM).
 fn start_export(cam: Camera, chans: Vec<(u32, String)>, map: std::collections::BTreeMap<u32, (Vec<dvrip::RecFile>, Vec<dvrip::RecFile>)>,
                 a: chrono::NaiveDateTime, b: chrono::NaiveDateTime, job: Arc<Mutex<ExportJob>>, ctx: egui::Context) {
     { let mut j = job.lock().unwrap(); j.busy = true; j.done.clear(); j.msg = "Starting export…".into(); }
@@ -3305,10 +3826,13 @@ fn start_export(cam: Camera, chans: Vec<(u32, String)>, map: std::collections::B
             set(format!("Channel {}/{}: {name}…", k + 1, chans.len()));
             let r = (|| -> anyhow::Result<PathBuf> {
                 let mut d = dvrip::Dvr::connect(&cam.host, dvrip::PORT, &cam.user, &cam.pass)?;
-                let mut es: Vec<u8> = vec![];
                 let mut parser = dvrip::FrameParser::default();
                 let mut started = false;
                 let total = (b - a).num_seconds().max(1) as f64;
+                let stem = format!("{}_{}_{}", name, a.format("%Y%m%d_%H%M%S"), b.format("%H%M%S")).chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect::<String>();
+                let tmp = std::env::temp_dir().join(format!("{stem}.es"));
+                let mut es = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+                let (job2, ctx2, name2) = (job.clone(), ctx.clone(), name.clone());
                 for f in files {
                     let from = parse_t(&f.begin).map(|fa| fa.max(a)).unwrap_or(a).format("%Y-%m-%d %H:%M:%S").to_string();
                     let mut cur: Option<chrono::NaiveDateTime> = None;
@@ -3318,16 +3842,14 @@ fn start_export(cam: Camera, chans: Vec<(u32, String)>, map: std::collections::B
                             let Some(t) = cur else { continue };
                             if t > b { return false; }
                             if !started { if !key || t < a - chrono::Duration::seconds(2) { continue; } started = true; }
-                            es.extend_from_slice(&frame);
-                            if key { job.lock().unwrap().msg = format!("Channel {}/{}: {name} {:.0}%", k + 1, chans.len(), ((t - a).num_seconds() as f64 / total * 100.0).clamp(0.0, 100.0)); ctx.request_repaint(); }
+                            if std::io::Write::write_all(&mut es, &frame).is_err() { return false; }
+                            if key { job2.lock().unwrap().msg = format!("Channel {}/{}: {name2} {:.0}%", k + 1, chans.len(), ((t - a).num_seconds() as f64 / total * 100.0).clamp(0.0, 100.0)); ctx2.request_repaint(); }
                         }
                         true
                     })?;
                 }
-                anyhow::ensure!(!es.is_empty(), "no video in range");
-                let stem = format!("{}_{}_{}", name, a.format("%Y%m%d_%H%M%S"), b.format("%H%M%S")).chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect::<String>();
-                let tmp = std::env::temp_dir().join(format!("{stem}.es"));
-                std::fs::write(&tmp, &es)?;
+                drop(es); // flush πριν το ffmpeg διαβάσει το αρχείο
+                anyhow::ensure!(std::fs::metadata(&tmp).map(|m| m.len() > 0).unwrap_or(false), "no video in range");
                 let out = dir.join(format!("{stem}.mp4"));
                 let st = Command::new(tool("ffmpeg")).args(["-v", "error", "-y", "-f", if parser.hevc { "hevc" } else { "h264" }, "-r", &parser.fps.max(1).to_string(), "-i"])
                     .arg(&tmp).args(["-c", "copy", "-movflags", "+faststart"]).arg(&out).stdout(Stdio::null()).stderr(Stdio::null()).status()?;
@@ -3395,11 +3917,15 @@ fn thumb_worker(store: Arc<Mutex<ThumbStore>>, ctx: egui::Context) {
                 let tags = if ai { det.as_ref().and_then(|d| d.run(&img, TW, TH, 0.4).ok()).map(|h| h.iter().map(|x| (x.class, x.score)).collect()).unwrap_or_default() } else { vec![] };
                 let mut s = store.lock().unwrap();
                 s.img.insert(key.clone(), Arc::new(img));
+                s.failed.remove(&key);
                 if ai { s.tags.insert(key.clone(), tags); s.progress.0 += 1; }
                 s.pending.remove(&key);
+                // όριο μνήμης: πάνω από ~300 μικρογραφίες (~70 MB) ξεκινάει καθαρή σελίδα
+                if s.img.len() > 300 { s.img.clear(); s.tags.clear(); }
             } else {
                 let mut s = store.lock().unwrap();
                 s.pending.remove(&key);
+                s.failed.insert(key.clone(), Instant::now());
                 if ai { s.tags.insert(key, vec![]); s.progress.0 += 1; }
             }
             ctx.request_repaint();
@@ -3410,6 +3936,8 @@ fn thumb_worker(store: Arc<Mutex<ThumbStore>>, ctx: egui::Context) {
 fn thumb_request(store: &Arc<Mutex<ThumbStore>>, ctx: &egui::Context, key: String, cam: &Camera, f: &dvrip::RecFile, at: chrono::NaiveDateTime, ai: bool, front: bool) {
     let mut s = store.lock().unwrap();
     if s.img.contains_key(&key) || s.pending.contains(&key) { return; }
+    // πρόσφατη αποτυχία: μην ξαναχτυπάμε το καταγραφικό για το ίδιο key σε κάθε κίνηση του ποντικιού
+    if s.failed.get(&key).is_some_and(|t| t.elapsed() < Duration::from_secs(30)) { return; }
     s.pending.insert(key.clone());
     let item = (key, cam.clone(), f.clone(), at, ai);
     if front { s.queue.push_front(item) } else { s.queue.push_back(item) }
@@ -3418,7 +3946,8 @@ fn thumb_request(store: &Arc<Mutex<ThumbStore>>, ctx: &egui::Context, key: Strin
 }
 
 /// Παρακολούθηση καταγραφικού: δίσκος, βάθος εγγραφών, κανάλια που σταμάτησαν να γράφουν.
-fn rec_health_worker(cam: Camera, chans: Vec<(u32, String)>, out: Arc<Mutex<Option<RecHealth>>>, alerts: bool, ctx: egui::Context) {
+/// (το on/off των ειδοποιήσεων διαβάζεται ζωντανά από το ALERTS_ON, όχι παγωμένο από το login)
+fn rec_health_worker(cam: Camera, chans: Vec<(u32, String)>, out: Arc<Mutex<Option<RecHealth>>>, ctx: egui::Context) {
     std::thread::spawn(move || {
         let mut warned: std::collections::HashSet<u32> = Default::default();
         loop {
@@ -3442,7 +3971,7 @@ fn rec_health_worker(cam: Camera, chans: Vec<(u32, String)>, out: Arc<Mutex<Opti
             // ειδοποίηση: κανάλι που έγραφε το τελευταίο 24ωρο αλλά όχι τα τελευταία 30 λεπτά
             for (ch, name, _, latest) in &h.chans {
                 let stale = latest.map_or(false, |l| now - l > chrono::Duration::minutes(30) && now - l < chrono::Duration::hours(24));
-                if stale && warned.insert(*ch) && alerts { desktop_notify(&format!("{name} stopped recording"), &format!("Last recording at {}.", latest.unwrap().format("%H:%M"))); }
+                if stale && warned.insert(*ch) && ALERTS_ON.load(Ordering::Relaxed) { desktop_notify(&format!("{name} stopped recording"), &format!("Last recording at {}.", latest.unwrap().format("%H:%M"))); }
                 if !stale { warned.remove(ch); }
             }
             *out.lock().unwrap() = Some(h);
@@ -3541,8 +4070,10 @@ fn save_ch_cfg(cam: &Camera, ch: u32, c: &ChCfg) -> anyhow::Result<()> {
 
 impl App {
     fn recorder_ui(&mut self, ctx: &egui::Context) {
+        // η κάμερα-αντιπρόσωπος μπορεί να έχει διαγραφεί όσο το παράθυρο ήταν ανοιχτό
+        let cam = self.rcfg.as_ref().and_then(|rc| self.store.camera.get(rc.group[0].0).cloned());
+        let Some(cam) = cam else { self.rcfg = None; return };
         let Some(rc) = &mut self.rcfg else { return };
-        let cam = self.store.camera[rc.group[0].0].clone();
         // φόρτωση καναλιού
         if rc.loaded_ch != rc.ch {
             rc.loaded_ch = rc.ch; rc.edit = None; rc.snap_tex = None;
@@ -3554,7 +4085,6 @@ impl App {
         if rc.snap_tex.is_none() { if let Some(Some(px)) = rc.edit.as_ref().map(|e| e.snap.clone()) { rc.snap_tex = Some(ctx.load_texture("rcsnap", egui::ColorImage::from_rgba_unmultiplied([640, 360], &px), egui::TextureOptions::LINEAR)); } }
         let mut open = true;
         let mut do_save = false;
-        let mut new_pw: Option<String> = None;
         let mut zone_dirty = false;
         egui::Window::new("Recorder settings").open(&mut open).collapsible(false).resizable(false).default_width(700.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0)).show(ctx, |ui| {
@@ -3704,12 +4234,20 @@ impl App {
                         else if rc.pw_new != rc.pw_new2 { *rc.msg.lock().unwrap() = "The new passwords don't match.".into(); }
                         else if rc.pw_old != cam.pass { *rc.msg.lock().unwrap() = "The current password is not the one NVRDeck has saved.".into(); }
                         else {
-                            let (c2, msg, b, newp, oldp) = (cam.clone(), rc.msg.clone(), rc.busy.clone(), rc.pw_new.clone(), rc.pw_old.clone());
-                            match dvrip::Dvr::connect(&c2.host, dvrip::PORT, &c2.user, &oldp).and_then(|mut d| d.change_password(&c2.user, &oldp, &newp)) {
-                                Ok(()) => { *msg.lock().unwrap() = "Password changed on the recorder.".into(); new_pw = Some(newp); }
-                                Err(e) => *msg.lock().unwrap() = format!("Not changed: {e}"),
-                            }
-                            b.store(false, Ordering::Relaxed);
+                            // η σύνδεση στο καταγραφικό γίνεται στο παρασκήνιο — ποτέ στο νήμα του UI
+                            let (c2, msg, b, done, ctx2) = (cam.clone(), rc.msg.clone(), rc.busy.clone(), rc.pw_done.clone(), ctx.clone());
+                            let (user, oldp, newp) = (cam.user.clone(), rc.pw_old.clone(), rc.pw_new.clone());
+                            b.store(true, Ordering::Relaxed);
+                            *msg.lock().unwrap() = "Changing…".into();
+                            std::thread::spawn(move || {
+                                let r = dvrip::Dvr::connect(&c2.host, dvrip::PORT, &user, &oldp).and_then(|mut d| d.change_password(&user, &oldp, &newp));
+                                match r {
+                                    Ok(()) => { *msg.lock().unwrap() = "Password changed on the recorder.".into(); *done.lock().unwrap() = Some(newp); }
+                                    Err(e) => *msg.lock().unwrap() = format!("Not changed: {e}"),
+                                }
+                                b.store(false, Ordering::Relaxed);
+                                ctx2.request_repaint();
+                            });
                             rc.pw_old.clear(); rc.pw_new.clear(); rc.pw_new2.clear();
                         }
                     }
@@ -3725,8 +4263,14 @@ impl App {
                             if ui.button("Cancel").clicked() { rc.confirm_reboot = false; }
                             if ui.add(egui::Button::new(RichText::new("Restart").color(Color32::WHITE)).fill(BAD)).clicked() {
                                 rc.confirm_reboot = false;
-                                let r = dvrip::Dvr::connect(&cam.host, dvrip::PORT, &cam.user, &cam.pass).and_then(|mut d| d.reboot());
-                                *rc.msg.lock().unwrap() = match r { Ok(()) => "Restarting… cameras come back in about a minute.".into(), Err(e) => format!("Could not restart: {e}") };
+                                let (c2, msg, b, ctx2) = (cam.clone(), rc.msg.clone(), rc.busy.clone(), ctx.clone());
+                                b.store(true, Ordering::Relaxed);
+                                std::thread::spawn(move || {
+                                    let r = dvrip::Dvr::connect(&c2.host, dvrip::PORT, &c2.user, &c2.pass).and_then(|mut d| d.reboot());
+                                    *msg.lock().unwrap() = match r { Ok(()) => "Restarting… cameras come back in about a minute.".into(), Err(e) => format!("Could not restart: {e}") };
+                                    b.store(false, Ordering::Relaxed);
+                                    ctx2.request_repaint();
+                                });
                             }
                         });
                     }
@@ -3761,6 +4305,8 @@ impl App {
                 });
             }
         }
+        // νέος κωδικός καταγραφικού από το παρασκήνιο: ενημέρωση των αποθηκευμένων credentials
+        let new_pw = rc.pw_done.lock().unwrap().take();
         if let Some(np) = new_pw {
             let host = cam.host.clone();
             for c in self.store.camera.iter_mut().filter(|c| c.host == host) { c.pass = np.clone(); }

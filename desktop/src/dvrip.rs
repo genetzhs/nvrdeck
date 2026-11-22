@@ -11,7 +11,7 @@ pub const PORT: u16 = 34567;
 pub struct Dvr { s: TcpStream, session: u32, seq: u32 }
 
 #[derive(Debug, Clone)]
-pub struct RecFile { pub channel: u32, pub begin: String, pub end: String, pub name: String, pub size_kb: u64, pub raw: Value }
+pub struct RecFile { pub channel: u32, pub begin: String, pub end: String, pub name: String, pub size_kb: u64 }
 
 #[derive(Debug, Clone)]
 pub struct Alarm { pub channel: u32, pub event: String, pub start: bool, pub time: String }
@@ -140,7 +140,7 @@ impl Dvr {
             eprintln!("  SystemInfo channel fields: {}", keys.join(", "));
         }
         let n = |k: &str| si[k].as_u64().unwrap_or(0) as u32;
-        Ok(n("VideoInChannel").max(n("DigChannel")).max(n("CombineSwitch").min(0)))
+        Ok(n("VideoInChannel").max(n("DigChannel")))
     }
 
     /// Πληροφορίες δίσκων: (πλήθος, συνολικά MB, ελεύθερα MB)
@@ -170,7 +170,7 @@ impl Dvr {
             for f in list {
                 let size = f["FileLength"].as_str().and_then(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16).ok()).unwrap_or(0);
                 out.push(RecFile { channel, begin: f["BeginTime"].as_str().unwrap_or("").into(), end: f["EndTime"].as_str().unwrap_or("").into(),
-                                   name: f["FileName"].as_str().unwrap_or("").into(), size_kb: size, raw: f });
+                                   name: f["FileName"].as_str().unwrap_or("").into(), size_kb: size });
             }
             if n < 64 { break; }
             let last = out.last().map(|f| f.end.clone()).unwrap_or_default();
@@ -273,8 +273,10 @@ impl Dvr {
         let addr = (host, port).to_socket_addrs()?.next().ok_or_else(|| anyhow::anyhow!("bad address"))?;
         let mut data = Dvr { s: TcpStream::connect_timeout(&addr, Duration::from_secs(5))?, session: self.session, seq: 0 };
         data.s.set_read_timeout(Some(Duration::from_secs(10)))?;
-        data.call(1424, pb("Claim"))?;
-        self.call(1420, pb("DownloadStart"))?;
+        let c = data.call(1424, pb("Claim"))?;
+        anyhow::ensure!(c["Ret"].as_i64() == Some(100), "claim refused ({:?})", c["Ret"]);
+        let r = self.call(1420, pb("DownloadStart"))?;
+        anyhow::ensure!(r["Ret"].as_i64() == Some(100), "download refused ({:?})", r["Ret"]);
         let mut total = 0u64;
         loop {
             let (m, b) = data.recv()?;

@@ -93,36 +93,36 @@ fn ambient_glow(ctx: &egui::Context) {
 
 fn apply_theme(ctx: &egui::Context, idx: u32) {
     THEME.store(idx, Ordering::Relaxed);
-    let P = pal();
-    let mut v = if P.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    let p = pal();
+    let mut v = if p.dark { egui::Visuals::dark() } else { egui::Visuals::light() };
     v.panel_fill = PANEL();
     v.window_fill = PANEL();
     v.extreme_bg_color = BG();
     v.faint_bg_color = SURFACE();
     v.override_text_color = Some(TEXT());
     v.window_rounding = Rounding::same(22.0);
-    v.window_stroke = Stroke::new(1.0, BORDER());
-    v.selection.bg_fill = ACCENT().linear_multiply(if P.dark { 0.35 } else { 0.25 });
-    v.selection.stroke = Stroke::new(1.0, ACCENT());
+    v.window_stroke = Stroke::new(1.0_f32, BORDER());
+    v.selection.bg_fill = ACCENT().linear_multiply(if p.dark { 0.35 } else { 0.25 });
+    v.selection.stroke = Stroke::new(1.0_f32, ACCENT());
     v.hyperlink_color = ACCENT();
     for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] {
         w.rounding = Rounding::same(12.0);
     }
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER());
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER());
     v.widgets.inactive.bg_fill = SURFACE();
     v.widgets.inactive.weak_bg_fill = SURFACE();
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER());
-    v.widgets.hovered.bg_fill = P.hover;
-    v.widgets.hovered.weak_bg_fill = P.hover;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, P.border);
-    v.widgets.active.bg_fill = P.hover;
-    v.widgets.active.weak_bg_fill = P.hover;
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER());
+    v.widgets.hovered.bg_fill = p.hover;
+    v.widgets.hovered.weak_bg_fill = p.hover;
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, p.border);
+    v.widgets.active.bg_fill = p.hover;
+    v.widgets.active.weak_bg_fill = p.hover;
     // παράθυρα φορμών: ίδια κάρτα με τη σύνδεση
-    v.window_fill = if P.dark { Color32::from_rgb(17, 18, 21) } else { PANEL() };
+    v.window_fill = if p.dark { Color32::from_rgb(17, 18, 21) } else { PANEL() };
     v.window_rounding = Rounding::same(20.0);
-    v.window_shadow = egui::epaint::Shadow { offset: egui::vec2(0.0, 18.0), blur: 48.0, spread: 0.0, color: Color32::from_black_alpha(if P.dark { 130 } else { 35 }) };
-    v.popup_shadow = egui::epaint::Shadow { offset: egui::vec2(0.0, 8.0), blur: 24.0, spread: 0.0, color: Color32::from_black_alpha(if P.dark { 110 } else { 25 }) };
-    v.text_cursor.stroke = Stroke::new(2.0, ACCENT());
+    v.window_shadow = egui::epaint::Shadow { offset: egui::vec2(0.0, 18.0), blur: 48.0, spread: 0.0, color: Color32::from_black_alpha(if p.dark { 130 } else { 35 }) };
+    v.popup_shadow = egui::epaint::Shadow { offset: egui::vec2(0.0, 8.0), blur: 24.0, spread: 0.0, color: Color32::from_black_alpha(if p.dark { 110 } else { 25 }) };
+    v.text_cursor.stroke = Stroke::new(2.0_f32, ACCENT());
     for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active, &mut v.widgets.open] { w.rounding = Rounding::same(10.0); }
     // η μπάρα τίτλου των παραθύρων παίρνει το ίδιο χρώμα με την κάρτα
     v.widgets.open.weak_bg_fill = v.window_fill;
@@ -148,7 +148,7 @@ fn apply_theme(ctx: &egui::Context, idx: u32) {
 /// «Γυάλινο» γέμισμα καρτών: διάφανο λευκό στο σκοτεινό θέμα, συμπαγές στα ανοιχτά.
 fn glass() -> Color32 { if pal().dark { Color32::from_rgba_unmultiplied(255, 255, 255, 9) } else { PANEL() } }
 fn glass_frame() -> egui::Frame {
-    egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0, BORDER())).rounding(22.0).inner_margin(egui::Margin::same(18.0))
+    egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0_f32, BORDER())).rounding(22.0).inner_margin(egui::Margin::same(18.0))
 }
 /// Μικρή κεφαλαία ετικέτα + μεγάλος τίτλος.
 fn screen_title(ui: &mut egui::Ui, eyebrow: &str, title: &str) {
@@ -935,15 +935,11 @@ struct App {
 struct NvrPb {
     local: bool,
     nvr: usize,        // δείκτης κάμερας-«αντιπροσώπου» του NVR
-    ch: u32,           // κανάλι (όπως στο RTSP)
     day: i64,          // 0 = σήμερα, -1 = χθες…
     pending: Option<chrono::NaiveDateTime>,
-    motion: bool,
     key: String,       // τι φορτώθηκε τελευταία
     files_gen: Arc<AtomicU64>,  // η γενιά του worker που φορτώνει αρχεία (αγνοούνται τα αργά/outdated)
-    files: Arc<Mutex<Option<Result<Vec<dvrip::RecFile>, String>>>>,
     dl: Arc<Mutex<DlJob>>,
-    player: Option<NvrPlayer>,
     /// κανάλι → (όλες οι εγγραφές, εγγραφές με κίνηση)
     day_files: Arc<Mutex<Option<Result<std::collections::BTreeMap<u32, (Vec<dvrip::RecFile>, Vec<dvrip::RecFile>)>, String>>>>,
     players: Vec<(u32, NvrPlayer)>,
@@ -991,7 +987,6 @@ struct DlJob { name: String, bytes: u64, total: u64, busy: bool, done: Option<Re
 struct RecHealth {
     disks: usize, total_mb: u64, free_mb: u64,
     chans: Vec<(u32, String, Option<chrono::NaiveDateTime>, Option<chrono::NaiveDateTime>)>, // (κανάλι, όνομα, παλαιότερη, πιο πρόσφατη)
-    checked: Option<chrono::NaiveDateTime>,
     err: String,
 }
 
@@ -1139,7 +1134,7 @@ impl App {
         egui::Area::new(egui::Id::new("login")).anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -12.0)).show(ctx, |ui| {
             egui::Frame::none()
                 .fill(if pal().dark { Color32::from_rgb(17, 18, 21) } else { PANEL() })
-                .stroke(Stroke::new(1.0, BORDER()))
+                .stroke(Stroke::new(1.0_f32, BORDER()))
                 .rounding(24.0)
                 .shadow(egui::epaint::Shadow { offset: egui::vec2(0.0, 18.0), blur: 48.0, spread: 0.0, color: Color32::from_black_alpha(if pal().dark { 120 } else { 30 }) })
                 .inner_margin(egui::Margin { left: 32.0, right: 32.0, top: 32.0, bottom: 28.0 })
@@ -1173,7 +1168,7 @@ impl App {
                 let enter = ui.input(|i| i.key_pressed(egui::Key::Enter)) && (r1.lost_focus() || r2.lost_focus() || r3.as_ref().map_or(false, |r| r.lost_focus()));
                 if !self.login_err.is_empty() {
                     ui.add_space(14.0);
-                    egui::Frame::none().fill(BAD.gamma_multiply(0.12)).stroke(Stroke::new(1.0, BAD.gamma_multiply(0.35))).rounding(10.0)
+                    egui::Frame::none().fill(BAD.gamma_multiply(0.12)).stroke(Stroke::new(1.0_f32, BAD.gamma_multiply(0.35))).rounding(10.0)
                         .inner_margin(egui::Margin::symmetric(12.0, 9.0)).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(RichText::new(&self.login_err).size(13.0).color(if pal().dark { Color32::from_rgb(255, 160, 175) } else { BAD }));
@@ -1258,7 +1253,7 @@ impl App {
     // ── Πάνω μπάρα ──
     fn top_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("top").exact_height(48.0).frame(
-            egui::Frame::none().fill(if pal().dark { Color32::from_rgba_unmultiplied(14, 14, 16, 215) } else { PANEL() }).inner_margin(egui::Margin::symmetric(16.0, 8.0)).stroke(Stroke::new(1.0, BORDER()))
+            egui::Frame::none().fill(if pal().dark { Color32::from_rgba_unmultiplied(14, 14, 16, 215) } else { PANEL() }).inner_margin(egui::Margin::symmetric(16.0, 8.0)).stroke(Stroke::new(1.0_f32, BORDER()))
         ).show(ctx, |ui| {
             ui.horizontal_centered(|ui| {
                 ui.label(RichText::new("● ").color(BAD));
@@ -1273,7 +1268,7 @@ impl App {
                 {
                     let armed = self.store.settings.armed;
                     let t = RichText::new(if armed { "● Armed" } else { "○ Disarmed" }).color(if armed { OK } else { MUTED() }).font(semibold(13.0));
-                    if ui.add(egui::Button::new(t).fill(if armed { OK.gamma_multiply(0.14) } else { Color32::TRANSPARENT }).stroke(Stroke::new(1.0, if armed { OK.gamma_multiply(0.5) } else { BORDER() })).rounding(999.0))
+                    if ui.add(egui::Button::new(t).fill(if armed { OK.gamma_multiply(0.14) } else { Color32::TRANSPARENT }).stroke(Stroke::new(1.0_f32, if armed { OK.gamma_multiply(0.5) } else { BORDER() })).rounding(999.0))
                         .on_hover_text("Armed: motion and people/vehicle alerts are on. Disarmed: no alerts.").clicked() {
                         self.store.settings.armed = !armed; self.save();
                     }
@@ -1610,7 +1605,7 @@ impl App {
                 }
                 // ένδειξη κίνησης (2 δευτερόλεπτα)
                 if self.streams.get(i).and_then(|s| s.as_ref()).and_then(|s| s.motion_at).map_or(false, |t| t.elapsed() < Duration::from_secs(2)) {
-                    p.rect_stroke(cell.shrink(1.0), 14.0, Stroke::new(2.0, Color32::from_rgb(255, 176, 32)));
+                    p.rect_stroke(cell.shrink(1.0), 14.0, Stroke::new(2.0_f32, Color32::from_rgb(255, 176, 32)));
                     let gal = p.layout_no_wrap("MOTION".into(), egui::FontId::monospace(10.0), Color32::BLACK);
                     let rr = egui::Rect::from_min_size(egui::pos2(cell.left() + 10.0, cell.bottom() - 30.0), gal.size() + egui::vec2(14.0, 8.0));
                     p.rect_filled(rr, 999.0, Color32::from_rgb(255, 176, 32));
@@ -1629,7 +1624,7 @@ impl App {
                     let hd_on = self.hd.as_ref().map_or(false, |h| h.0 == i && h.1.tex.is_some());
                     let mut bar = egui::Rect::from_min_size(egui::pos2(cell.center().x - 210.0, cell.bottom() - 52.0), egui::vec2(420.0, 40.0));
                     if bar.left() < cell.left() { bar = bar.translate(egui::vec2(cell.left() - bar.left(), 0.0)); }
-                    ui.allocate_ui_at_rect(bar, |ui| {
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(bar), |ui| {
                         egui::Frame::none().fill(Color32::from_black_alpha(170)).rounding(999.0).inner_margin(egui::Margin::symmetric(10.0, 5.0)).show(ui, |ui| {
                             ui.horizontal_centered(|ui| {
                                 if ui.add(egui::Button::new("📷  Snapshot").rounding(999.0)).on_hover_text("S").clicked() {
@@ -1675,7 +1670,7 @@ impl App {
                     });
                 }
                 if resp.hovered() && self.solo.is_none() {
-                    p.rect_stroke(cell, 14.0, Stroke::new(1.0, ACCENT().gamma_multiply(0.6)));
+                    p.rect_stroke(cell, 14.0, Stroke::new(1.0_f32, ACCENT().gamma_multiply(0.6)));
                 }
             }
             if let Some(i) = toggle_rec.take() { self.toggle_recording(i); }
@@ -1732,7 +1727,7 @@ impl App {
             for (i, c) in self.store.camera.iter().enumerate() {
                 let live = self.streams.get(i).and_then(|s| s.as_ref())
                     .map_or(false, |s| s.shared.lock().unwrap().last.map_or(false, |t| t.elapsed() < Duration::from_secs(5)));
-                egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0, BORDER())).rounding(18.0).inner_margin(egui::Margin::symmetric(16.0, 12.0)).show(ui, |ui| {
+                egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0_f32, BORDER())).rounding(18.0).inner_margin(egui::Margin::symmetric(16.0, 12.0)).show(ui, |ui| {
                     ui.horizontal(|ui| {
                         let (dot, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
                         ui.painter().circle_filled(dot.center(), 4.0, if !c.enabled { MUTED() } else if live { OK } else { BAD });
@@ -1814,7 +1809,7 @@ impl App {
             if at.elapsed() > Duration::from_secs(60) { self.last_alert = None; } else {
                 let mut play = false; let mut close = false;
                 egui::Area::new(egui::Id::new("alert_banner")).anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 58.0)).order(egui::Order::Foreground).show(ctx, |ui| {
-                    egui::Frame::none().fill(SURFACE()).stroke(Stroke::new(1.0, BORDER())).rounding(14.0).inner_margin(egui::Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
+                    egui::Frame::none().fill(SURFACE()).stroke(Stroke::new(1.0_f32, BORDER())).rounding(14.0).inner_margin(egui::Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| { ui.label(RichText::new(&title).strong()); ui.label(RichText::new(t.format("%H:%M:%S").to_string()).small().color(MUTED())); });
                             ui.add_space(10.0);
@@ -1856,7 +1851,7 @@ impl App {
             egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
                 for f in &g.found {
                     let added = self.store.camera.iter().any(|c| c.host == f.host);
-                    egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0, BORDER())).rounding(14.0).inner_margin(egui::Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
+                    egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0_f32, BORDER())).rounding(14.0).inner_margin(egui::Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.vertical(|ui| {
                                 ui.label(RichText::new(&f.host).strong().monospace());
@@ -2165,7 +2160,7 @@ impl App {
                     pt.rect_filled(egui::Rect::from_min_size(r.min, egui::vec2(r.width(), 16.0)), egui::Rounding { nw: 10.0, ne: 10.0, sw: 0.0, se: 0.0 }, p.panel);
                     pt.rect_filled(egui::Rect::from_min_size(r.min + egui::vec2(10.0, 26.0), egui::vec2(40.0, 10.0)), 3.0, p.accent);
                     pt.text(r.left_bottom() + egui::vec2(10.0, -8.0), egui::Align2::LEFT_BOTTOM, *name, egui::FontId::proportional(13.0), p.text);
-                    pt.rect_stroke(r, 10.0, if sel { Stroke::new(2.0, ACCENT()) } else { Stroke::new(1.0, BORDER()) });
+                    pt.rect_stroke(r, 10.0, if sel { Stroke::new(2.0_f32, ACCENT()) } else { Stroke::new(1.0_f32, BORDER()) });
                     if resp.clicked() && !sel {
                         self.store.settings.theme = i as u32;
                         self.settings_draft.theme = i as u32;
@@ -2305,7 +2300,7 @@ impl App {
         // γρήγορη είσοδος, γρήγορη έξοδος (opacity μόνο)
         let a = (age / 0.15).min(1.0) * ((2.5 - age) / 0.2).min(1.0);
         egui::Area::new(egui::Id::new("toast")).anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0)).show(ctx, |ui| {
-            egui::Frame::none().fill(SURFACE().gamma_multiply(a)).stroke(Stroke::new(1.0, BORDER().gamma_multiply(a))).rounding(8.0)
+            egui::Frame::none().fill(SURFACE().gamma_multiply(a)).stroke(Stroke::new(1.0_f32, BORDER().gamma_multiply(a))).rounding(8.0)
                 .inner_margin(egui::Margin::symmetric(14.0, 8.0)).show(ui, |ui| ui.label(RichText::new(t.as_str()).color(TEXT().gamma_multiply(a))));
         });
         ctx.request_repaint();
@@ -2888,7 +2883,7 @@ impl App {
             }
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for (path, video, when, size) in &self.media {
-                    egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0, BORDER())).rounding(14.0).inner_margin(egui::Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
+                    egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0_f32, BORDER())).rounding(14.0).inner_margin(egui::Margin::symmetric(14.0, 10.0)).show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(if *video { "🎞" } else { "📷" }).size(18.0));
                             ui.vertical(|ui| {
@@ -2958,7 +2953,8 @@ struct NvrPlayer {
     stop: Arc<AtomicBool>,
     pause: Arc<AtomicBool>,
     speed: Arc<AtomicU32>,
-    pos: Arc<Mutex<f64>>,       // (δεν χρησιμοποιείται για την ώρα)
+    #[allow(dead_code)] // δεσμευμένο για μελλοντική ένδειξη θέσης — δεν χρησιμοποιείται για την ώρα
+    pos: Arc<Mutex<f64>>,
     clock: Arc<Mutex<Option<chrono::NaiveDateTime>>>, // πραγματική ώρα του καρέ που φαίνεται
     begin: chrono::NaiveDateTime,
     tex: Option<egui::TextureHandle>,
@@ -3259,7 +3255,7 @@ impl App {
         let mut ev_seek: Option<chrono::NaiveDateTime> = None;
         if self.pb.events_open {
             egui::SidePanel::left("pbev").exact_width(300.0).resizable(false)
-                .frame(egui::Frame::none().fill(if pal().dark { Color32::from_rgba_unmultiplied(14, 14, 16, 200) } else { PANEL() }).inner_margin(egui::Margin::same(14.0)).stroke(Stroke::new(1.0, BORDER())))
+                .frame(egui::Frame::none().fill(if pal().dark { Color32::from_rgba_unmultiplied(14, 14, 16, 200) } else { PANEL() }).inner_margin(egui::Margin::same(14.0)).stroke(Stroke::new(1.0_f32, BORDER())))
                 .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Events").font(semibold(18.0)));
@@ -3304,7 +3300,7 @@ impl App {
                     for (k, (ch, name, a, b)) in shown.iter().enumerate() {
                         let key = format!("{ch}@{}", *a + chrono::Duration::seconds(3));
                         let tex = imgs[k].as_ref().map(|im| self.pb.thumb_tex.entry(key.clone()).or_insert_with(|| ctx.load_texture(&key, egui::ColorImage::from_rgba_unmultiplied([TW, TH], im), egui::TextureOptions::LINEAR)).clone());
-                        let r = egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0, BORDER())).rounding(12.0).inner_margin(egui::Margin::same(8.0)).show(ui, |ui| {
+                        let r = egui::Frame::none().fill(glass()).stroke(Stroke::new(1.0_f32, BORDER())).rounding(12.0).inner_margin(egui::Margin::same(8.0)).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
                                 let (ir, _) = ui.allocate_exact_size(egui::vec2(112.0, 63.0), egui::Sense::hover());
@@ -3326,7 +3322,7 @@ impl App {
                             });
                         }).response;
                         let r = ui.interact(r.rect, ui.id().with(("ev", k)), egui::Sense::click());
-                        if r.hovered() { ui.painter().rect_stroke(r.rect, 12.0, Stroke::new(1.0, ACCENT().gamma_multiply(0.7))); }
+                        if r.hovered() { ui.painter().rect_stroke(r.rect, 12.0, Stroke::new(1.0_f32, ACCENT().gamma_multiply(0.7))); }
                         if r.clicked() { ev_seek = Some(*a - chrono::Duration::seconds(2)); self.pb.big = Some(*ch); }
                         ui.add_space(6.0);
                     }
@@ -3337,7 +3333,7 @@ impl App {
         // ── δεξιά στήλη: ημερολόγιο, κανάλια, έλεγχοι ──
         let mut seek_to: Option<chrono::NaiveDateTime> = None;
         egui::SidePanel::right("pbside").exact_width(300.0).resizable(false)
-            .frame(egui::Frame::none().fill(if pal().dark { Color32::from_rgba_unmultiplied(14, 14, 16, 200) } else { PANEL() }).inner_margin(egui::Margin::same(16.0)).stroke(Stroke::new(1.0, BORDER())))
+            .frame(egui::Frame::none().fill(if pal().dark { Color32::from_rgba_unmultiplied(14, 14, 16, 200) } else { PANEL() }).inner_margin(egui::Margin::same(16.0)).stroke(Stroke::new(1.0_f32, BORDER())))
             .show(ctx, |ui| { egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.set_max_width(268.0);
             ui.horizontal(|ui| {
@@ -3385,7 +3381,7 @@ impl App {
                 let p = ui.painter();
                 if sel { p.rect_filled(cell, 8.0, ACCENT()); }
                 else if resp.hovered() && !fut { p.rect_filled(cell, 8.0, BORDER()); }
-                if d == today && !sel { p.rect_stroke(cell, 8.0, Stroke::new(1.0, ACCENT())); }
+                if d == today && !sel { p.rect_stroke(cell, 8.0, Stroke::new(1.0_f32, ACCENT())); }
                 p.text(cell.center(), egui::Align2::CENTER_CENTER, d.day().to_string(), egui::FontId::proportional(13.0),
                        if sel { Color32::WHITE } else if fut { MUTED().gamma_multiply(0.5) } else { TEXT() });
                 if resp.clicked() && !fut { self.pb.day = (d - today).num_days(); self.pb.month = Some(month); }
@@ -3565,7 +3561,7 @@ impl App {
                 let br = egui::Rect::from_min_size(cell.min + egui::vec2(8.0, 8.0), gal.size() + egui::vec2(16.0, 8.0));
                 p.rect_filled(br, 999.0, Color32::from_black_alpha(150));
                 p.galley(br.min + egui::vec2(8.0, 4.0), gal, Color32::WHITE);
-                if resp.hovered() { p.rect_stroke(cell, 14.0, Stroke::new(1.0, ACCENT().gamma_multiply(0.6))); }
+                if resp.hovered() { p.rect_stroke(cell, 14.0, Stroke::new(1.0_f32, ACCENT().gamma_multiply(0.6))); }
             }
             if let Some(b) = toggle_big { self.pb.big = if self.pb.big == Some(b) { None } else { Some(b) }; }
             if visible.is_empty() {
@@ -3582,7 +3578,7 @@ impl App {
             let tl = egui::Rect::from_min_max(egui::pos2(avail.min.x, avail.max.y - tl_h), avail.max);
             let p = ui.painter();
             p.rect_filled(tl, 14.0, glass());
-            p.rect_stroke(tl, 14.0, Stroke::new(1.0, BORDER()));
+            p.rect_stroke(tl, 14.0, Stroke::new(1.0_f32, BORDER()));
             let name_w = 110.0;
             let bar = egui::Rect::from_min_max(egui::pos2(tl.left() + name_w, tl.top() + 30.0), egui::pos2(tl.right() - 14.0, tl.bottom() - 24.0));
             let (vs, vl) = self.pb.view;
@@ -3621,7 +3617,7 @@ impl App {
             let mut t = (vs / step).ceil() * step;
             while t <= vs + vl {
                 let x = x_of(t);
-                p.line_segment([egui::pos2(x, bar.bottom() + 2.0), egui::pos2(x, bar.bottom() + 6.0)], Stroke::new(1.0, MUTED()));
+                p.line_segment([egui::pos2(x, bar.bottom() + 2.0), egui::pos2(x, bar.bottom() + 6.0)], Stroke::new(1.0_f32, MUTED()));
                 let lbl = format!("{:02}:{:02}", (t / 3600.0) as u32, ((t % 3600.0) / 60.0) as u32);
                 p.text(egui::pos2(x, bar.bottom() + 8.0), egui::Align2::CENTER_TOP, lbl, egui::FontId::monospace(10.5), MUTED());
                 t += step;
@@ -3644,13 +3640,13 @@ impl App {
                 if b > a {
                     let r = egui::Rect::from_min_max(egui::pos2(x_of(secs(a)).max(bar.left()), bar.top() - 2.0), egui::pos2(x_of(secs(b)).min(bar.right()), bar.bottom() + 2.0));
                     p.rect_filled(r, 3.0, Color32::from_white_alpha(22));
-                    p.rect_stroke(r, 3.0, Stroke::new(1.0, Color32::from_white_alpha(90)));
+                    p.rect_stroke(r, 3.0, Stroke::new(1.0_f32, Color32::from_white_alpha(90)));
                 }
             }
             if let Some(cur) = self.pb.cursor {
                 let x = x_of(secs(cur));
                 if x >= bar.left() && x <= bar.right() {
-                    p.line_segment([egui::pos2(x, bar.top() - 6.0), egui::pos2(x, bar.bottom() + 2.0)], Stroke::new(2.0, TEXT()));
+                    p.line_segment([egui::pos2(x, bar.top() - 6.0), egui::pos2(x, bar.bottom() + 2.0)], Stroke::new(2.0_f32, TEXT()));
                     p.circle_filled(egui::pos2(x, bar.top() - 6.0), 4.5, TEXT());
                 }
             }
@@ -3688,7 +3684,7 @@ impl App {
             }
             if let Some(sv) = preview {
                 let x = x_of(sv);
-                p.line_segment([egui::pos2(x, bar.top() - 4.0), egui::pos2(x, bar.bottom())], Stroke::new(1.0, ACCENT()));
+                p.line_segment([egui::pos2(x, bar.top() - 4.0), egui::pos2(x, bar.bottom())], Stroke::new(1.0_f32, ACCENT()));
                 let lbl = format!("{:02}:{:02}:{:02}", (sv / 3600.0) as u32, ((sv % 3600.0) / 60.0) as u32, (sv % 60.0) as u32);
                 let gal = p.layout_no_wrap(lbl, egui::FontId::monospace(11.0), Color32::WHITE);
                 let r = egui::Rect::from_center_size(egui::pos2(x.clamp(bar.left() + 34.0, bar.right() - 34.0), bar.top() - 14.0), gal.size() + egui::vec2(12.0, 6.0));
@@ -3777,15 +3773,15 @@ fn field_box(ui: &mut egui::Ui, key: impl std::hash::Hash, value: &mut String, i
     let fill = if pal().dark { Color32::from_rgb(10, 10, 12) } else { Color32::WHITE };
     p.rect_filled(rect, rad, fill);
     if focused {
-        p.rect_stroke(rect.expand(3.0), rad + 3.0, Stroke::new(3.0, ACCENT().gamma_multiply(0.25)));
-        p.rect_stroke(rect, rad, Stroke::new(1.0, ACCENT()));
+        p.rect_stroke(rect.expand(3.0), rad + 3.0, Stroke::new(3.0_f32, ACCENT().gamma_multiply(0.25)));
+        p.rect_stroke(rect, rad, Stroke::new(1.0_f32, ACCENT()));
     } else {
-        p.rect_stroke(rect, rad, Stroke::new(1.0, if hovered { MUTED().gamma_multiply(0.6) } else { BORDER() }));
+        p.rect_stroke(rect, rad, Stroke::new(1.0_f32, if hovered { MUTED().gamma_multiply(0.6) } else { BORDER() }));
     }
     // εικονίδιο (ζωγραφισμένο, ίδιο πάχος γραμμής)
     let ic = egui::pos2(rect.left() + 22.0, rect.center().y);
     let col = if focused { ACCENT() } else { MUTED() };
-    let st = Stroke::new(1.6, col);
+    let st = Stroke::new(1.6_f32, col);
     if let Some(icon) = icon { match icon {
         FieldIcon::User => {
             p.circle_stroke(ic + egui::vec2(0.0, -3.5), 3.6, st);
@@ -3822,7 +3818,7 @@ fn field_box(ui: &mut egui::Ui, key: impl std::hash::Hash, value: &mut String, i
         let p = ui.painter();
         if resp.hovered() { p.rect_filled(er, 8.0, BORDER().gamma_multiply(0.6)); }
         let c = er.center();
-        let st = Stroke::new(1.5, if resp.hovered() { TEXT() } else { MUTED() });
+        let st = Stroke::new(1.5_f32, if resp.hovered() { TEXT() } else { MUTED() });
         let lid = |s: f32| -> Vec<egui::Pos2> { (0..=16).map(|k| { let t = -1.0 + 2.0 * k as f32 / 16.0; c + egui::vec2(8.0 * t, s * 4.6 * (1.0 - t * t)) }).collect() };
         p.add(egui::Shape::line(lid(-1.0), st));
         p.add(egui::Shape::line(lid(1.0), st));
@@ -3989,9 +3985,9 @@ fn rec_health_worker(cam: Camera, chans: Vec<(u32, String)>, out: Arc<Mutex<Opti
                     if latest.is_none() { latest = d.files(idx, &fmt(now - chrono::Duration::days(3)), &fmt(now), "*").ok().and_then(|v| v.iter().filter_map(|f| parse_t(&f.end)).max()); }
                     v.push((*ch, name.clone(), oldest, latest));
                 }
-                Ok(RecHealth { disks, total_mb, free_mb, chans: v, checked: Some(now), err: String::new() })
+                Ok(RecHealth { disks, total_mb, free_mb, chans: v, err: String::new() })
             })();
-            let h = match r { Ok(h) => h, Err(e) => RecHealth { checked: Some(now), err: e.to_string(), ..out.lock().unwrap().clone().unwrap_or_default() } };
+            let h = match r { Ok(h) => h, Err(e) => RecHealth { err: e.to_string(), ..out.lock().unwrap().clone().unwrap_or_default() } };
             // ειδοποίηση: κανάλι που έγραφε το τελευταίο 24ωρο αλλά όχι τα τελευταία 30 λεπτά
             for (ch, name, _, latest) in &h.chans {
                 let stale = latest.map_or(false, |l| now - l > chrono::Duration::minutes(30) && now - l < chrono::Duration::hours(24));
@@ -4235,7 +4231,7 @@ impl App {
                         let on = e.region[r] >> c & 1 == 1;
                         let cell = egui::Rect::from_min_size(rect.min + egui::vec2(c as f32 * cw, r as f32 * chh), egui::vec2(cw, chh));
                         if on { p.rect_filled(cell.shrink(0.5), 0.0, ACCENT().gamma_multiply(0.30)); }
-                        p.rect_stroke(cell, 0.0, Stroke::new(0.5, Color32::from_white_alpha(28)));
+                        p.rect_stroke(cell, 0.0, Stroke::new(0.5_f32, Color32::from_white_alpha(28)));
                     } }
                     if let Some(pp) = resp.interact_pointer_pos() {
                         let c = (((pp.x - rect.left()) / cw) as usize).min(RW - 1); let r = (((pp.y - rect.top()) / chh) as usize).min(RH - 1);
@@ -4270,8 +4266,8 @@ impl App {
                             if resp.drag_started() { if let Some(q) = resp.interact_pointer_pos() { let (x, y) = n(q); zz.a = x; zz.b = y; zz.c = x; zz.d = y; } }
                             if resp.dragged() { if let Some(q) = resp.interact_pointer_pos() { let (x, y) = n(q); zz.c = x; zz.d = y; } }
                             let at = |x: f32, y: f32| rect.min + egui::vec2(x * rect.width(), y * rect.height());
-                            if zz.line { p.line_segment([at(zz.a, zz.b), at(zz.c, zz.d)], Stroke::new(3.0, BAD)); p.circle_filled(at(zz.a, zz.b), 5.0, BAD); p.circle_filled(at(zz.c, zz.d), 5.0, BAD); }
-                            else { let r = egui::Rect::from_two_pos(at(zz.a, zz.b), at(zz.c, zz.d)); p.rect_filled(r, 0.0, BAD.gamma_multiply(0.2)); p.rect_stroke(r, 0.0, Stroke::new(2.0, BAD)); }
+                            if zz.line { p.line_segment([at(zz.a, zz.b), at(zz.c, zz.d)], Stroke::new(3.0_f32, BAD)); p.circle_filled(at(zz.a, zz.b), 5.0, BAD); p.circle_filled(at(zz.c, zz.d), 5.0, BAD); }
+                            else { let r = egui::Rect::from_two_pos(at(zz.a, zz.b), at(zz.c, zz.d)); p.rect_filled(r, 0.0, BAD.gamma_multiply(0.2)); p.rect_stroke(r, 0.0, Stroke::new(2.0_f32, BAD)); }
                             ui.label(RichText::new("Drag on the picture to draw it.").small().color(MUTED()));
                         }
                         if z.map(|z| z.enc()) != before { if let Some(c) = self.store.camera.get_mut(ci) { c.ai_zone = z.map(|z| z.enc()).unwrap_or_default(); } zone_dirty = true; }

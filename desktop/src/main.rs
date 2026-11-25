@@ -464,9 +464,12 @@ fn tool(name: &str) -> PathBuf {
 
 fn ffmpeg_cmd(url: &str, s: &Settings) -> Command {
     let (w, h, fps) = (s.width, s.height, s.fps);
+    // Πολλά ταυτόχρονα streams με αυτόματο threading υπερκορέννυν το scheduler.
+    // Ελαφρύ grid: ένας decoder/filter thread ανά κάμερα· full HD: δύο.
+    let threads = if w * h <= 960 * 540 { "1" } else { "2" };
     let mut c = Command::new(tool("ffmpeg"));
     c.args(["-hide_banner", "-loglevel", "info", "-nostats", "-nostdin", "-rtsp_transport", "tcp", "-timeout", "5000000",
-            "-fflags", "nobuffer", "-flags", "low_delay", "-i", url, "-an", "-vf",
+            "-threads", threads, "-fflags", "nobuffer", "-flags", "low_delay", "-i", url, "-an", "-filter_threads", threads, "-vf",
             &format!("fps={fps},scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"),
             "-pix_fmt", "rgba", "-f", "rawvideo", "-"])
         .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -1104,11 +1107,18 @@ impl App {
         self.streams = self.store.camera.iter().map(|c| {
             if !c.enabled { return None; }
             let mut grid = c.clone();
+            let mut grid_settings = self.store.settings.clone();
             // Με Auto HD το πλέγμα χρησιμοποιεί ΠΑΝΤΑ το ελαφρύ sub-stream, ακόμη κι αν η
-            // κάμερα έχει επιλεγμένο Main. Το Main ανοίγει μόνο στην πλήρη προβολή· αλλιώς
-            // επτά 1080p/25 fps decoders μπορούν να καταναλώσουν όλους τους πυρήνες.
-            if auto_hd { grid.main_stream = false; }
-            Some(Stream::start(grid.url(), self.store.settings.clone(), ctx.clone()))
+            // κάμερα έχει επιλεγμένο Main. Το Main ανοίγει μόνο στην πλήρη προβολή.
+            if auto_hd {
+                grid.main_stream = false;
+                // Τα tiles δεν χρειάζονται 1080p/25 fps: ακόμη και sub-stream 800×448
+                // αλλιώς γίνεται upscale σε 8 MB RGBA × 25 × κάθε κάμερα.
+                grid_settings.width = grid_settings.width.min(960);
+                grid_settings.height = grid_settings.height.min(540);
+                grid_settings.fps = grid_settings.fps.min(12);
+            }
+            Some(Stream::start(grid.url(), grid_settings, ctx.clone()))
         }).collect();
         if self.solo.map_or(false, |i| i >= self.streams.len()) { self.solo = None; }
         self.hd = None;
@@ -2242,7 +2252,7 @@ impl App {
                 let _ = self.store.save();
             }
         });
-        Self::card(ui, "Video quality", "Grid resolution and frame rate. Lower = less CPU.", |ui| {
+        Self::card(ui, "Video quality", "Lower = less CPU. With Auto HD, the grid is capped at 540p/12 fps; full view stays HD.", |ui| {
             let d = &mut self.settings_draft;
             if let Some((w, h)) = segmented(ui, &[("360p", 640, 360), ("540p", 960, 540), ("720p", 1280, 720), ("1080p", 1920, 1080)], d.width) { d.width = w; d.height = h; }
             ui.add_space(10.0);
